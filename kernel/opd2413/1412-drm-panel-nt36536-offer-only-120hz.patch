@@ -1,0 +1,30 @@
+From: Kholin <oodzchen@gmail.com>
+Subject: [PATCH] drm/panel: nt36536: offer only the 120 Hz mode
+
+The 60 Hz and 30 Hz modes only lengthen the vertical front porch. With
+either of them the panel shows no picture, and switching back to 120 Hz
+leaves the DPU's CTL with pending state and the SSPP no longer fetching
+until a full disable. Advertise 120 Hz alone until the rate switch is
+understood.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+--- a/drivers/gpu/drm/panel/panel-novatek-nt36536.c	2026-11-11 01:21:12.052738169 +0800
++++ b/drivers/gpu/drm/panel/panel-novatek-nt36536.c	2026-11-11 01:21:12.046413938 +0800
+@@ -322,8 +322,14 @@
+ 	.type = DRM_MODE_TYPE_DRIVER,
+ };
+ 
+-/* Stock 120/60/30 Hz timings keep the link clock and horizontal timing fixed. */
+-static const unsigned int novatek_nt36536_vfp[] = { 26, 2684, 8000 };
++/*
++ * Stock 120/60/30 Hz timings keep the link clock and horizontal timing fixed
++ * (vertical front porch 26, 2684 and 8000 lines). Only 120 Hz is offered:
++ * with the longer porches the panel shows no picture, and the mode switch
++ * back to 120 Hz leaves the DPU stuck until the next full disable. The stock
++ * kernel likely sends rate-switch commands that are not known yet.
++ */
++static const unsigned int novatek_nt36536_vfp[] = { 26 };
+ 
+ static int novatek_nt36536_get_modes(struct drm_panel *panel,
+ 				     struct drm_connector *connector)

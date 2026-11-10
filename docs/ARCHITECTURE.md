@@ -85,7 +85,7 @@ systemd-boot 替换设备树。
 ESP 512 MiB（FAT16）。现在一套 Armada 内核占 149 MB（未压缩内核 64 MB + 非 hostonly 的
 initramfs 84 MB），三套就满了。Fedora 侧：
 
-- `installonly_limit=2`，只保留两个内核（待设置）。
+- `installonly_limit=2`（`opd2413-device` 设置），只保留两个内核。
 - initramfs 用 hostonly（在设备上生成）：63 MB，每个内核在 ESP 上约 128 MB。
 - 内核升级到 Fedora 配置后启用 `EFI_ZBOOT` 压缩。
 
@@ -122,7 +122,8 @@ Fedora 是在运行中的 Armada 里装进新子卷的（没有重新 mkfs），
 | `opd2413-desktop` | KDE 默认值：缩放、电源键与合盖行为、屏幕键盘 | 桌面策略 |
 | `opd2413-mesa`（仅在需要时） | 带补丁的 Mesa。先验证 Fedora 45 自带的 26.2.6 能否驱动 Adreno 830 | 设备 |
 
-内核包每次打包都升 release 号，不复用版本名（模块 BTF 与内核必须同次构建，旧模块配新内核会加载失败）。
+内核版本号用 `7.2.6-<N>.opd2413`，每次构建 `N` 加一、不复用（模块 BTF 与内核必须同次构建，旧模块配新内核会加载失败）。
+一个版本号不能是另一个的前缀：kernel-install 卸载内核时会删除所有 `fedora-<kver>*.conf`。
 
 ## 5. 内核路线
 

@@ -20,9 +20,9 @@
 cd ~/github/fedora-opd2413
 A=~/github/armada
 
-tools/build-kernel-rpm.sh   $A/output/opd2413-stage4/kern2/out/armada-kernel-7.2.6.tar.zst 7.2.6 1
+tools/build-kernel-rpm.sh   out/kernel-7.2.6-2.opd2413.tar.zst 7.2.6-2.opd2413 1   # 内核树的构建见 kernel/README.md
 tools/build-firmware-rpm.sh 16.0.10.600 1 $A/system_files/usr/lib/firmware
-tools/build-device-rpms.sh  0.1 2
+tools/build-device-rpms.sh  0.1 5
 tools/collect-rpms.sh       # 汇总到 out/rpms/ 并生成 SHA256SUMS
 ```
 
@@ -33,8 +33,8 @@ tools/collect-rpms.sh       # 汇总到 out/rpms/ 并生成 SHA256SUMS
 - 固件包的版本取原厂 OTA 的版本号。
 - 重新构建同名包之前先删掉 `out/rpmbuild/RPMS` 里的旧文件，`collect-rpms.sh` 要求每个包只有一份。
 
-2026-11-10 的一套：`kernel-opd2413-7.2.6-1`、`opd2413-firmware-16.0.10.600-1`、
-`opd2413-device-0.1-2`、`opd2413-audio-0.1-2`。
+当前平板上的一套（2026-11-11）：`kernel-opd2413-7.2.6-2.opd2413`、`opd2413-firmware-16.0.10.600-1`、
+`opd2413-device-0.1-5`、`opd2413-audio-0.1-5`。
 
 ## 测试
 

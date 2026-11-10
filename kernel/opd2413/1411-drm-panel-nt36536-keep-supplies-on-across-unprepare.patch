@@ -1,0 +1,69 @@
+From: Kholin <oodzchen@gmail.com>
+Subject: [PATCH] drm/panel: nt36536: keep the supplies on across unprepare
+
+After the panel supplies are switched off and on at runtime (screen
+blank, mode change) the panel accepts the on-commands, reports power mode
+0x9e with no DSI errors, and still shows no picture. The bootloader sets
+up some panel state that survives the reset pin but not a power cycle,
+and the on-commands do not recreate it. At boot the panel is never
+unpowered, which is why the first prepare works.
+
+Keep vddio and the KTZ8868 bias enabled after the first prepare: unprepare
+sends display off and sleep in, prepare resets the panel and sends the
+on-commands again. Verified with repeated blank/unblank cycles on
+OPD2413. Costs the panel's sleep-mode current while the screen is off.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+--- a/drivers/gpu/drm/panel/panel-novatek-nt36536.c	2026-11-11 01:21:12.009657522 +0800
++++ b/drivers/gpu/drm/panel/panel-novatek-nt36536.c	2026-11-11 01:21:12.026602343 +0800
+@@ -24,6 +24,8 @@
+ struct novatek_nt36536 {
+ 	struct drm_panel panel;
+ 	struct mipi_dsi_device *dsi[2];
++	/* Supplies stay on from the first prepare; see novatek_nt36536_unprepare(). */
++	bool powered;
+ 	struct drm_dsc_config dsc;
+ 	struct gpio_desc *reset_gpio;
+ 	struct regulator *vddio;
+@@ -252,9 +254,12 @@
+ 	struct mipi_dsi_multi_context dsi_ctx = { .dsi = ctx->dsi[1] };
+ 	int ret;
+ 
+-	ret = novatek_nt36536_power_on(ctx);
+-	if (ret < 0)
+-		return ret;
++	if (!ctx->powered) {
++		ret = novatek_nt36536_power_on(ctx);
++		if (ret < 0)
++			return ret;
++		ctx->powered = true;
++	}
+ 
+ 	novatek_nt36536_reset(ctx);
+ 
+@@ -278,6 +283,7 @@
+ 
+ err:
+ 	novatek_nt36536_power_off(ctx);
++	ctx->powered = false;
+ 
+ 	return ret;
+ }
+@@ -292,8 +298,14 @@
+ 	if (ret < 0)
+ 		dev_err(dev, "failed to off panel: %d\n", ret);
+ 
+-	novatek_nt36536_power_off(ctx);
+-
++	/*
++	 * Keep vddio and the KTZ8868 bias on. After a full power cycle the
++	 * on-commands are accepted (DCS power mode reads back 0x9e, no DSI
++	 * errors) yet the panel stays dark: it loses some state that the
++	 * bootloader set up and a reset alone does not clear. With the
++	 * supplies kept on, display off/sleep in followed by reset and the
++	 * on-commands restores the picture every time, as it does at boot.
++	 */
+ 	return 0;
+ }
+ 

@@ -8,7 +8,7 @@
 | 1 | 启动参数 `clk_ignore_unused pd_ignore_unused regulator_ignore_unused` | `/etc/kernel/cmdline` | 沿用 Armada 已验证的组合；没人逐个验证过去掉后哪些外设掉电 | 功耗偏高，掩盖设备树里缺失的资源声明；休眠达不到最深态 | M3 合入 erhai 的休眠系列后逐个去掉，每个冷启动验证 |
 | 2 | SELinux 非 enforcing（M1 用 `enforcing=0`） | `/etc/kernel/cmdline` | 先只换一个变量；设备服务还没有策略 | 不符合标准 Fedora 的安全默认 | M2：首启 relabel 干净、设备服务无 AVC 拒绝后改 enforcing |
 | 3 | DTB 放在 ESP 固定路径，对所有内核全局生效 | ESP `/dtbs/qcom/sm8750-oneplus-pad2pro.dtb`；U-Boot 在 `boot_b` 里写死这个路径 | U-Boot 现在这样加载；改它要重写 `boot_b` | 回滚到旧内核时 DTB 不跟着回滚，DTB 与内核可能不匹配 | 条目已自带 `devicetree` 行，QEMU 里这样的条目能启动内核（2026-11-10）；还要在真机确认内核拿到的是条目的 DTB 而不是 U-Boot 传入的那份，之后固定路径的副本只作兜底 |
-| 4 | 沿用 Armada 7.2.6 内核和它的整套补丁（含约 250 个其他掌机的补丁） | `kernel-opd2413` | M1 只换发行版 | 内核落后于 Fedora，没有安全更新；配置不是 Fedora 的 | M3 换到 Fedora 的内核基线（7.3.x） |
+| 4 | 沿用 Armada 7.2.6 内核和它的整套补丁（含约 250 个其他掌机的补丁），从 armada 仓库忽略目录里的一棵已编译的树构建 | `kernel-opd2413`、`out/kernel-tree` | M1 只换发行版 | 内核落后于 Fedora，没有安全更新；配置不是 Fedora 的 | M3 换到 Fedora 的内核基线（7.3.x） |
 | 5 | 扬声器没有原厂保护算法，固定增益 350 / −2.5 dB | UCM、内核 `1408` | 原厂保护在 Android HAL 和 ADSP 调参里，未移植 | 大音量长时间播放有损坏扬声器的风险 | 调研 AW88261 自身保护配置或 ADSP 侧保护模块 |
 | 6 | 分区名和 kShimC 菜单标题仍叫 "Armada"（"Armada" 项现在启动的是 Fedora） | GPT、`boot_b` 里的 kShimC 清单和 U-Boot 参数 | 改名要改 GPT 并重写 `boot_b` | 只是名字不符 | 下一次因为别的原因必须重写 `boot_b` 时一起改 |
 | 7 | `ARMADA_BOOT`（sda17，1 GiB）闲置 | GPT | Fedora 的内核都放 ESP，不需要独立 `/boot` | 浪费 1 GiB | 决定用途（并入根需要改 GPT，或作 swap） |
@@ -20,5 +20,6 @@
 | 14 | 安装时用固定镜像（`OPD_MIRROR`），装好的系统仍用 Fedora 默认的 metalink | `tools/install-rootfs.sh` | metalink 曾分到 35 KB/s 的镜像 | 日后 `dnf upgrade` 可能同样很慢 | 问用户是否把系统默认源换成国内镜像，或在 dnf 配置里开 `fastestmirror` |
 | 15 | firewalld 不工作（无防火墙） | 内核配置 | Armada 内核没有 `NFT_FIB_IPV4/IPV6/INET`，firewalld 加载规则失败后停止 | 平板在局域网里没有防火墙；sshd 只允许密钥登录 | M3 换用 Fedora 的内核配置后，确认 firewalld `active` |
 | 16 | Wi-Fi 的"硬件" MAC 是 ath12k 生成的 `00:03:7f:…`，不是本机真实地址 | 内核 ath12k | 本机真实 MAC 在 persist / OTA 里，未导入 | 用 Fedora 默认的按 SSID 生成的稳定 MAC，地址每次开机不变；与 Android 下的 MAC 不同 | 按 erhai 的做法从本机数据导入真实 MAC（蓝牙地址同理） |
-| 17 | KDE 的"空闲时关闭屏幕"在三个电源配置里都关掉 | 用户 `colin` 的 `~/.config/powerdevilrc`（手工设置，不在任何包里） | 运行中面板关闭再打开后黑屏、只能重启（见 STATUS"显示"一行）；自动熄屏会走这条路径 | 屏幕只会调暗、不会熄灭，费电；锁屏后也不熄屏 | 内核修好面板重新 prepare 后的黑屏，熄屏/亮屏真机通过后删掉这几行 |
-| 18 | ESP 上没有设置只保留两个内核 | dnf 的 `installonly_limit` 是默认 3 | 还没做 | 三个内核约 384 MB，ESP 剩不了多少，第四个装不下 | M2 内核升级流程里设成 2，并在 `install-kernel` 前检查 ESP 剩余空间 |
+| 19 | 熄屏时面板保持供电（只发关显示和进睡眠） | 内核 `kernel/opd2413/1411` | 完全断电后面板丢失 ABL 建立的某种状态，内核的初始化序列没有重建它，屏幕保持黑 | 熄屏时多耗面板睡眠电流和 KTZ8868 偏压的静态电流；系统挂起时同样 | 找到断电后缺的那一步（候选：`oplus,panel-reset-position = <2>` 的含义、触控固件下载与显示初始化的顺序），能从断电状态点亮后改回真正断电 |
+| 20 | 只提供 120 Hz | 内核 `kernel/opd2413/1412` | 60/30 Hz（只加长垂直前肩）出不了画面；切回 120 Hz 后 DPU 的 CTL 卡住、SSPP 停止取帧，要完整关闭一次才恢复 | 没有省电的低刷新率，也没有可变刷新率 | 弄清厂商切换刷新率的面板命令和 DPU 侧的正确切换流程，真机通过后恢复这两个模式 |
+| 21 | 诊断内核 `7.2.6-diag2` 留作回退项 | 平板上的 `kernel-opd2413-7.2.6_diag2` | 卸载事故后它是唯一真机启动过的其他内核 | 每次熄屏亮屏多打印几行诊断；占 ESP 约 128 MB | 下一个正式内核真机通过后卸掉（`installonly_limit=2` 装新内核时也会自动卸掉它） |

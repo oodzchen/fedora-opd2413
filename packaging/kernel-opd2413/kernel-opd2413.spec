@@ -11,8 +11,12 @@
 %global __strip /bin/true
 
 Name:           kernel-opd2413
-Version:        %{kver}
-Release:        %{pkgrel}
+# kver is the kernel release (uname -r), e.g. 7.2.6-2.opd2413: the upstream
+# version, then this build's number. RPM takes the two halves as Version and
+# Release. Never reuse a number, and never let one kver be a prefix of another:
+# kernel-install's remove deletes every entry matching "fedora-<kver>*.conf".
+Version:        %(echo %{kver} | cut -d- -f1)
+Release:        %(r=$(echo %{kver} | cut -s -d- -f2-); echo ${r:-%{pkgrel}})
 Summary:        Linux kernel for the OnePlus Pad 2 Pro (OPD2413)
 License:        GPL-2.0-only
 URL:            https://kernel.org
