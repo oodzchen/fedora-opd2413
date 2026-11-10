@@ -1,0 +1,9 @@
+# OnePlus Pad 2 Pro: keep Android's partitions on the internal UFS read-only;
+# only the Linux partitions stay writable (see /usr/libexec/opd2413/ufs-guard).
+# Ordered after 60-persistent-storage, which provides ID_PART_ENTRY_NAME.
+ACTION!="add|change", GOTO="opd2413_ufs_guard_end"
+SUBSYSTEM!="block", GOTO="opd2413_ufs_guard_end"
+KERNEL!="sd*", GOTO="opd2413_ufs_guard_end"
+DEVPATH!="*/1d84000.ufs/*", GOTO="opd2413_ufs_guard_end"
+RUN+="/usr/libexec/opd2413/ufs-guard $devnode"
+LABEL="opd2413_ufs_guard_end"

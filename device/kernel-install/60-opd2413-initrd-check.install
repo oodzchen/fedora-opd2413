@@ -1,0 +1,22 @@
+#!/bin/bash
+# Refuse to install a kernel whose initramfs lacks device firmware. Such a
+# system boots, but the touchscreen, GPU and audio stay dead with nothing on
+# screen to say why.
+set -euo pipefail
+
+[ "${1:?}" = add ] || exit 0
+[ "${KERNEL_INSTALL_LAYOUT:-}" = bls ] || exit 0
+
+initrd=${KERNEL_INSTALL_STAGING_AREA:?}/initrd
+[ -s "${initrd}" ] || { echo "opd2413-initrd-check: no initramfs was generated" >&2; exit 1; }
+
+needed=$(/usr/libexec/opd2413/early-firmware)
+present=$(lsinitrd "${initrd}" | awk '{print "/" $NF}')
+missing=$(comm -23 <(sort -u <<< "${needed}") <(sort -u <<< "${present}"))
+if [ -n "${missing}" ]; then
+    echo "opd2413-initrd-check: the initramfs lacks device firmware:" >&2
+    sed 's/^/  /' <<< "${missing}" >&2
+    exit 1
+fi
+[ "${KERNEL_INSTALL_VERBOSE:-0}" -gt 0 ] && echo "opd2413-initrd-check: $(wc -l <<< "${needed}") firmware files present"
+exit 0

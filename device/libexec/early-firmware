@@ -1,0 +1,35 @@
+#!/bin/bash
+# Print the firmware files that must be inside the initramfs, one absolute path
+# per line. Their names come from the device tree and the audio topology, so
+# MODULE_FIRMWARE does not reveal them; the drivers probe before the root file
+# system is mounted. Exits non-zero when a file is not installed.
+# Usage: early-firmware [SYSROOT]
+set -euo pipefail
+
+root=${1:-}
+fw=${root}/usr/lib/firmware
+list=${root}/usr/share/opd2413/firmware.sha256
+[ -s "${list}" ] || { echo "early-firmware: missing ${list}" >&2; exit 1; }
+
+paths=()
+while read -r _ path; do
+    case "${path}" in
+        qcom/sm8750/erhai/* | awinic/erhai/* | novatek/*) paths+=("${fw}/${path}") ;;
+    esac
+done < "${list}"
+paths+=("${fw}/qcom/sm8750/OnePlus-Pad-2-Pro-tplg.bin")
+
+# Adreno 830 microcode from linux-firmware, compressed or not.
+for name in gen80000_sqe.fw gen80000_gmu.bin gen80000_aqe.fw; do
+    found=
+    for candidate in "${fw}/qcom/${name}" "${fw}/qcom/${name}.xz" "${fw}/qcom/${name}.zst"; do
+        if [ -f "${candidate}" ]; then found=${candidate}; break; fi
+    done
+    [ -n "${found}" ] || { echo "early-firmware: missing qcom/${name}" >&2; exit 1; }
+    paths+=("${found}")
+done
+
+for path in "${paths[@]}"; do
+    [ -f "${path}" ] || { echo "early-firmware: missing ${path}" >&2; exit 1; }
+    printf '%s\n' "${path#"${root}"}"
+done

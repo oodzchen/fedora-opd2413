@@ -1,0 +1,22 @@
+#!/bin/bash
+# U-Boot loads the device tree from one fixed path on the ESP before it starts
+# systemd-boot. Keep that copy in step with the kernel being installed.
+set -eu
+
+command=${1:?}
+kver=${2:?}
+[ "${command}" = add ] || exit 0
+
+boot_root=${KERNEL_INSTALL_BOOT_ROOT:-/boot/efi}
+name=qcom/sm8750-oneplus-pad2pro.dtb
+src=/usr/lib/modules/${kver}/dtb/${name}
+dst=${boot_root}/dtbs/${name}
+
+[ -s "${src}" ] || { echo "opd2413-dtb: ${src} missing" >&2; exit 1; }
+cmp -s "${src}" "${dst}" && exit 0
+mkdir -p "$(dirname "${dst}")"
+cp -f "${src}" "${dst}.new"
+sync "${dst}.new"
+mv -f "${dst}.new" "${dst}"
+[ "${KERNEL_INSTALL_VERBOSE:-0}" -gt 0 ] && echo "opd2413-dtb: updated ${dst}"
+exit 0
