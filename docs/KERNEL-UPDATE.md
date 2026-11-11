@@ -11,6 +11,9 @@
   装完新内核，下次开机就会进新内核。
 - **U-Boot 的 EFI 变量在系统运行时只读**：`bootctl set-default`、`bootctl set-oneshot` 都会失败。要临时选别的条目，只能在开机时
   手选（kShimC 选 "Armada boot menu"，再在 systemd-boot 菜单里选）。
+- **systemd-boot 的启动计数（`/etc/kernel/tries`、条目名里的 `+N`）不能用**：U-Boot 拒绝改名，开机时会打印一行红色的
+  `Failed to rename ... Access denied`，条目不会被标记为坏，也不会自动回退。不要创建 `/etc/kernel/tries`。
+- **ramoops/pstore 拿不到上一次启动的日志**：这台机器重启后那块内存不保留（软重启也一样）。
 - **kShimC 会记住上次选的菜单项**（ESP 上的 `KSHIM.CHO`）。手选过 "Armada boot menu" 之后，下次要改回 "Armada"，
   否则每次开机都停在 systemd-boot 菜单。
 - **版本号不能互为前缀**：卸载时 kernel-install 会删除所有 `fedora-<kver>*.conf`。版本号一律用 `7.2.6-<N>.opd2413`。

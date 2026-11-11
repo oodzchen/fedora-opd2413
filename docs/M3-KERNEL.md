@@ -53,7 +53,7 @@
 | 4 配置 | 完成 | `kernel/opd2413-7.3/opd2413.config`，做法见下节 |
 | 5 构建 | 完成 | `7.3.3-1.opd2413`：5859 个模块，`vmlinuz.efi` 18.7 MB，去调试段后模块 564 MB |
 | 6 离线检查 | 完成 | 编译无错误、改动过的文件无警告；DTB 对比差异都能解释；容器安装测试 PASS（66 个固件齐全，通用 initramfs 122 MB）；QEMU 启动链 PASS（systemd-boot 262 启动压缩 EFI 内核） |
-| 7 上机 | 待用户确认 | |
+| 7 上机 | 真机失败，排查中 | 7.3.3-1、-2、-3 三个构建都没能在平板上起来，记录见 WORKLOG 2026-11-11"M3a 上机" |
 
 ## 冲突怎么处理的
 
@@ -99,6 +99,13 @@ PCIe WAKE# 改为低有效；CPU 温区少了一个没挂降频的 90°C passive
 4. 判据（M3a 完成标准）：`uname -r`、`running`、失败单元、`getenforce`、AVC、`journalctl -b -p err`；KWin 硬件渲染；
    用户确认画面、触控、键盘和触控板、声音、亮度、Wi-Fi、熄屏后亮屏；之后再冷启动 4 次都有画面。
 5. 首次启动若整机重启或卡住，先怀疑：CoreSight 新节点、hostonly initramfs 缺模块、DRM 交接。
+
+## 上机后追加的改动
+
+| 构建 | 改动 | 原因 |
+|---|---|---|
+| 7.3.3-2 | `patches/0004`：ramoops 回到 `0xbfff00000`（16 GB 机型）；配置加 `PSTORE_CONSOLE=y` | 想让内核 3 读到 7.3 的崩溃日志。结果：ramoops 在这台机器上重启后不保留，此路不通 |
+| 7.3.3-3 | 配置加 `QCOM_TZMEM_MODE_SHMBRIDGE=y`（Fedora 默认 generic；arm64 defconfig、erhai、Armada 都是 SHM bridge）；包里的 vmlinuz 改为未压缩 `Image`（74 MB） | 前者：和已知能用的配置对齐。后者：当时误以为压缩镜像是复位原因，后来证伪，但 Image 保留（与内核 3 一致，排除一个变量） |
 
 ## 工作区（主机，忽略目录）
 

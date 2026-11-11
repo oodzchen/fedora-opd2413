@@ -5,13 +5,16 @@
 
 ## 唯一的下一步
 
-**M3a 上机：在平板上安装 `kernel-opd2413-7.3.3-1.opd2413`**（离线已通过：编译、DTB 对比、容器安装测试、QEMU 启动链），
-需要用户确认。步骤和判据见 [M3-KERNEL.md](M3-KERNEL.md) 的"上机"一节与 [KERNEL-UPDATE.md](KERNEL-UPDATE.md)。
+**M3a：查清 7.3 内核在平板上为什么启动后很快复位**。下一个实验（待用户同意）：给 ESP 上的测试启动项
+`opd2413-m3test.conf`（7.3.3-3）加上 `earlycon=efifb keep_bootcon`，使参数与唯一一次越过复位的那次完全相同。
+越过了：说明 earlycon 影响结果，而且屏幕上能看到后面的日志；仍复位：问题在 7.3.3-3 相对 7.3.3-2 的唯一改动 SHM bridge 上。
+所有上机记录和已排除的假设见 [WORKLOG.md](WORKLOG.md) 2026-11-11"M3a 上机"一节。
 M2 剩下的被动观察项：开机提示音毛刺再出现时当场取证；空闲自动熄屏能否恢复。
 
 ## 当前阻塞
 
-无。
+7.3 内核在平板上起不来：选中后黑屏或红字后几秒内整机复位；唯一一次越过（7.3.3-2 + earlycon）在约 10 秒后黑屏卡死，
+SSH 连不上。复位后没有任何日志可读（ramoops 在这台机器上重启后不保留，见 WORKLOG）。内核 3 不受影响，是默认项。
 
 ## 接手时先做这几件事
 
@@ -23,13 +26,19 @@ M2 剩下的被动观察项：开机提示音毛刺再出现时当场取证；�
 
 ## 设备状态（2026-11-11）
 
-- 平板运行 Fedora 45 KDE，内核 `7.2.6-3.opd2413`（默认，带 SELinux 和 Fedora 的 netfilter 配置），
-  回退项 `7.2.6-2.opd2413`（没有 SELinux，用它启动时 SELinux 为关闭状态）。设备包 `opd2413-device/audio-0.1-5`（`installonly_limit=2`）。
+- 平板运行 Fedora 45 KDE，内核 `7.2.6-3.opd2413`（默认项，带 SELinux 和 Fedora 的 netfilter 配置）。
+  `7.2.6-2.opd2413` 已卸载。设备包 `opd2413-device/audio-0.1-5`（`installonly_limit=2`）。
+- 另装了测试内核 `kernel-opd2413-7.3.3-3.opd2413`：kernel-install 生成的条目已改名为 `opd2413-m3test.conf`
+  （标题 "M3 test: 7.3.3-3 (no boot counter)"，排在菜单最后，不是默认项），参数去掉了 `quiet loglevel=3`、加了 `ignore_loglevel`。
+  这个条目是手工改的，卸载该内核时 kernel-install 不会删它，要手动删。
+- ESP 固定路径的 `/dtbs/qcom/sm8750-oneplus-pad2pro.dtb` 已被 `95-opd2413-dtb` 插件换成 7.3 的 DTB（只给 U-Boot 用；
+  每个条目用自己的 DTB，内核 3 不受影响）。回到只用内核 3 时，可对内核 3 重跑 `kernel-install add` 换回来。
+- `/etc/modprobe.d/opd2413-pps.conf`：`options erhai_pps pps_enable=0`（只对 7.3 内核有意义）。`/etc/kernel/tries` 已删除。
 - SELinux enforcing（`/etc/selinux/config`，启动参数里已没有 `enforcing=0`），firewalld 运行中（public 区）。
 - 自动登录到 `colin`，自动锁屏已关；KDE 空闲熄屏已恢复默认。
 - 显示模式只有 120 Hz。
 - Armada 已完全删除；`boot_b`、分区表、Android 各分区未改动。
-- 没有正在运行的设备任务。
+- 没有正在运行的设备任务。kShimC 记住的菜单项可能是 "Armada boot menu"（会停在 systemd-boot 菜单）。
 
 ## 主机上的产物（都在忽略目录里，不进仓库）
 
@@ -51,7 +60,7 @@ M2 剩下的被动观察项：开机提示音毛刺再出现时当场取证；�
 | M0 | 立项：决定、仓库、架构和进度文档 | 完成（2026-11-10） |
 | M1 | Fedora 45 KDE 用现有 7.2.6 内核从机内启动，功能与 Armada 持平，然后取代 Armada | 完成（2026-11-11） |
 | M2 | 运行中面板重新打开黑屏（已修）；标准化：SELinux、防火墙、每条目 DTB、内核升级和回滚流程（[KERNEL-UPDATE.md](KERNEL-UPDATE.md)）都已完成；开机提示音毛刺待再现 | 基本完成 |
-| M3 | 内核升到 Fedora 45 的当前内核（7.3.3），以 erhai v0.7.2 为设备改动主体，合入休眠、充电、蓝牙、相机、传感器（[M3-KERNEL.md](M3-KERNEL.md)） | 进行中 |
+| M3 | 内核升到 Fedora 45 的当前内核（7.3.3），以 erhai v0.7.2 为设备改动主体，合入休眠、充电、蓝牙、相机、传感器（[M3-KERNEL.md](M3-KERNEL.md)） | 进行中：离线通过，真机失败（启动后复位），排查中 |
 | M4 | 外设逐项验收和长尾问题（灰闪、USB 3 方向、DP 音频等） | 未开始 |
 | M5 | 维护：软件包自动重建、ColorOS OTA 后恢复流程、对外文档 | 未开始 |
 
