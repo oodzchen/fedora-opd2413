@@ -179,8 +179,8 @@ NFC、手写笔（用户决定忽略）。详见 [HARDWARE.md](HARDWARE.md)。
 ## 8. 更新与回滚
 
 - 用户态：`dnf upgrade`，和普通 Fedora 一样。
-- 内核：装新的 `kernel-opd2413` → `kernel-install` 写新条目 → 旧内核保留为上一项。
-  启动失败时在 kShimC 里选 "Armada boot menu"，从 systemd-boot 菜单选旧内核。
+- 内核：装新的 `kernel-opd2413` → `kernel-install` 写新条目 → 旧内核保留为上一项（只留两个）。
+  启动失败时在 kShimC 里选 "Armada boot menu"，从 systemd-boot 菜单选旧内核。步骤和注意事项见 [KERNEL-UPDATE.md](KERNEL-UPDATE.md)。
 - 根文件系统：btrfs 子卷，重大升级前可以手动快照。
 - 救援：kShimC 的 USB 入口；最坏情况回 Android 后用 adb 处理 ESP。
 - ColorOS OTA 会覆盖 `boot`：需要重新把 kShimC 镜像写回活动槽（流程待在 M5 整理）。
