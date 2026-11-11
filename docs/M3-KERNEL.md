@@ -43,10 +43,58 @@
 **M3b（erhai 功能）**：每项单独上机验证并写进 STATUS 功能表：s2idle 休眠与唤醒（电源键、键盘、合盖）、9 V PD 与 PPS 充电、
 电量和温度、蓝牙、霍尔合盖、摄像头出图、视频硬解（需要补 `vpu35_4v.mbn` 固件）、去掉技术债 #1 的三个调试启动参数。
 
+## 进度
+
+| 步 | 状态 | 说明 |
+|---|---|---|
+| 1 基线 | 完成 | `out/m3-tree` 分支 `fedora-7.3.3` |
+| 2 erhai 合并 | 完成（未拆分） | 冲突的处理见下节；结果暂存为一个大补丁 `kernel/opd2413-7.3/patches/0001`，按主题拆分是技术债 |
+| 3 Armada 修复 | 完成 | `1404`、`1406`、`1407`、`1409`、`1411`（带 `keep_powered` 参数）；`1405`（出错时的寄存器打印）未带 |
+| 4 配置 | 完成 | `kernel/opd2413-7.3/opd2413.config`，做法见下节 |
+| 5 构建 | 完成 | `7.3.3-1.opd2413`：5859 个模块，`vmlinuz.efi` 18.7 MB，去调试段后模块 564 MB |
+| 6 离线检查 | 完成 | 编译无错误、改动过的文件无警告；DTB 对比差异都能解释；容器安装测试 PASS（66 个固件齐全，通用 initramfs 122 MB）；QEMU 启动链 PASS（systemd-boot 262 启动压缩 EFI 内核） |
+| 7 上机 | 待用户确认 | |
+
+## 冲突怎么处理的
+
+- **上游已收录的以上游为准**：面板 Kconfig、热管理、QMI、lpass 宏的 PM 时钟框架、q6v5 的一次性中断、phy-core、ubwc、DP（erhai 的 DP 改动整体放弃，M3b 做外接显示时再看）。
+- **nt36536 面板**：7.3 上游的 `panel-novatek-nt36536.c` 是联想 Legion Y700 Gen4 的驱动（只匹配 `csot,pp8807hb1-1`），
+  erhai 用同一个文件名写了本机的驱动。上游的保留，erhai 的改名为 `panel-novatek-nt36536-xn242.c`（`DRM_PANEL_NOVATEK_NT36536_XN242`）。
+  DSC 每包 slice 数改用上游的 `MIPI_DSI_MODE_DSC_ALL_SLICES_IN_PKT`（2 个 slice 正好是全部），`dsi_host.c` 和 `drm_mipi_dsi.h` 保持上游。
+- **音频**：`common.c` 取 erhai 的多 codec TDM 版本（上游只支持单 codec，本机 6 颗功放）；`sc8280xp.c` 以上游重构后的版本为底，
+  TDM 部分改用多 codec 接口、保留链路格式、加 `convert-*` 修正、sm8750 开 `mi2s_bclk_enable`；`audioreach.c` 取 erhai 的 TDM 和
+  `bits_per_sample`，声道映射用上游（与内核 3 相同）；rx/tx/va/wsa 宏用上游版本 + 系统休眠时强制运行时挂起，tx 再叠 Armada `0080`
+  （UCM 同时用 DEC0、DEC1）。erhai 的 TX 高通滤波控件没带（UCM 不用）。
+- **其他**：q6v5_pas 同时保留上游的 `qcom_pas_context` 改名和 erhai 的开机总线投票；spi-geni 保留 erhai 的 GPI DMA 延迟 QoS，
+  `geni_icc_get` 用上游的位置；iris 合并两边的控件。
+
+## 配置怎么定的
+
+Fedora 7.3 的配置**没有开 SM8750 的 GCC、引脚、互联**，原版 Fedora 内核在这台平板上起不来。片段的来源：
+
+1. 在平板上（内核 3）只读列出已加载模块和已绑定驱动，用 `tools/kernel/mod2config.py` 映射到 Kconfig 选项（177 个）。
+2. 内核 3 里 `=y` 而 Fedora 不是的（约 50 个：时钟、引脚、互联、UFS、显示、remoteproc、GLINK 等）照样编进内核：
+   dracut 的 hostonly 是在内核 3 上算的，那时这些驱动在内核本体里，不能指望 initramfs 带上它们的模块。
+3. 依赖链上的父选项（DRM、TYPEC、RPMSG、QRTR、MHI、IIO、UFS 核心、RPMB 等）用 `tools/kernel/fixdeps.py` 迭代补齐，
+   直到片段里每一项都生效。
+4. erhai 新驱动：快充 SC8547A 和 PPS 编成模块（PPS 上机时先用 `options erhai_pps pps_enable=0` 关掉，M3b 单独验证）；
+   摄像头相关编成模块；手写笔充电 CPS8601 不开。
+
+## DTB 对比（内核 3 的 DTB 与新 DTB）
+
+固件路径（firmware-name）完全相同。差异：GPU compatible `adreno-44050000` → `44050001`（7.3 上游目录里的 Adreno 830）并带
+速度档熔丝；去掉 Armada 的 DPU LUT DMA 寄存器；新增上游 7.3 的 CoreSight 节点（tmc、replicator、ctcu、tpdm，内核 3 下同类的
+funnel/cti/tmc/stm 驱动都正常加载过）；手写笔充电器节点（驱动未开）；两颗电荷泵；ramoops 移到 0xafff00000；去掉串口控制台；
+PCIe WAKE# 改为低有效；CPU 温区少了一个没挂降频的 90°C passive 触发点（118°C 的 passive 降频仍在，效果相同）。
+
 ## 工作区（主机，忽略目录）
 
 | 路径 | 内容 |
 |---|---|
 | `out/fedora-kernel/` | src.rpm 和解出来的源码包、redhat 补丁、aarch64 配置、kernel.spec |
 | `out/m3-tree/` | git 树：分支 `fedora-7.3.3`（7.3.3 + Fedora 补丁）、`m3-merge`（erhai 三方合并）、`trial-erhai`（逐提交重放试验，不用）。通过 alternates 引用 `~/github/linux-sm8750-erhai` 的对象 |
-| `out/m3-erhai/` | erhai 提交导出的补丁、分类和试验结果、merge-tree 输出 |
+| `out/m3-erhai/` | erhai 提交导出的补丁、分类和试验结果、merge-tree 输出、平板驱动清单、DTB 对比 |
+| `out/m3-build/` | 构建目录（`O=`）；`out/m3-build*.log` 是构建日志 |
+| `tools/kernel/`（仓库内） | `pick.py`（按块选冲突）、`mod2config.py`、`fixdeps.py` |
+| `out/kernel-7.3.3-1.opd2413*` | 安装 stage 和 tar.zst；RPM 在 `out/rpmbuild/RPMS/aarch64/`，测试用的一套在 `out/m3-rpms/` |
+| `out/m3-pkg-test/`、`out/m3-qemu-test/` | 两个离线测试的证据 |

@@ -74,3 +74,32 @@ make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LOCALVERSION=-<N>.opd2413 \
 
 以 Fedora 45 的内核为基线重建补丁序列，见 [../docs/ARCHITECTURE.md](../docs/ARCHITECTURE.md) §5。
 届时新序列放在新的目录里，`armada-7.2.6/` 保留到新内核真机通过为止。
+
+## M3：Fedora 7.3.3 基线（`opd2413-7.3/`）
+
+| 路径 | 内容 |
+|---|---|
+| `opd2413-7.3/patches/0001` | erhai v0.7.2（`870167fad`）三方合并到 Fedora 7.3.3 的结果（合并基础 7.2.15），冲突已解决，见 docs/M3-KERNEL.md |
+| `opd2413-7.3/patches/0002` | Armada 的开机显示交接：`1404`、`1406`（移植）、`1407`、`1409` |
+| `opd2413-7.3/patches/0003` | `1411` 移植到 erhai 的面板驱动 `panel-novatek-nt36536-xn242.c`，加模块参数 `keep_powered`（默认 1） |
+| `opd2413-7.3/opd2413.config` | 在 Fedora `kernel-aarch64-fedora.config` 之上的设备配置片段 |
+
+构建（`out/` 下，约 35 分钟）：
+
+```sh
+# 源码：kernel-7.3.3-300.fc45.src.rpm 里的 linux-7.3.3.tar.xz、patch-7.3-redhat.patch、
+# Makefile.rhelver、kernel-aarch64-fedora.config
+tar -xJf linux-7.3.3.tar.xz && cd linux-7.3.3
+patch -p1 < patch-7.3-redhat.patch && cp <src.rpm>/Makefile.rhelver .
+for p in <repo>/kernel/opd2413-7.3/patches/*.patch; do patch -p1 < $p; done
+cp kernel-aarch64-fedora.config <O>/.config
+ARCH=arm64 scripts/kconfig/merge_config.sh -m -O <O> <O>/.config <repo>/kernel/opd2413-7.3/opd2413.config
+make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- O=<O> olddefconfig
+make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- O=<O> LOCALVERSION=-<N>.opd2413 -j15 all
+make ... INSTALL_MOD_PATH=<stage> INSTALL_MOD_STRIP=1 modules_install
+```
+
+打包前在 `<stage>/lib/modules/<kver>/` 放：`vmlinuz`（= `arch/arm64/boot/vmlinuz.efi`，Fedora 配置开了 `EFI_ZBOOT`，
+18.7 MB）、`dtb/qcom/sm8750-oneplus-pad2pro.dtb`（= 编出来的 `sm8750-erhai.dtb`）、`config`、`System.map`；
+删掉 `build`、`source` 链接。然后 tar.zst + `tools/build-kernel-rpm.sh`。合并配置后检查片段里的每一项都生效
+（依赖是模块时 `=y` 会被降成 `=m`）。已用：1 = 首个 7.3 构建。

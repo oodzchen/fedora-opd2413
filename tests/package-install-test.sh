@@ -55,18 +55,21 @@ fi
 
 cat "${out}/report.txt"
 esp=${out}/esp
-entry=${esp}/loader/entries/fedora-7.2.6.conf
+kver=$(ls "${esp}/fedora")
+[ "$(echo "${kver}" | wc -w)" = 1 ] || { echo "FAIL: expected one kernel on the ESP: ${kver}" >&2; exit 1; }
+kre=${kver//./\\.}
+entry=${esp}/loader/entries/fedora-${kver}.conf
 fail=0
 bad() { echo "FAIL: $*" >&2; fail=1; }
 has() { grep -qxE "$1" "${entry}" || bad "entry lacks: $1"; }
-has 'linux +/fedora/7\.2\.6/linux'
-has 'initrd +/fedora/7\.2\.6/initrd'
-has 'devicetree +/fedora/7\.2\.6/sm8750-oneplus-pad2pro\.dtb'
+has "linux +/fedora/${kre}/linux"
+has "initrd +/fedora/${kre}/initrd"
+has "devicetree +/fedora/${kre}/sm8750-oneplus-pad2pro\\.dtb"
 has 'options +root=UUID=.* rootflags=subvol=fedora ro'
-for f in fedora/7.2.6/linux fedora/7.2.6/initrd dtbs/qcom/sm8750-oneplus-pad2pro.dtb; do
+for f in fedora/${kver}/linux fedora/${kver}/initrd dtbs/qcom/sm8750-oneplus-pad2pro.dtb; do
     [ -s "${esp}/${f}" ] || bad "missing on ESP: ${f}"
 done
-cmp -s "${esp}/dtbs/qcom/sm8750-oneplus-pad2pro.dtb" "${esp}/fedora/7.2.6/sm8750-oneplus-pad2pro.dtb" \
+cmp -s "${esp}/dtbs/qcom/sm8750-oneplus-pad2pro.dtb" "${esp}/fedora/${kver}/sm8750-oneplus-pad2pro.dtb" \
     || bad "fixed-path DTB differs from the entry DTB"
 
 # Every device firmware file must be inside the initramfs: 62 stock files, the
@@ -77,7 +80,7 @@ missing=0
 while read -r path; do
     grep -qE "[[:space:]]${path#/}\$" "${out}/initrd-list.txt" || { bad "initramfs lacks ${path}"; missing=$((missing + 1)); }
 done < "${need}"
-echo "initramfs: $(stat -c %s "${esp}/fedora/7.2.6/initrd") bytes, $(wc -l < "${need}") device firmware files required, ${missing} missing"
+echo "initramfs: $(stat -c %s "${esp}/fedora/${kver}/initrd") bytes, $(wc -l < "${need}") device firmware files required, ${missing} missing"
 grep -A3 -e '--- fedora kernels' "${out}/report.txt" | grep -q '^kernel' && bad "Fedora kernel packages are not excluded"
 
 [ "$(cat "${out}/negative.txt")" = refused ] || bad "kernel-install accepted an initramfs without device firmware"

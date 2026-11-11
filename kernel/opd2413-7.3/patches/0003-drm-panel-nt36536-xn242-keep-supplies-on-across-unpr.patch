@@ -1,0 +1,72 @@
+From 2ec052eeb974880a483e7352b543591820292cf0 Mon Sep 17 00:00:00 2001
+From: trial <trial@localhost>
+Date: Wed, 11 Nov 2026 09:59:27 +0800
+Subject: [PATCH 3/3] drm/panel: nt36536-xn242: keep supplies on across
+ unprepare (1411), keep_powered parameter
+
+---
+ .../drm/panel/panel-novatek-nt36536-xn242.c   | 28 ++++++++++++++++---
+ 1 file changed, 24 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/panel/panel-novatek-nt36536-xn242.c b/drivers/gpu/drm/panel/panel-novatek-nt36536-xn242.c
+index 4f9aad0da..41ea67396 100644
+--- a/drivers/gpu/drm/panel/panel-novatek-nt36536-xn242.c
++++ b/drivers/gpu/drm/panel/panel-novatek-nt36536-xn242.c
+@@ -29,8 +29,21 @@ struct novatek_nt36536 {
+ 	struct regulator *vddio;
+ 	struct regulator *vsp;
+ 	struct regulator *vsn;
++	bool powered;
+ };
+ 
++/*
++ * With the supplies fully cut, the panel stayed dark after the next prepare
++ * under the earlier power sequence (OPD2413 kernel 7.2.6-2, patch 1411): it
++ * accepted the init commands and reported display on, but showed nothing.
++ * By default unprepare therefore only sends display off and sleep in, and
++ * prepare resets and re-initialises the powered panel. Clear this to test a
++ * full power cycle with the vendor supply sequence below.
++ */
++static bool keep_powered = true;
++module_param(keep_powered, bool, 0644);
++MODULE_PARM_DESC(keep_powered, "Keep the panel supplies on while the panel is off (default: true)");
++
+ static inline struct novatek_nt36536 *to_novatek_nt36536(struct drm_panel *panel)
+ {
+ 	return container_of(panel, struct novatek_nt36536, panel);
+@@ -252,9 +265,12 @@ static int novatek_nt36536_prepare(struct drm_panel *panel)
+ 	struct mipi_dsi_multi_context dsi_ctx = { .dsi = ctx->dsi[1] };
+ 	int ret;
+ 
+-	ret = novatek_nt36536_power_on(ctx);
+-	if (ret < 0)
+-		return ret;
++	if (!ctx->powered) {
++		ret = novatek_nt36536_power_on(ctx);
++		if (ret < 0)
++			return ret;
++		ctx->powered = true;
++	}
+ 
+ 	novatek_nt36536_reset(ctx);
+ 
+@@ -278,6 +294,7 @@ static int novatek_nt36536_prepare(struct drm_panel *panel)
+ 
+ err:
+ 	novatek_nt36536_power_off(ctx);
++	ctx->powered = false;
+ 
+ 	return ret;
+ }
+@@ -292,7 +309,10 @@ static int novatek_nt36536_unprepare(struct drm_panel *panel)
+ 	if (ret < 0)
+ 		dev_err(dev, "failed to off panel: %d\n", ret);
+ 
+-	novatek_nt36536_power_off(ctx);
++	if (!keep_powered) {
++		novatek_nt36536_power_off(ctx);
++		ctx->powered = false;
++	}
+ 
+ 	return 0;
+ }

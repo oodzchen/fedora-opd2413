@@ -5,8 +5,8 @@
 
 ## 唯一的下一步
 
-**M3：解决 erhai v0.7.2 三方合并到 Fedora 7.3.3 的冲突**（36 个文件，约 100 处，集中在音频），然后移植 Armada 独有的显示修复、
-定配置、编译。路线、调查结论和完成标准见 [M3-KERNEL.md](M3-KERNEL.md)，工作区是 `out/m3-tree` 的 `m3-merge` 分支。
+**M3a 上机：在平板上安装 `kernel-opd2413-7.3.3-1.opd2413`**（离线已通过：编译、DTB 对比、容器安装测试、QEMU 启动链），
+需要用户确认。步骤和判据见 [M3-KERNEL.md](M3-KERNEL.md) 的"上机"一节与 [KERNEL-UPDATE.md](KERNEL-UPDATE.md)。
 M2 剩下的被动观察项：开机提示音毛刺再出现时当场取证；空闲自动熄屏能否恢复。
 
 ## 当前阻塞
