@@ -76,9 +76,10 @@ Fedora 的软件包原样安装、由 dnf 管理；设备适配只通过几个�
 - `dracut-config-rescue` 的 kernel-install 插件被 `opd2413-device` 屏蔽（ESP 放不下第二个 initramfs）。
 - 不装 GRUB 和 shim。
 
-已知缺口（登记在技术债表）：固定路径的 DTB 是全局的，回滚到旧内核时 DTB 不跟着回滚。
-长期方案是每个条目自带 `devicetree`，需要先在 QEMU 里验证 U-Boot 的 EFI 是否接受
-systemd-boot 替换设备树。
+内核实际用的是条目里 `devicetree` 行指定的那份：systemd-boot 用它替换 U-Boot 交给 EFI 的设备树，U-Boot 再通过 EFI 设备树
+修补协议补上 `/chosen` 和内存等信息。2026-11-11 真机验证（条目 DTB 里加的标记属性出现在 `/proc/device-tree/chosen`，
+`u-boot,version` 也在）。所以每个内核用自己同次构建的 DTB，回滚内核时 DTB 一起回滚；固定路径那份只给 U-Boot 自己用，
+也是没有 `devicetree` 行的条目的兜底。
 
 ### ESP 容量
 

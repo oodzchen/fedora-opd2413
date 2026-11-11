@@ -6,7 +6,6 @@
 | # | 临时做法 | 位置 | 为什么暂时需要 | 影响 | 去掉的条件 |
 |---|---|---|---|---|---|
 | 1 | 启动参数 `clk_ignore_unused pd_ignore_unused regulator_ignore_unused` | `/etc/kernel/cmdline` | 沿用 Armada 已验证的组合；没人逐个验证过去掉后哪些外设掉电 | 功耗偏高，掩盖设备树里缺失的资源声明；休眠达不到最深态 | M3 合入 erhai 的休眠系列后逐个去掉，每个冷启动验证 |
-| 3 | DTB 放在 ESP 固定路径，对所有内核全局生效 | ESP `/dtbs/qcom/sm8750-oneplus-pad2pro.dtb`；U-Boot 在 `boot_b` 里写死这个路径 | U-Boot 现在这样加载；改它要重写 `boot_b` | 回滚到旧内核时 DTB 不跟着回滚，DTB 与内核可能不匹配 | 条目已自带 `devicetree` 行，QEMU 里这样的条目能启动内核（2026-11-10）；还要在真机确认内核拿到的是条目的 DTB 而不是 U-Boot 传入的那份，之后固定路径的副本只作兜底 |
 | 4 | 沿用 Armada 7.2.6 内核和它的整套补丁（含约 250 个其他掌机的补丁），从 armada 仓库忽略目录里的一棵已编译的树构建 | `kernel-opd2413`、`out/kernel-tree` | M1 只换发行版 | 内核落后于 Fedora，没有安全更新；配置不是 Fedora 的（只并入了 Fedora 的 netfilter 选项和 LSM 顺序，`kernel/opd2413/fedora-netfilter-lsm.config`） | M3 换到 Fedora 的内核基线（7.3.x） |
 | 5 | 扬声器没有原厂保护算法，固定增益 350 / −2.5 dB | UCM、内核 `1408` | 原厂保护在 Android HAL 和 ADSP 调参里，未移植 | 大音量长时间播放有损坏扬声器的风险 | 调研 AW88261 自身保护配置或 ADSP 侧保护模块 |
 | 6 | 分区名和 kShimC 菜单标题仍叫 "Armada"（"Armada" 项现在启动的是 Fedora） | GPT、`boot_b` 里的 kShimC 清单和 U-Boot 参数 | 改名要改 GPT 并重写 `boot_b` | 只是名字不符 | 下一次因为别的原因必须重写 `boot_b` 时一起改 |

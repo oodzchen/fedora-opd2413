@@ -350,3 +350,14 @@ initrd 1.6 s + userspace 8 s。
   `kernel-install add`（ESP 上条目以外的文件哈希不变）。冷启动：内核 3，`getenforce` 为 Enforcing，启动参数里没有
   `enforcing=`，AVC 0，失败单元 0，firewalld 运行，自动登录进入桌面。
 - **注意**：回退内核 2 没有 SELinux（技术债 #22）。
+
+### 每条目 DTB 真机验证
+
+- 问题：U-Boot 从 ESP 固定路径加载 DTB 交给 EFI；条目里也有 `devicetree` 行。三份 DTB 内容相同，只读手段分不出内核用的是哪份。
+- 实验：主机上用 `fdtput` 在内核 3 的 DTB 的 `/chosen` 里加 `opd2413,dtb-source = "entry-dtbtest"`（dts 对比只差这一行），
+  放到 ESP `/opd2413-dtbtest/`，新增条目 `opd2413-dtbtest.conf`（不用 `fedora-` 前缀，因为 `loader.conf` 的
+  `default fedora-*` 会匹配它；`sort-key zz-dtbtest` 排最后）。`bootctl set-oneshot` 失败：U-Boot 不支持运行时写 EFI 变量
+  （efivars 只读），由用户在 kShimC 选 "Armada boot menu" 后手选测试项。
+- 结果：`LoaderEntrySelected` 为测试项；`/proc/device-tree/chosen/opd2413,dtb-source` 为 `entry-dtbtest`，`u-boot,version`、
+  `linux,uefi-*` 也都在（U-Boot 的修补作用在了替换后的 DTB 上）；`running`，Enforcing。
+- 清理：删掉测试条目和目录，ESP 文件集合与测试前相同。技术债 #3 关闭。
