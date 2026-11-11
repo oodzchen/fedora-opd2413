@@ -87,6 +87,19 @@ Fedora 7.3 的配置**没有开 SM8750 的 GCC、引脚、互联**，原版 Fedo
 funnel/cti/tmc/stm 驱动都正常加载过）；手写笔充电器节点（驱动未开）；两颗电荷泵；ramoops 移到 0xafff00000；去掉串口控制台；
 PCIe WAKE# 改为低有效；CPU 温区少了一个没挂降频的 90°C passive 触发点（118°C 的 passive 降频仍在，效果相同）。
 
+## 上机（M3a）
+
+写入：`/etc/modprobe.d/opd2413-pps.conf`（`options erhai_pps pps_enable=0`）；`dnf install` 内核包
+（`installonly_limit=2` 自动卸掉 `7.2.6-2.opd2413`，kernel-install 在 ESP 写 `fedora/7.3.3-1.opd2413/` 和条目）。
+内核 3 保留为回退项。新条目版本最高，成为默认项。
+
+1. 装前：内核 3 是当前最新且已真机通过的内核；ESP 空闲约 268 MB（卸 2 腾出约 128 MB，新内核约 19 MB + hostonly initramfs）。
+2. 装后：`rpm -q kernel-opd2413` 为 3 和 7.3.3-1；ESP 上两个条目；`lsinitrd` 能看到设备固件；ESP 上条目以外的文件哈希不变。
+3. 重启（kShimC 选 "Armada"）。起不来就重启后选 "Armada boot menu"，在 systemd-boot 里选内核 3。
+4. 判据（M3a 完成标准）：`uname -r`、`running`、失败单元、`getenforce`、AVC、`journalctl -b -p err`；KWin 硬件渲染；
+   用户确认画面、触控、键盘和触控板、声音、亮度、Wi-Fi、熄屏后亮屏；之后再冷启动 4 次都有画面。
+5. 首次启动若整机重启或卡住，先怀疑：CoreSight 新节点、hostonly initramfs 缺模块、DRM 交接。
+
 ## 工作区（主机，忽略目录）
 
 | 路径 | 内容 |
