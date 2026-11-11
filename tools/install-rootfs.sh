@@ -103,7 +103,10 @@ echo "KEYMAP=us" > "${target}/etc/vconsole.conf"
 systemd-machine-id-setup --root="${target}"
 
 # Hardware-related arguments are the ones the 7.2.6 kernel was validated with.
-# SELinux starts permissive: files are labelled on the first boot.
+# SELinux starts permissive: files are labelled on the first boot. Once that
+# boot shows no AVC denials, drop enforcing=0 here and run kernel-install add
+# for each installed kernel (needs a kernel with selinux in CONFIG_LSM,
+# 7.2.6-3.opd2413 or later).
 echo fedora > "${target}/etc/kernel/entry-token"
 cat > "${target}/etc/kernel/cmdline" <<EOF
 root=UUID=${root_uuid} rootflags=subvol=${root_subvol},${mount_opts} ro console=tty0 quiet loglevel=3 allow_mismatched_32bit_el0 fw_devlink.strict=1 pcie_ports=compat psi=1 cpufreq.default_governor=schedutil swiotlb=8192 clk_ignore_unused pd_ignore_unused regulator_ignore_unused enforcing=0

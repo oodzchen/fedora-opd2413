@@ -31,6 +31,7 @@ tools/build-kernel-rpm.sh <armada>/output/opd2413-stage4/kern2/out/armada-kernel
 |---|---|---|
 | `1411-drm-panel-nt36536-keep-supplies-on-across-unprepare.patch` | 熄屏时面板保持供电，亮屏时复位并重发初始化命令 | 2026-11-11 用户目视确认多次熄屏亮屏都恢复画面 |
 | `1412-drm-panel-nt36536-offer-only-120hz.patch` | 只报告 120 Hz 模式（60/30 Hz 出不了画面） | 显示设置只剩 120 Hz |
+| `fedora-netfilter-lsm.config`（配置片段） | Fedora 45 内核的全部 netfilter 选项，Fedora 的 LSM 顺序（含 selinux），`SECURITY_SELINUX_BOOTPARAM=y` | 2026-11-11 内核 3：SELinux enforcing、firewalld 运行，AVC 0 |
 
 `experiments/` 里是排查用的诊断补丁（读回面板电源状态、保持供电的第一版），不进正式内核。
 
@@ -46,6 +47,8 @@ cp $A/grey1/ktz8866.c.before out/kernel-tree/drivers/video/backlight/ktz8866.c  
 cd out/kernel-tree
 patch -p1 < ../../kernel/opd2413/1411-*.patch
 patch -p1 < ../../kernel/opd2413/1412-*.patch
+ARCH=arm64 scripts/kconfig/merge_config.sh -m .config ../../kernel/opd2413/fedora-netfilter-lsm.config
+make ARCH=arm64 olddefconfig
 make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LOCALVERSION=-<N>.opd2413 -j15 Image modules
 make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LOCALVERSION=-<N>.opd2413 \
      INSTALL_MOD_PATH=<stage> INSTALL_MOD_STRIP=1 modules_install
@@ -56,11 +59,14 @@ make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LOCALVERSION=-<N>.opd2413 \
 
 规则：
 
-- 版本号 `7.2.6-<N>.opd2413`，`N` 每次构建加一、不复用（已用：1 = 原始 kern2 的 `7.2.6`，2 = 1411+1412）。
+- 版本号 `7.2.6-<N>.opd2413`，`N` 每次构建加一、不复用（已用：1 = 原始 kern2 的 `7.2.6`，2 = 1411+1412，3 = 再加配置片段）。
   **一个版本号不能是另一个的前缀**：卸载内核时 kernel-install 会删除所有 `fedora-<kver>*.conf`，
   2026-11-11 卸载 `7.2.6` 时把 `7.2.6-diag1`、`7.2.6-diag2` 的条目一起删了。
 - 必须 `INSTALL_MOD_STRIP=1`（否则模块 2.2 GB）；它只去掉调试段，模块的 `.BTF` 保留。
 - 内核和模块必须同次构建、一起安装。
+- 合并配置后对比一下哪些选项没进去：内核 3 只丢了 `NF_CONNTRACK_OVS`、`NF_NAT_OVS`（本内核没有 Open vSwitch），
+  合并前的配置留在 `out/kernel-config.kern2-plus-1411-1412`。
+- 主机工具链变了（2026-11-11 binutils 升到 2.47）会导致整棵树重编，约 17 分钟（`-j15`）。
 
 这套做法是 M1 的权宜之计（技术债 #4），M3 换成 Fedora 的 kernel.spec。
 

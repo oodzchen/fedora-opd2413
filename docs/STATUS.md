@@ -5,8 +5,10 @@
 
 ## 唯一的下一步
 
-**确认空闲自动熄屏后能恢复**（KDE 默认插电约 10 分钟、电池约 5 分钟）。机制与已验证的熄屏亮屏相同，但要在日常使用中
-看到一次。之后按 M2 的顺序继续：卸掉诊断内核 `7.2.6-diag2`、SELinux（`lsm=`）、防火墙、调试启动参数、开机提示音毛刺。
+**真机确认内核用的是启动条目里的 DTB**（技术债 #3）：做一份只改一个无害属性（如 `/chosen` 下加一个标记）的条目 DTB，
+看 `/proc/device-tree` 里出现的是哪一份。通过后固定路径的 DTB 只作兜底，内核和 DTB 可以一起回滚。
+之后按 M2 的顺序继续：开机提示音毛刺、Wi-Fi 省电模式是否导致 SSH 偶尔超时、内核升级和回滚流程写成文档。
+空闲自动熄屏后能否恢复，留意日常使用中看到一次即可（机制与已验证的熄屏亮屏相同）。
 
 ## 当前阻塞
 
@@ -22,8 +24,9 @@
 
 ## 设备状态（2026-11-11）
 
-- 平板运行 Fedora 45 KDE，内核 `7.2.6-2.opd2413`（默认），回退项 `7.2.6-diag2`（诊断内核：熄屏时保持供电并打印面板读回）。
-  设备包 `opd2413-device/audio-0.1-5`（`installonly_limit=2`）。
+- 平板运行 Fedora 45 KDE，内核 `7.2.6-3.opd2413`（默认，带 SELinux 和 Fedora 的 netfilter 配置），
+  回退项 `7.2.6-2.opd2413`（没有 SELinux，用它启动时 SELinux 为关闭状态）。设备包 `opd2413-device/audio-0.1-5`（`installonly_limit=2`）。
+- SELinux enforcing（`/etc/selinux/config`，启动参数里已没有 `enforcing=0`），firewalld 运行中（public 区）。
 - 自动登录到 `colin`，自动锁屏已关；KDE 空闲熄屏已恢复默认。
 - 显示模式只有 120 Hz。
 - Armada 已完全删除；`boot_b`、分区表、Android 各分区未改动。
@@ -33,10 +36,11 @@
 
 | 路径 | 内容 |
 |---|---|
-| `out/rpms/` | 四个软件包和 `SHA256SUMS`，与平板上装的一致 |
+| `out/rpms/` | 四个软件包和 `SHA256SUMS`，与平板上装的一致（内核 3） |
+| `out/old-rpms/` | 以前的内核包（1、2、opd1、diag1、diag2），2 是平板上的回退内核 |
 | `out/pkg-test/`、`out/qemu-test/` | 两个离线测试的证据 |
 | `private/esp-20261110/esp-sda16.img` | ESP 整分区备份（含 `KSHIM.CHO`） |
-| `out/kernel-tree/` | kern2 源码树的副本 + 1411/1412，见 kernel/README.md |
+| `out/kernel-tree/` | kern2 源码树的副本 + 1411/1412 + `fedora-netfilter-lsm.config`，见 kernel/README.md |
 | `private/display-*` | 黑屏排查的证据和抓取脚本 |
 | `private/ssh.sh`、`private/scp.sh` | 连平板的 SSH / scp 包装（`OPD_OS=fedora` 用 Fedora 的地址和主机密钥） |
 | `private/install.env` | 用户给的初始密码 |
@@ -47,7 +51,7 @@
 |---|---|---|
 | M0 | 立项：决定、仓库、架构和进度文档 | 完成（2026-11-10） |
 | M1 | Fedora 45 KDE 用现有 7.2.6 内核从机内启动，功能与 Armada 持平，然后取代 Armada | 完成（2026-11-11） |
-| M2 | 运行中面板重新打开黑屏（已修）；标准化：SELinux、防火墙、去掉调试启动参数、内核升级和回滚流程、每条目 DTB | 进行中 |
+| M2 | 运行中面板重新打开黑屏（已修）；标准化：SELinux（已完成）、防火墙（已完成）、内核升级和回滚流程、每条目 DTB | 进行中 |
 | M3 | 内核升到 Fedora 45 的当前内核（2026-11-10 为 7.3.3），合入 erhai 的休眠、充电、蓝牙、相机、传感器 | 未开始 |
 | M4 | 外设逐项验收和长尾问题（灰闪、USB 3 方向、DP 音频等） | 未开始 |
 | M5 | 维护：软件包自动重建、ColorOS OTA 后恢复流程、对外文档 | 未开始 |
@@ -98,4 +102,5 @@ Armada 下的结论见 [HARDWARE.md](HARDWARE.md)。换了发行版后都要重�
 | DP 外接显示 | 有源码线索 | erhai |
 | USB 3 双向 | 待调研 | |
 | 合盖、电源键、音量键 | 有源码线索 | erhai；关机后插着电会自动重新开机，待拔线复测 |
-| SELinux enforcing | 真机失败 | Armada 内核的 `CONFIG_LSM` 不含 selinux，且没有 `SECURITY_SELINUX_BOOTPARAM`，`enforcing=0` 无效，现在是 Disabled；需要加 `lsm=` 参数（M2） |
+| SELinux enforcing | 真机通过 | 内核 3 加入 selinux；首启 relabel 23 s；permissive 和运行中 enforcing 下用户试用触控、键盘、声音、亮度、浏览器、设置均无拒绝；改为开机 enforcing 后冷启动 AVC 0（2026-11-11） |
+| 防火墙 | 真机启动 | firewalld `running`，public 区绑定 wlp1s0；SSH 可连；规则本身未逐条验证 |
