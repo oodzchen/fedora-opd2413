@@ -1,0 +1,10 @@
+# M3 feature patches on top of the 7.2.15 base (tools/kernel/apply-armada-series.sh).
+# Applied in this order by tools/kernel/apply-opd2413-features.sh, strictly (patch -F0).
+# Numbering: 2001-2099 Bluetooth, 2100-2199 battery and charging, 2200-2299 suspend and keys,
+# 2300- sensors, camera, video decode. Sources in kernel/PATCHES.md.
+
+# M3.1 Bluetooth
+2001-Bluetooth-hci_qca-reset-the-in-band-sleep-state-on-power-off.patch
+
+# M3.2 battery and charging (a: fixed 9 V PD; PPS drivers not built)
+2101-power-supply-qcom_battmgr-take-the-erhai-v0.7.2-driver.patch

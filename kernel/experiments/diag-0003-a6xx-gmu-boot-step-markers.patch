@@ -1,0 +1,243 @@
+Subject: [PATCH] drm/msm/a6xx: OPD2413 diagnosis: mark every GMU boot step
+
+Diagnostic only, never for a production kernel. 7.3.3-3 resets the tablet a
+few milliseconds after "Loaded GMU firmware" (experiment 12, 2026-11-11).
+Each step of a6xx_gmu_resume(), a6xx_gmu_fw_start(), a6xx_gmu_start() and
+a6xx_hfi_start() prints one emergency-level line and waits 40 ms, so the
+ramoops console of the failed boot shows the last step that was reached.
+No register write, order or value is changed; GMU boot takes about 1.5 s longer.
+
+Local change; no third-party code. Applies to the m3-merge tree (7.3.3-3 source).
+
+diff --git a/drivers/gpu/drm/msm/adreno/a6xx_gmu.c b/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
+index 541a8caf7..1076dc034 100644
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
+@@ -3,6 +3,7 @@
+ 
+ #include <linux/bitfield.h>
+ #include <linux/clk.h>
++#include <linux/delay.h>
+ #include <linux/firmware/qcom/qcom_scm.h>
+ #include <linux/interconnect.h>
+ #include <linux/of_platform.h>
+@@ -17,6 +18,17 @@
+ #include "a6xx_gmu.xml.h"
+ #include "msm_gem.h"
+ #include "msm_gpu_trace.h"
++
++/*
++ * OPD2413 boot diagnosis only: the tablet resets while the GMU boots and the
++ * console log in ramoops is the only evidence. Print each step at emergency
++ * level (reaches the pstore console whatever the loglevel) and wait so the
++ * line is in RAM before the next register write.
++ */
++#define OPD_GMU_MARK(fmt, ...) do { \
++	pr_emerg("opd2413-gmu: " fmt "\n", ##__VA_ARGS__); \
++	mdelay(40); \
++} while (0)
+ #include "msm_mmu.h"
+ 
+ static void a6xx_gmu_fault(struct a6xx_gmu *gmu)
+@@ -326,10 +338,13 @@ static int a6xx_gmu_start(struct a6xx_gmu *gmu)
+ 		gmu_write(gmu, REG_A6XX_GPU_GMU_CX_GMU_PWR_COL_CP_RESP, 0);
+ 
+ 
++	OPD_GMU_MARK("start: releasing CM3 from reset");
+ 	gmu_write(gmu, REG_A6XX_GMU_CM3_SYSRESET, 0);
++	OPD_GMU_MARK("start: CM3 released, polling FW_INIT_RESULT");
+ 
+ 	ret = gmu_poll_timeout(gmu, REG_A6XX_GMU_CM3_FW_INIT_RESULT, val,
+ 		(val & mask) == reset_val, 100, 100000);
++	OPD_GMU_MARK("start: FW_INIT_RESULT ret=%d val=%#x", ret, val);
+ 
+ 	if (ret)
+ 		DRM_DEV_ERROR(gmu->dev, "GMU firmware initialization timed out\n");
+@@ -344,6 +359,7 @@ static int a6xx_gmu_hfi_start(struct a6xx_gmu *gmu)
+ 	u32 val;
+ 	int ret;
+ 
++	OPD_GMU_MARK("hfi_ctrl: writing HFI_CTRL_INIT");
+ 	gmu_write(gmu, REG_A6XX_GMU_HFI_CTRL_INIT, 1);
+ 
+ 	ret = gmu_poll_timeout(gmu, REG_A6XX_GMU_HFI_CTRL_STATUS, val,
+@@ -965,9 +981,11 @@ static int a6xx_gmu_fw_start(struct a6xx_gmu *gmu, unsigned int state)
+ 	else if (!adreno_is_a8xx(adreno_gpu))
+ 		gmu_write(gmu, REG_A6XX_GMU_GENERAL_7, 1);
+ 
++	OPD_GMU_MARK("fw_start: state=%u, before rpmh_start", state);
+ 	ret = a6xx_rpmh_start(gmu);
+ 	if (ret)
+ 		return ret;
++	OPD_GMU_MARK("fw_start: rpmh_start ok");
+ 
+ 	if (state == GMU_COLD_BOOT) {
+ 		if (WARN(!adreno_gpu->fw[ADRENO_FW_GMU],
+@@ -978,6 +996,7 @@ static int a6xx_gmu_fw_start(struct a6xx_gmu *gmu, unsigned int state)
+ 		if (ret)
+ 			return ret;
+ 	}
++	OPD_GMU_MARK("fw_start: firmware in place");
+ 
+ 	/* Clear init result to make sure we are getting a fresh value */
+ 	gmu_write(gmu, REG_A6XX_GMU_CM3_FW_INIT_RESULT, 0);
+@@ -1041,6 +1060,7 @@ static int a6xx_gmu_fw_start(struct a6xx_gmu *gmu, unsigned int state)
+ 			  gmu->log.iova | (gmu->log.size / SZ_4K - 1));
+ 	}
+ 
++	OPD_GMU_MARK("fw_start: boot config written, before CX GBIF");
+ 	/* For A7x and newer, do the CX GBIF configurations before GMU wake up */
+ 	for (int i = 0; (gbif_cx && gbif_cx[i].offset); i++)
+ 		gpu_write(gpu, gbif_cx[i].offset, gbif_cx[i].value);
+@@ -1052,12 +1072,15 @@ static int a6xx_gmu_fw_start(struct a6xx_gmu *gmu, unsigned int state)
+ 		gpu_rmw(gpu, REG_A6XX_GBIF_CX_CONFIG, GENMASK(31, 29),
+ 			FIELD_PREP(GENMASK(31, 29), 2));
+ 
++	OPD_GMU_MARK("fw_start: before power_config");
+ 	/* Set up the lowest idle level on the GMU */
+ 	a6xx_gmu_power_config(gmu);
++	OPD_GMU_MARK("fw_start: power_config done");
+ 
+ 	ret = a6xx_gmu_start(gmu);
+ 	if (ret)
+ 		return ret;
++	OPD_GMU_MARK("fw_start: gmu_start ok");
+ 
+ 	if (gmu->legacy) {
+ 		ret = a6xx_gmu_gfx_rail_on(gmu);
+@@ -1072,6 +1095,7 @@ static int a6xx_gmu_fw_start(struct a6xx_gmu *gmu, unsigned int state)
+ 	ret = a6xx_gmu_hfi_start(gmu);
+ 	if (ret)
+ 		return ret;
++	OPD_GMU_MARK("fw_start: HFI queues up");
+ 
+ 	/* FIXME: Do we need this wmb() here? */
+ 	wmb();
+@@ -1331,10 +1355,13 @@ int a6xx_gmu_resume(struct a6xx_gpu *a6xx_gpu)
+ 
+ 	gmu->hung = false;
+ 
++	OPD_GMU_MARK("resume: begin");
+ 	/* Turn on the resources */
+ 	pm_runtime_get_sync(gmu->dev);
++	OPD_GMU_MARK("resume: gmu runtime PM on (CX)");
+ 
+ 	a6xx_gmu_gxpd_get(gmu);
++	OPD_GMU_MARK("resume: GX power domain requested");
+ 
+ 	/* Use a known rate to bring up the GMU */
+ 	clk_set_rate(gmu->core_clk, 200000000);
+@@ -1343,16 +1370,19 @@ int a6xx_gmu_resume(struct a6xx_gpu *a6xx_gpu)
+ 	ret = clk_bulk_prepare_enable(gmu->nr_clocks, gmu->clocks);
+ 	if (ret)
+ 		goto rpm_put;
++	OPD_GMU_MARK("resume: clocks on");
+ 
+ 	ret = a6xx_gmu_secure_init(a6xx_gpu);
+ 	if (ret)
+ 		goto disable_clk;
++	OPD_GMU_MARK("resume: secure init done");
+ 
+ 	/* Read the slice info on A8x GPUs */
+ 	a8xx_gpu_get_slice_info(gpu);
+ 
+ 	/* Set the bus quota to a reasonable value for boot */
+ 	a6xx_gmu_set_initial_bw(gpu, gmu);
++	OPD_GMU_MARK("resume: slice info read, initial bus vote set");
+ 
+ 	/* The mask resets to 0 with the GMU: keep HFI replies off the irq line */
+ 	gmu_write(gmu, REG_A6XX_GMU_GMU2HOST_INTR_MASK, ~0);
+@@ -1377,13 +1407,16 @@ int a6xx_gmu_resume(struct a6xx_gpu *a6xx_gpu)
+ 		status = GMU_COLD_BOOT;
+ 	}
+ 
++	OPD_GMU_MARK("resume: gmu irq enabled, boot status=%d", status);
+ 	ret = a6xx_gmu_fw_start(gmu, status);
+ 	if (ret)
+ 		goto disable_irq;
++	OPD_GMU_MARK("resume: fw_start ok");
+ 
+ 	ret = a6xx_hfi_start(gmu, status);
+ 	if (ret)
+ 		goto disable_irq;
++	OPD_GMU_MARK("resume: hfi_start ok");
+ 
+ 	/*
+ 	 * Turn on the GMU firmware fault interrupt after we know the boot
+@@ -1395,6 +1428,7 @@ int a6xx_gmu_resume(struct a6xx_gpu *a6xx_gpu)
+ 
+ 	/* Set the GPU to the current freq */
+ 	a6xx_gmu_set_initial_freq(gpu, gmu);
++	OPD_GMU_MARK("resume: initial frequency set, GMU boot complete");
+ 
+ 	return 0;
+ 
+diff --git a/drivers/gpu/drm/msm/adreno/a6xx_hfi.c b/drivers/gpu/drm/msm/adreno/a6xx_hfi.c
+index 2c07b3b0f..5f82caa09 100644
+--- a/drivers/gpu/drm/msm/adreno/a6xx_hfi.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_hfi.c
+@@ -3,6 +3,7 @@
+ 
+ #include <linux/completion.h>
+ #include <linux/circ_buf.h>
++#include <linux/delay.h>
+ #include <linux/list.h>
+ 
+ #include <soc/qcom/cmd-db.h>
+@@ -12,6 +13,12 @@
+ #include "a6xx_gmu.xml.h"
+ #include "a6xx_gpu.h"
+ 
++/* OPD2413 boot diagnosis only, see a6xx_gmu.c */
++#define OPD_GMU_MARK(fmt, ...) do { \
++	pr_emerg("opd2413-gmu: " fmt "\n", ##__VA_ARGS__); \
++	mdelay(40); \
++} while (0)
++
+ #define HFI_MSG_ID(val) [val] = #val
+ 
+ static const char * const a6xx_hfi_msg_id[] = {
+@@ -981,23 +988,33 @@ int a6xx_hfi_start(struct a6xx_gmu *gmu, int boot_state)
+ 		return a6xx_hfi_start_v1(gmu, boot_state);
+ 
+ 
++	OPD_GMU_MARK("hfi: send_perf_table");
+ 	ret = a6xx_hfi_send_perf_table(gmu);
++	OPD_GMU_MARK("hfi: send_perf_table ret=%d", ret);
+ 	if (ret)
+ 		return ret;
+ 
++	OPD_GMU_MARK("hfi: send_bw_table");
+ 	ret = a6xx_hfi_send_bw_table(gmu);
++	OPD_GMU_MARK("hfi: send_bw_table ret=%d", ret);
+ 	if (ret)
+ 		return ret;
+ 
++	OPD_GMU_MARK("hfi: enable_acd");
+ 	ret = a6xx_hfi_enable_acd(gmu);
++	OPD_GMU_MARK("hfi: enable_acd ret=%d", ret);
+ 	if (ret)
+ 		return ret;
+ 
++	OPD_GMU_MARK("hfi: enable_ifpc");
+ 	ret = a6xx_hfi_enable_ifpc(gmu);
++	OPD_GMU_MARK("hfi: enable_ifpc ret=%d", ret);
+ 	if (ret)
+ 		return ret;
+ 
++	OPD_GMU_MARK("hfi: send_core_fw_start");
+ 	ret = a6xx_hfi_send_core_fw_start(gmu);
++	OPD_GMU_MARK("hfi: send_core_fw_start ret=%d", ret);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -1005,7 +1022,9 @@ int a6xx_hfi_start(struct a6xx_gmu *gmu, int boot_state)
+ 	 * Downstream driver sends this in its "a6xx_hw_init" equivalent,
+ 	 * but seems to be no harm in sending it here
+ 	 */
++	OPD_GMU_MARK("hfi: send_start");
+ 	ret = a6xx_hfi_send_start(gmu);
++	OPD_GMU_MARK("hfi: send_start ret=%d", ret);
+ 	if (ret)
+ 		return ret;
+ 
