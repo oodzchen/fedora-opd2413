@@ -1,0 +1,422 @@
+From: Ajay Kumar Nandam <ajay.nandam@oss.qualcomm.com>
+Subject: [PATCH] ASoC: codecs: lpass-{tx,va}-macro: take the erhai v0.7.2 drivers
+
+Replace lpass-tx-macro.c and lpass-va-macro.c with the files of
+erhai-v0.7.2 and drop their PM_CLK dependency as erhai does. The kernel 3
+series carried the earlier "switch to PM clock framework for runtime PM"
+versions; erhai moved on to the FROMLIST "manage clocks in runtime PM"
+versions, which enable macro, dcodec, mclk, npl and fsgen explicitly, and
+adds HPF cut-off controls for the TX decimators (used by the UCM).
+
+On OPD2413 with the PM-clock versions, microphone capture returns
+full-scale garbage (~30000 zero crossings per second, almost unchanged
+when the ADC and decimator gains are lowered by 28 dB).
+
+erhai commits on these files, oldest first (authors as recorded there):
+  bc29c081e yzddmr6: ASoC: codecs: lpass-tx-macro: add HPF cut-off controls for the decimators
+  c11156217 Ajay Kumar Nandam: ASoC: codecs: lpass-va-macro: Switch to PM clock framework for runtime PM
+  b723cd554 Ajay Kumar Nandam: ASoC: codecs: lpass-tx-macro: switch to PM clock framework for runtime PM
+  d4f6a79ba Ajay Kumar Nandam: ASoC: codecs: lpass-{tx,rx}-macro: check clk_set_rate() return value
+  75cf773ca Noahcdls: ASoC: codecs: lpass-macro: force runtime suspend across system sleep
+  a7b7b0818 yzddmr6: Revert forced LPASS system suspend for resume isolation
+  431d7ce0f yzddmr6: clk: qcom: gcc-sm8750: retain PCIe power while isolating resume resets
+  9ead6de36 Ajay Kumar Nandam: FROMLIST: ASoC: codecs: lpass-tx-macro: manage clocks in runtime PM
+  385a9a869 Ajay Kumar Nandam: FROMLIST: ASoC: codecs: lpass-va-macro: manage clocks in runtime PM
+  f09e9e8f6 yzddmr6: ASoC: codecs: lpass: remove unused TX and VA PM clock dependencies (Kconfig)
+
+[opd2413: files taken whole from erhai-v0.7.2; From: names the author of
+ the two FROMLIST commits that change the clock handling.]
+---
+ sound/soc/codecs/Kconfig          |   2 -
+ sound/soc/codecs/lpass-tx-macro.c | 124 +++++++++++++++++++++++++++++---------
+ sound/soc/codecs/lpass-va-macro.c |  75 ++++++++++++++---------
+ 3 files changed, 142 insertions(+), 59 deletions(-)
+
+diff --git a/sound/soc/codecs/Kconfig b/sound/soc/codecs/Kconfig
+index 20a2bbaa8..a55d9aed1 100644
+--- a/sound/soc/codecs/Kconfig
++++ b/sound/soc/codecs/Kconfig
+@@ -2905,7 +2905,6 @@ config SND_SOC_LPASS_WSA_MACRO
+ 
+ config SND_SOC_LPASS_VA_MACRO
+ 	depends on COMMON_CLK
+-	depends on PM_CLK
+ 	select REGMAP_MMIO
+ 	select SND_SOC_LPASS_MACRO_COMMON
+ 	tristate "Qualcomm VA Macro in LPASS(Low Power Audio SubSystem)"
+@@ -2919,7 +2918,6 @@ config SND_SOC_LPASS_RX_MACRO
+ 
+ config SND_SOC_LPASS_TX_MACRO
+ 	depends on COMMON_CLK
+-	depends on PM_CLK
+ 	select REGMAP_MMIO
+ 	select SND_SOC_LPASS_MACRO_COMMON
+ 	tristate "Qualcomm TX Macro in LPASS(Low Power Audio SubSystem)"
+diff --git a/sound/soc/codecs/lpass-tx-macro.c b/sound/soc/codecs/lpass-tx-macro.c
+index 4731d1764..64e8d178b 100644
+--- a/sound/soc/codecs/lpass-tx-macro.c
++++ b/sound/soc/codecs/lpass-tx-macro.c
+@@ -6,7 +6,6 @@
+ #include <linux/clk.h>
+ #include <linux/io.h>
+ #include <linux/platform_device.h>
+-#include <linux/pm_clock.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/regmap.h>
+ #include <sound/soc.h>
+@@ -93,6 +92,7 @@
+ #define CDC_TXn_PH_EN_MASK		BIT(0)
+ #define CDC_TXn_ADC_MODE_MASK		GENMASK(2, 1)
+ #define CDC_TXn_HPF_CUT_FREQ_MASK	GENMASK(6, 5)
++#define CDC_TXn_HPF_CUT_FREQ_SHIFT	5
+ #define CDC_TXn_ADC_DMIC_SEL_MASK	BIT(7)
+ #define CDC_TX0_TX_PATH_CFG1		(0x0408)
+ #define CDC_TXn_TX_VOL_CTL(n)		(0x040C + 0x80 * n)
+@@ -271,6 +271,7 @@ struct tx_macro {
+ 	struct hpf_work tx_hpf_work[NUM_DECIMATORS];
+ 	struct tx_mute_work tx_mute_dwork[NUM_DECIMATORS];
+ 	unsigned long active_ch_mask[TX_MACRO_MAX_DAIS];
++	unsigned long active_ch_cnt[TX_MACRO_MAX_DAIS];
+ 	struct regmap *regmap;
+ 	struct clk *mclk;
+ 	struct clk *npl;
+@@ -287,6 +288,53 @@ struct tx_macro {
+ };
+ #define to_tx_macro(_hw) container_of(_hw, struct tx_macro, hw)
+ 
++static void tx_macro_disable_clocks(struct tx_macro *tx)
++{
++	clk_disable_unprepare(tx->fsgen);
++	clk_disable_unprepare(tx->npl);
++	clk_disable_unprepare(tx->mclk);
++	clk_disable_unprepare(tx->dcodec);
++	clk_disable_unprepare(tx->macro);
++}
++
++static int tx_macro_enable_clocks(struct tx_macro *tx)
++{
++	int ret;
++
++	ret = clk_prepare_enable(tx->macro);
++	if (ret)
++		return ret;
++
++	ret = clk_prepare_enable(tx->dcodec);
++	if (ret)
++		goto err_dcodec;
++
++	ret = clk_prepare_enable(tx->mclk);
++	if (ret)
++		goto err_mclk;
++
++	ret = clk_prepare_enable(tx->npl);
++	if (ret)
++		goto err_npl;
++
++	ret = clk_prepare_enable(tx->fsgen);
++	if (ret)
++		goto err_fsgen;
++
++	return 0;
++
++err_fsgen:
++	clk_disable_unprepare(tx->npl);
++err_npl:
++	clk_disable_unprepare(tx->mclk);
++err_mclk:
++	clk_disable_unprepare(tx->dcodec);
++err_dcodec:
++	clk_disable_unprepare(tx->macro);
++
++	return ret;
++}
++
+ static const DECLARE_TLV_DB_SCALE(digital_gain, -8400, 100, -8400);
+ 
+ static struct reg_default tx_defaults[] = {
+@@ -888,7 +936,13 @@ static int tx_macro_tx_mixer_put(struct snd_kcontrol *kcontrol,
+ 	if (!!enable == test_bit(dec_id, &tx->active_ch_mask[dai_id]))
+ 		return 0;
+ 
+-	assign_bit(dec_id, &tx->active_ch_mask[dai_id], enable);
++	if (enable) {
++		set_bit(dec_id, &tx->active_ch_mask[dai_id]);
++		tx->active_ch_cnt[dai_id]++;
++	} else {
++		tx->active_ch_cnt[dai_id]--;
++		clear_bit(dec_id, &tx->active_ch_mask[dai_id]);
++	}
+ 	snd_soc_dapm_mixer_update_power(widget->dapm, kcontrol, enable, update);
+ 
+ 	return 1;
+@@ -1166,7 +1220,7 @@ static int tx_macro_get_channel_map(const struct snd_soc_dai *dai,
+ 	case TX_MACRO_AIF2_CAP:
+ 	case TX_MACRO_AIF3_CAP:
+ 		*tx_slot = tx->active_ch_mask[dai->id];
+-		*tx_num = hweight_long(tx->active_ch_mask[dai->id]);
++		*tx_num = tx->active_ch_cnt[dai->id];
+ 		break;
+ 	default:
+ 		break;
+@@ -1178,12 +1232,12 @@ static int tx_macro_digital_mute(struct snd_soc_dai *dai, int mute, int stream)
+ {
+ 	struct snd_soc_component *component = dai->component;
+ 	struct tx_macro *tx = snd_soc_component_get_drvdata(component);
+-	unsigned long decimator;
++	u8 decimator;
+ 
+ 	for_each_set_bit(decimator, &tx->active_ch_mask[dai->id], TX_MACRO_DEC_MAX)
+ 		snd_soc_component_write_field(component,
+ 					      CDC_TXn_TX_PATH_CTL(decimator),
+-					      CDC_TXn_PGA_MUTE_MASK, mute ? 1 : 0);
++					      CDC_TXn_PGA_MUTE_MASK, !!mute);
+ 
+ 	return 0;
+ }
+@@ -1338,6 +1392,29 @@ static const struct soc_enum dec_mode_mux_enum[] = {
+ 			dec_mode_mux_text),
+ };
+ 
++static const char * const hpf_cut_off_text[] = {
++	"CF_NEG_3DB_4HZ", "CF_NEG_3DB_75HZ", "CF_NEG_3DB_150HZ",
++};
++
++static const struct soc_enum hpf_cut_off_enum[] = {
++	SOC_ENUM_SINGLE(CDC_TXn_TX_PATH_CFG0(0), CDC_TXn_HPF_CUT_FREQ_SHIFT,
++			ARRAY_SIZE(hpf_cut_off_text), hpf_cut_off_text),
++	SOC_ENUM_SINGLE(CDC_TXn_TX_PATH_CFG0(1), CDC_TXn_HPF_CUT_FREQ_SHIFT,
++			ARRAY_SIZE(hpf_cut_off_text), hpf_cut_off_text),
++	SOC_ENUM_SINGLE(CDC_TXn_TX_PATH_CFG0(2), CDC_TXn_HPF_CUT_FREQ_SHIFT,
++			ARRAY_SIZE(hpf_cut_off_text), hpf_cut_off_text),
++	SOC_ENUM_SINGLE(CDC_TXn_TX_PATH_CFG0(3), CDC_TXn_HPF_CUT_FREQ_SHIFT,
++			ARRAY_SIZE(hpf_cut_off_text), hpf_cut_off_text),
++	SOC_ENUM_SINGLE(CDC_TXn_TX_PATH_CFG0(4), CDC_TXn_HPF_CUT_FREQ_SHIFT,
++			ARRAY_SIZE(hpf_cut_off_text), hpf_cut_off_text),
++	SOC_ENUM_SINGLE(CDC_TXn_TX_PATH_CFG0(5), CDC_TXn_HPF_CUT_FREQ_SHIFT,
++			ARRAY_SIZE(hpf_cut_off_text), hpf_cut_off_text),
++	SOC_ENUM_SINGLE(CDC_TXn_TX_PATH_CFG0(6), CDC_TXn_HPF_CUT_FREQ_SHIFT,
++			ARRAY_SIZE(hpf_cut_off_text), hpf_cut_off_text),
++	SOC_ENUM_SINGLE(CDC_TXn_TX_PATH_CFG0(7), CDC_TXn_HPF_CUT_FREQ_SHIFT,
++			ARRAY_SIZE(hpf_cut_off_text), hpf_cut_off_text),
++};
++
+ static const struct snd_kcontrol_new tx_aif1_cap_mixer[] = {
+ 	SOC_SINGLE_EXT("DEC0", SND_SOC_NOPM, TX_MACRO_DEC0, 1, 0,
+ 			tx_macro_tx_mixer_get, tx_macro_tx_mixer_put),
+@@ -2053,6 +2130,15 @@ static const struct snd_kcontrol_new tx_macro_snd_controls[] = {
+ 	SOC_ENUM_EXT("DEC7 MODE", dec_mode_mux_enum[7],
+ 			tx_macro_dec_mode_get, tx_macro_dec_mode_put),
+ 
++	SOC_ENUM("TX0 HPF cut off", hpf_cut_off_enum[0]),
++	SOC_ENUM("TX1 HPF cut off", hpf_cut_off_enum[1]),
++	SOC_ENUM("TX2 HPF cut off", hpf_cut_off_enum[2]),
++	SOC_ENUM("TX3 HPF cut off", hpf_cut_off_enum[3]),
++	SOC_ENUM("TX4 HPF cut off", hpf_cut_off_enum[4]),
++	SOC_ENUM("TX5 HPF cut off", hpf_cut_off_enum[5]),
++	SOC_ENUM("TX6 HPF cut off", hpf_cut_off_enum[6]),
++	SOC_ENUM("TX7 HPF cut off", hpf_cut_off_enum[7]),
++
+ 	SOC_SINGLE_EXT("DEC0_BCS Switch", SND_SOC_NOPM, 0, 1, 0,
+ 		       tx_macro_get_bcs, tx_macro_set_bcs),
+ };
+@@ -2299,14 +2385,6 @@ static int tx_macro_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		goto err;
+ 
+-	ret = devm_pm_clk_create(dev);
+-	if (ret)
+-		goto err;
+-
+-	ret = of_pm_clk_add_clks(dev);
+-	if (ret < 0)
+-		goto err;
+-
+ 	pm_runtime_set_autosuspend_delay(dev, 100);
+ 	pm_runtime_use_autosuspend(dev);
+ 	ret = devm_pm_runtime_enable(dev);
+@@ -2317,7 +2395,6 @@ static int tx_macro_probe(struct platform_device *pdev)
+ 	if (ret < 0)
+ 		goto err;
+ 
+-
+ 	/* reset soundwire block */
+ 	if (tx->data->flags & LPASS_MACRO_FLAG_RESET_SWR)
+ 		regmap_update_bits(tx->regmap, CDC_TX_CLK_RST_CTRL_SWR_CONTROL,
+@@ -2366,16 +2443,9 @@ static void tx_macro_remove(struct platform_device *pdev)
+ static int tx_macro_runtime_suspend(struct device *dev)
+ {
+ 	struct tx_macro *tx = dev_get_drvdata(dev);
+-	int ret;
+ 
+ 	regcache_cache_only(tx->regmap, true);
+-
+-	ret = pm_clk_suspend(dev);
+-	if (ret) {
+-		regcache_cache_only(tx->regmap, false);
+-		return ret;
+-	}
+-
++	tx_macro_disable_clocks(tx);
+ 	regcache_mark_dirty(tx->regmap);
+ 
+ 	return 0;
+@@ -2386,7 +2456,7 @@ static int tx_macro_runtime_resume(struct device *dev)
+ 	struct tx_macro *tx = dev_get_drvdata(dev);
+ 	int ret;
+ 
+-	ret = pm_clk_resume(dev);
++	ret = tx_macro_enable_clocks(tx);
+ 	if (ret) {
+ 		regcache_cache_only(tx->regmap, true);
+ 		regcache_mark_dirty(tx->regmap);
+@@ -2398,17 +2468,15 @@ static int tx_macro_runtime_resume(struct device *dev)
+ 	if (ret) {
+ 		regcache_cache_only(tx->regmap, true);
+ 		regcache_mark_dirty(tx->regmap);
+-		pm_clk_suspend(dev);
++		tx_macro_disable_clocks(tx);
+ 		return ret;
+ 	}
+ 
+ 	return 0;
+ }
+ 
+-static const struct dev_pm_ops tx_macro_pm_ops = {
+-	SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, pm_runtime_force_resume)
+-	RUNTIME_PM_OPS(tx_macro_runtime_suspend, tx_macro_runtime_resume, NULL)
+-};
++static DEFINE_RUNTIME_DEV_PM_OPS(tx_macro_pm_ops, tx_macro_runtime_suspend,
++				 tx_macro_runtime_resume, NULL);
+ 
+ static const struct tx_macro_data lpass_ver_9 = {
+ 	.flags			= LPASS_MACRO_FLAG_HAS_NPL_CLOCK |
+diff --git a/sound/soc/codecs/lpass-va-macro.c b/sound/soc/codecs/lpass-va-macro.c
+index 8f52a2997..167f45b5c 100644
+--- a/sound/soc/codecs/lpass-va-macro.c
++++ b/sound/soc/codecs/lpass-va-macro.c
+@@ -10,7 +10,6 @@
+ #include <linux/of_clk.h>
+ #include <linux/of_platform.h>
+ #include <linux/platform_device.h>
+-#include <linux/pm_clock.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/regmap.h>
+ #include <linux/regulator/consumer.h>
+@@ -260,6 +259,46 @@ static const struct va_macro_data sm8550_va_data = {
+ 	.has_npl_clk = false,
+ };
+ 
++static void va_macro_disable_clocks(struct va_macro *va)
++{
++	clk_disable_unprepare(va->npl);
++	clk_disable_unprepare(va->mclk);
++	clk_disable_unprepare(va->dcodec);
++	clk_disable_unprepare(va->macro);
++}
++
++static int va_macro_enable_clocks(struct va_macro *va)
++{
++	int ret;
++
++	ret = clk_prepare_enable(va->macro);
++	if (ret)
++		return ret;
++
++	ret = clk_prepare_enable(va->dcodec);
++	if (ret)
++		goto err_dcodec;
++
++	ret = clk_prepare_enable(va->mclk);
++	if (ret)
++		goto err_mclk;
++
++	ret = clk_prepare_enable(va->npl);
++	if (ret)
++		goto err_npl;
++
++	return 0;
++
++err_npl:
++	clk_disable_unprepare(va->mclk);
++err_mclk:
++	clk_disable_unprepare(va->dcodec);
++err_dcodec:
++	clk_disable_unprepare(va->macro);
++
++	return ret;
++}
++
+ static bool va_is_volatile_register(struct device *dev, unsigned int reg)
+ {
+ 	switch (reg) {
+@@ -1617,14 +1656,6 @@ static int va_macro_probe(struct platform_device *pdev)
+ 		clk_set_rate(va->npl, 2 * VA_MACRO_MCLK_FREQ);
+ 	}
+ 
+-	ret = devm_pm_clk_create(dev);
+-	if (ret)
+-		goto err;
+-
+-	ret = of_pm_clk_add_clks(dev);
+-	if (ret < 0)
+-		goto err;
+-
+ 	pm_runtime_set_autosuspend_delay(dev, 100);
+ 	pm_runtime_use_autosuspend(dev);
+ 	ret = devm_pm_runtime_enable(dev);
+@@ -1715,16 +1746,9 @@ static void va_macro_remove(struct platform_device *pdev)
+ static int va_macro_runtime_suspend(struct device *dev)
+ {
+ 	struct va_macro *va = dev_get_drvdata(dev);
+-	int ret;
+ 
+ 	regcache_cache_only(va->regmap, true);
+-
+-	ret = pm_clk_suspend(dev);
+-	if (ret) {
+-		regcache_cache_only(va->regmap, false);
+-		return ret;
+-	}
+-
++	va_macro_disable_clocks(va);
+ 	regcache_mark_dirty(va->regmap);
+ 
+ 	return 0;
+@@ -1733,9 +1757,9 @@ static int va_macro_runtime_suspend(struct device *dev)
+ static int va_macro_runtime_resume(struct device *dev)
+ {
+ 	struct va_macro *va = dev_get_drvdata(dev);
+-	int ret, sret;
++	int ret;
+ 
+-	ret = pm_clk_resume(dev);
++	ret = va_macro_enable_clocks(va);
+ 	if (ret) {
+ 		regcache_cache_only(va->regmap, true);
+ 		regcache_mark_dirty(va->regmap);
+@@ -1748,22 +1772,15 @@ static int va_macro_runtime_resume(struct device *dev)
+ 	if (ret) {
+ 		regcache_cache_only(va->regmap, true);
+ 		regcache_mark_dirty(va->regmap);
+-		sret = pm_clk_suspend(dev);
+-		if (sret)
+-			dev_err(va->dev,
+-				"failed to suspend clocks after regcache sync failure: %d\n",
+-				sret);
++		va_macro_disable_clocks(va);
+ 		return ret;
+ 	}
+ 
+ 	return 0;
+ }
+ 
+-
+-static const struct dev_pm_ops va_macro_pm_ops = {
+-	SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, pm_runtime_force_resume)
+-	RUNTIME_PM_OPS(va_macro_runtime_suspend, va_macro_runtime_resume, NULL)
+-};
++static DEFINE_RUNTIME_DEV_PM_OPS(va_macro_pm_ops, va_macro_runtime_suspend,
++				 va_macro_runtime_resume, NULL);
+ 
+ static const struct of_device_id va_macro_dt_match[] = {
+ 	{ .compatible = "qcom,sc7280-lpass-va-macro", .data = &sc7280_va_data },

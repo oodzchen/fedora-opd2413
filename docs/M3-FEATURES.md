@@ -151,6 +151,16 @@ erhai v0.7.2 的状态（`onepluspad-2pro-mainline` README）：视频硬解（I
 摄像头（M3.4b，`7.2.15-5`）真机通过：erhai 的 46 个相机提交 `2301`–`2346`，libcamera 0.7.2（Fedora）simple 管线 + 软件 ISP，Snapshot 前后摄预览、拍照、录像正常，约 32 fps。已知限制：没有自动对焦、没有传感器调校（偏色、四角暗、画质低）。相机 ISP/CSI PHY 有了驱动后，interconnect、rpmhpd、camcc 的 sync_state 自然完成，技术债 #34 只剩 GMU。
 录像无声音而是满幅噪音：麦克风采集本身坏了（见 WORKLOG 2026-11-12 M3.4b），另立"麦克风"一项。
 
+## M3.5 麦克风、M3.6 键盘（2026-11-12 真机通过）
+
+麦克风：录到满幅噪音、且逐次启动时好时坏。根因：WCD939x 的 ADC1–4 共用一个 SoundWire 端口，`wcd939x_get_swr_port()` 按端口报告开关状态，
+`alsactl` 保存/恢复混音器状态后 ADC2/ADC3 的通道位被置上，编解码器发 4 声道而 SoC 收 2 声道。修复：内核 `2407`（按声道报告和切换）+ UCM 打开麦克风时先关 ADC2/ADC3（opd2413-audio 0.1-12）。
+排查中试过但不是原因的：erhai 的 lpass-tx/va-macro（`2401`，保留，带 HPF 控件）、整套 erhai 音频驱动（实验内核 7.2.15-7，已删）、TX SoundWire 端口布局（`2402`，已撤）、
+ADSP 丢消息修复（`2404`–`2406`，保留，消除了开机的 `qcom-apm CMD timeout`）。
+
+键盘：麦克风键发 F13、锁屏键发 F24 → 设备包 0.1-11 的 hwdb 映射为 `micmute`、`screenlock`；Esc 键固件发 AC Back → 内核 `2403` 报 `KEY_ESC`。
+按住放大镜键时用户确认 F3/F6 可用。
+
 ## 回馈 erhai
 
 用户同意把发现和修复同步给 erhai。每次提交前先问用户；不带序列号、MAC、UUID、IP 等本机数据。目前可整理的候选：
@@ -160,4 +170,7 @@ erhai v0.7.2 的状态（`onepluspad-2pro-mainline` README）：视频硬解（I
 | 7.3.3 上的三个问题（GMU 启动时整机复位、ath12k 扫不到 AP、声卡 deferred）及取证方法 | 只有现象和定位范围，没有修复；对 erhai 作者做 7.3 时有参考价值 |
 | ramoops 在本机可用，以及 systemd-pstore 会搬走并覆盖记录、`quiet` 下控制台区几乎为空这两个坑 | 已真机验证，可写成说明 |
 | erhai 没有而本机验证过的修复：开机显示交接（Armada `1404`–`1407`、`1409`）、熄屏保持面板供电（`1411`） | 原作者是 Armada/本仓库，回馈时保留来源 |
+| wcd939x 开关按端口报告导致多开声道（`2407`，wcd938x 同样写法） | 已真机验证，可提交上游/erhai |
+| erhai `095062299` 的 TX 端口布局：单独不是麦克风坏的原因（与 `2407` 配合时 erhai 布局可用） | 已验证，回馈时说明 |
+| 键盘：Esc 键（`2403`）、麦克风/锁屏键（hwdb） | 已真机验证 |
 | 在 7.2 上合入各功能时发现的问题 | 随做随记到这里 |

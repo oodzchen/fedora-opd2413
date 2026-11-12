@@ -1,0 +1,9 @@
+# OnePlus Pad 2 Pro pogo keyboard (oneplus-pogo-keyboard driver; its keymap is
+# indexed by HID keyboard usage). The keyboard firmware sends keyboard usages
+# for two top-row keys that ColorOS maps itself: the microphone key sends F13
+# (0x68), which desktops treat as the Tools key, and the lock key sends F24
+# (0x73), which nothing handles. (The driver's Fn layer would report F3/F6
+# for them, but with the magnifier key held these two keys send nothing.)
+evdev:name:OnePlus Pad 2 Pro Keyboard:*
+ KEYBOARD_KEY_68=micmute
+ KEYBOARD_KEY_73=screenlock

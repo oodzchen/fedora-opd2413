@@ -1,0 +1,37 @@
+From: Kholin <oodzchen@gmail.com>
+Subject: [PATCH] Input: oneplus-pogo-keyboard - report the Esc key as KEY_ESC
+
+The key printed Esc in the top-left corner sends the consumer usage AC
+Back (0x0224), which ColorOS uses as the Android back key; the driver
+reports it as KEY_BACK, so desktop applications never see Escape. The
+key goes through the media-key table, which udev hwdb cannot remap.
+Report it as KEY_ESC.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ drivers/input/keyboard/oneplus-pogo-keyboard.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/input/keyboard/oneplus-pogo-keyboard.c b/drivers/input/keyboard/oneplus-pogo-keyboard.c
+index 1004d6256..eb32be658 100644
+--- a/drivers/input/keyboard/oneplus-pogo-keyboard.c
++++ b/drivers/input/keyboard/oneplus-pogo-keyboard.c
+@@ -198,6 +198,9 @@ static const struct {
+  * user-assignable keys).  The split screen and device interconnect keys
+  * have no standard equivalent and are not reported.  fn_code is the code
+  * reported while the Fn key is held.
++ *
++ * The key in the Esc position sends AC Back (0x0224) for Android; it is
++ * printed Esc and is reported as KEY_ESC here.
+  */
+ static const struct {
+ 	u16 usage;
+@@ -213,7 +216,7 @@ static const struct {
+ 	{ 0x00e9, KEY_VOLUMEUP, KEY_F12 },
+ 	{ 0x00ea, KEY_VOLUMEDOWN, KEY_F11 },
+ 	{ 0x01d0, KEY_FN },
+-	{ 0x0224, KEY_BACK },
++	{ 0x0224, KEY_ESC },
+ 	{ 0x0244, KEY_APPSELECT },
+ 	{ 0x02fa, KEY_ASSISTANT },
+ 	{ 0x038e, KEY_SCREENLOCK, KEY_F6 },

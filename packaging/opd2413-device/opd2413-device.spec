@@ -35,6 +35,7 @@ install -D -m 0755 %{srcdir}/libexec/ufs-guard %{buildroot}/usr/libexec/opd2413/
 install -D -m 0755 %{srcdir}/libexec/early-firmware %{buildroot}/usr/libexec/opd2413/early-firmware
 install -D -m 0755 %{srcdir}/libexec/boot-select %{buildroot}/usr/libexec/opd2413/boot-select
 install -D -m 0644 %{srcdir}/udev/90-opd2413-ufs-guard.rules %{buildroot}/usr/lib/udev/rules.d/90-opd2413-ufs-guard.rules
+install -D -m 0644 %{srcdir}/udev/90-opd2413-pogo-keyboard.hwdb %{buildroot}/usr/lib/udev/hwdb.d/90-opd2413-pogo-keyboard.hwdb
 install -D -m 0755 %{srcdir}/dracut/90opd2413/module-setup.sh %{buildroot}/usr/lib/dracut/modules.d/90opd2413/module-setup.sh
 install -D -m 0644 %{srcdir}/dracut/90-opd2413.conf %{buildroot}/usr/lib/dracut/dracut.conf.d/90-opd2413.conf
 install -D -m 0644 %{srcdir}/kernel-install/50-opd2413.conf %{buildroot}/usr/lib/kernel/install.conf.d/50-opd2413.conf
@@ -57,6 +58,7 @@ ln -s ../opd2413-boot-restore.service %{buildroot}/usr/lib/systemd/system/sysini
 %files
 /usr/libexec/opd2413
 /usr/lib/udev/rules.d/90-opd2413-ufs-guard.rules
+/usr/lib/udev/hwdb.d/90-opd2413-pogo-keyboard.hwdb
 /usr/lib/dracut/modules.d/90opd2413
 /usr/lib/dracut/dracut.conf.d/90-opd2413.conf
 /usr/lib/kernel/install.conf.d/50-opd2413.conf

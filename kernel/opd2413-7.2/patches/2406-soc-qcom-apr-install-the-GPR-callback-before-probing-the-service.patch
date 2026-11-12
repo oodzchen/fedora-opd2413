@@ -1,0 +1,46 @@
+From e8c5cc534faf0304e647e36bedc66de4daf66c3b Mon Sep 17 00:00:00 2001
+From: Junhao Xie <bigfoot@radxa.com>
+Date: Sat, 5 Sep 2026 16:54:30 +0800
+Subject: [PATCH] soc: qcom: apr: install the GPR callback before probing the
+ service
+
+apr_device_probe() assigned adev->svc.callback only after the driver's probe returned:
+
+ret = adrv->probe(adev); if (!ret) adev->svc.callback = adrv->gpr_callback;
+
+Signed-off-by: Junhao Xie <bigfoot@radxa.com>
+(cherry picked from commit fdb8767545ea19f7c796caba4c9509ac9e9b48ed)
+
+(cherry picked from commit e7d6f4959c959c8a91fcbf7cd2b1bddae0902cf7)
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Assisted-by: LLM
+---
+ drivers/soc/qcom/apr.c | 14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/soc/qcom/apr.c b/drivers/soc/qcom/apr.c
+index ea7f83916..8fe72daa2 100644
+--- a/drivers/soc/qcom/apr.c
++++ b/drivers/soc/qcom/apr.c
+@@ -367,9 +367,19 @@ static int apr_device_probe(struct device *dev)
+ 	struct apr_driver *adrv = to_apr_driver(dev->driver);
+ 	int ret;
+ 
++	/*
++	 * Install the response callback before probing. A driver may issue a
++	 * synchronous request from its own probe - q6apm asks the DSP for the
++	 * SPF state - and the reply can arrive while probe is still running.
++	 * gpr_do_rx_callback() drops packets for a service with no callback,
++	 * so setting it afterwards loses that reply and the request always
++	 * times out, no matter how long it waits.
++	 */
++	adev->svc.callback = adrv->gpr_callback;
++
+ 	ret = adrv->probe(adev);
+-	if (!ret)
+-		adev->svc.callback = adrv->gpr_callback;
++	if (ret)
++		adev->svc.callback = NULL;
+ 
+ 	return ret;
+ }

@@ -1,0 +1,196 @@
+From 0ccae66657fb4cfa137b1ceacea956c21de94998 Mon Sep 17 00:00:00 2001
+From: yzddmr6 <46088090+yzddmr6@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 11:22:50 +0800
+Subject: [PATCH] rpmsg: glink: hold messages that arrive before the endpoint
+ can take them
+
+A remote may send on a channel as soon as it has been granted an intent,
+and qcom_glink_handle_intent_req() grants one for any open channel. When
+the remote opened the channel, qcom_glink_create_ept() sends the open-ack
+and open-request and then waits for the remote's ack before it sets the
+endpoint callback, and the rpmsg core only calls the driver's probe after
+the endpoint exists. A message that arrives in either window reaches a
+NULL callback, or a callback that returns -EAGAIN because its driver has
+not finished probing, and GLINK drops it: the callback's return value is
+ignored and the intent is returned to the remote.
+
+QRTR depends on not losing that message. qcom_smd_qrtr_callback() returns
+-EAGAIN until its probe has registered the endpoint, which the SMD
+transport honours by leaving the message in its FIFO. Over GLINK the
+remote's first packet, the HELLO of its name service, is lost instead;
+the local name service only greets a node in reply to its HELLO, so the
+two never exchange their servers. The lost HELLO prevents audio, charger and sensor
+services from being discovered until the next reboot.
+
+Keep a complete message on a per-channel list when the endpoint has no
+callback or the callback returns -EAGAIN, and deliver the list in order
+once the callback is set, once the driver has probed (announce_create)
+and on every later arrival. The intent is returned to the remote only
+after delivery, so the remote cannot overwrite a held message and runs
+out of intents rather than outpacing a stalled client. Other callback
+errors still drop the message as before. Held messages are returned when
+the endpoint is destroyed and freed with an intentless channel.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Source-commit: 235ab34e2a6e2434dacc2fad7c0c52ffd1b04589
+Assisted-by: LLM
+
+[opd2413: erhai 0ccae6665; context refreshed (erhai applied it over a
+ temporary diagnostic it later removed); the code change is unchanged.]
+---
+diff --git a/drivers/rpmsg/qcom_glink_native.c b/drivers/rpmsg/qcom_glink_native.c
+index fda1ddda0..1fcd6d0b1 100644
+--- a/drivers/rpmsg/qcom_glink_native.c
++++ b/drivers/rpmsg/qcom_glink_native.c
+@@ -153,6 +153,7 @@ enum {
+  * @buf:	receive buffer, for gathering fragments
+  * @buf_offset:	write offset in @buf
+  * @buf_size:	size of current @buf
++ * @pending_rx:	received messages held until the endpoint can take them
+  * @open_ack:	completed once remote has acked the open-request
+  * @open_req:	completed once open-request has been received
+  * @intent_req_lock: Synchronises multiple intent requests
+@@ -184,6 +185,8 @@ struct glink_channel {
+ 	int buf_offset;
+ 	int buf_size;
+ 
++	struct list_head pending_rx;
++
+ 	struct completion open_ack;
+ 	struct completion open_req;
+ 
+@@ -248,6 +251,7 @@ static struct glink_channel *qcom_glink_alloc_channel(struct qcom_glink *glink,
+ 	init_waitqueue_head(&channel->intent_req_wq);
+ 
+ 	INIT_LIST_HEAD(&channel->done_intents);
++	INIT_LIST_HEAD(&channel->pending_rx);
+ 	INIT_WORK(&channel->intent_work, qcom_glink_rx_done_work);
+ 
+ 	idr_init(&channel->liids);
+@@ -269,6 +273,15 @@ static void qcom_glink_channel_release(struct kref *ref)
+ 	/* cancel pending rx_done work */
+ 	cancel_work_sync(&channel->intent_work);
+ 
++	/* Held messages of intentless channels own their buffer */
++	if (channel->glink->intentless) {
++		list_for_each_entry_safe(intent, tmp, &channel->pending_rx, node) {
++			list_del(&intent->node);
++			kfree(intent->data);
++			kfree(intent);
++		}
++	}
++
+ 	spin_lock_irqsave(&channel->intent_lock, flags);
+ 	/* Free all non-reuse intents pending rx_done work */
+ 	list_for_each_entry_safe(intent, tmp, &channel->done_intents, node) {
+@@ -895,6 +908,37 @@ static int qcom_glink_rx_defer(struct qcom_glink *glink, size_t extra)
+ 	return 0;
+ }
+ 
++/*
++ * Deliver the messages held on @channel in arrival order. A message is held
++ * when it arrives before the endpoint has a callback, or when the callback
++ * returns -EAGAIN because its driver has not finished probing: the remote may
++ * send as soon as it has been granted an intent, which can be before
++ * qcom_glink_create_ept() sets the callback and before the rpmsg driver's
++ * probe returns. The intent is only returned to the remote once the message
++ * has been delivered. Called with channel->recv_lock held.
++ */
++static void qcom_glink_deliver_pending(struct qcom_glink *glink,
++				       struct glink_channel *channel)
++{
++	struct glink_core_rx_intent *intent, *tmp;
++	int ret;
++
++	list_for_each_entry_safe(intent, tmp, &channel->pending_rx, node) {
++		if (!channel->ept.cb)
++			return;
++
++		ret = channel->ept.cb(channel->ept.rpdev, intent->data,
++				      intent->offset, channel->ept.priv,
++				      RPMSG_ADDR_ANY);
++		if (ret == -EAGAIN)
++			return;
++
++		list_del(&intent->node);
++		intent->offset = 0;
++		qcom_glink_rx_done(glink, channel, intent);
++	}
++}
++
+ static int qcom_glink_rx_data(struct qcom_glink *glink, size_t avail)
+ {
+ 	struct glink_core_rx_intent *intent;
+@@ -991,20 +1035,12 @@ static int qcom_glink_rx_data(struct qcom_glink *glink, size_t avail)
+ 
+ 	/* Handle message when no fragments remain to be received */
+ 	if (!left_size) {
+-		spin_lock(&channel->recv_lock);
+-		if (channel->ept.cb) {
+-			channel->ept.cb(channel->ept.rpdev,
+-					intent->data,
+-					intent->offset,
+-					channel->ept.priv,
+-					RPMSG_ADDR_ANY);
+-		}
+-		spin_unlock(&channel->recv_lock);
+-
+-		intent->offset = 0;
+ 		channel->buf = NULL;
+ 
+-		qcom_glink_rx_done(glink, channel, intent);
++		spin_lock(&channel->recv_lock);
++		list_add_tail(&intent->node, &channel->pending_rx);
++		qcom_glink_deliver_pending(glink, channel);
++		spin_unlock(&channel->recv_lock);
+ 	}
+ 
+ advance_rx:
+@@ -1350,10 +1386,14 @@ static struct rpmsg_endpoint *qcom_glink_create_ept(struct rpmsg_device *rpdev,
+ 
+ 	ept = &channel->ept;
+ 	ept->rpdev = rpdev;
+-	ept->cb = cb;
+ 	ept->priv = priv;
+ 	ept->ops = &glink_endpoint_ops;
+ 
++	spin_lock_irqsave(&channel->recv_lock, flags);
++	ept->cb = cb;
++	qcom_glink_deliver_pending(glink, channel);
++	spin_unlock_irqrestore(&channel->recv_lock, flags);
++
+ 	return ept;
+ }
+ 
+@@ -1368,8 +1408,14 @@ static int qcom_glink_announce_create(struct rpmsg_device *rpdev)
+ 	int num_intents;
+ 	int num_groups = 1;
+ 	__be32 *val = defaults;
++	unsigned long flags;
+ 	int size;
+ 
++	/* The driver has probed; deliver what it could not take before */
++	spin_lock_irqsave(&channel->recv_lock, flags);
++	qcom_glink_deliver_pending(glink, channel);
++	spin_unlock_irqrestore(&channel->recv_lock, flags);
++
+ 	if (glink->intentless || !completion_done(&channel->open_ack))
+ 		return 0;
+ 
+@@ -1412,10 +1458,16 @@ static void qcom_glink_destroy_ept(struct rpmsg_endpoint *ept)
+ {
+ 	struct glink_channel *channel = to_glink_channel(ept);
+ 	struct qcom_glink *glink = channel->glink;
++	struct glink_core_rx_intent *intent, *tmp;
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&channel->recv_lock, flags);
+ 	channel->ept.cb = NULL;
++	list_for_each_entry_safe(intent, tmp, &channel->pending_rx, node) {
++		list_del(&intent->node);
++		intent->offset = 0;
++		qcom_glink_rx_done(glink, channel, intent);
++	}
+ 	spin_unlock_irqrestore(&channel->recv_lock, flags);
+ 
+ 	qcom_glink_send_close_req(glink, channel);

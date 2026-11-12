@@ -59,3 +59,13 @@
 2344-i2c-add-flip-controls-to-the-SmartSens-sensors.patch
 2345-i2c-add-the-2x2-binning-modes-of-the-SmartSens-sensors.patch
 2346-qcom-camss-report-frame-starts-on-SM8750.patch
+
+# M3.5 microphone
+2401-ASoC-codecs-lpass-tx-va-macro-take-the-erhai-v0.7.2-drivers.patch
+2404-remoteproc-qcom-q6v5-make-handover-IRQ-one-shot.patch
+2405-rpmsg-glink-hold-messages-that-arrive-before-the-endpoint-can-take-them.patch
+2406-soc-qcom-apr-install-the-GPR-callback-before-probing-the-service.patch
+2407-ASoC-codecs-wcd939x-report-and-switch-SoundWire-channels-individually.patch
+
+# M3.6 keyboard
+2403-Input-oneplus-pogo-keyboard-report-the-Esc-key-as-KEY_ESC.patch

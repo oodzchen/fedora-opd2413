@@ -51,3 +51,8 @@
 | `7.2.15-3` | M3.2a 电池与充电：`2101`（erhai v0.7.2 的 battmgr 整文件：电流符号、去掉 POWER_NOW、充电阈值改用属性 24、USB 外设供电、固定 9 V PD、充电通知不唤醒）。PPS 驱动（`CHARGER_ERHAI_PPS`、`CHARGER_SC8547A`）不编译 |
 | `7.2.15-4` | M3.2b PPS：`2102`（wcd939x-usbss 的 D+/D- 切换）、`2103`（SC8547A 电荷泵和 erhai PPS 引擎）+ `m3-2b-pps.config` |
 | `7.2.15-5` | M3.4b 摄像头：`2301`–`2346`（erhai 的相机系列 46 个提交）+ `m3-4b-camera.config` |
+| `7.2.15-6` | M3.5 麦克风（候选）：`2401`（erhai 的 lpass-tx/va-macro，显式时钟管理 + TX HPF 控件） |
+| `7.2.15-7` | 实验（不保留）：本机音频通路 14 个文件换成 erhai 版本，麦克风仍坏，排除内核音频驱动 |
+| `7.2.15-8` | M3.6 `2403`（Esc 键报 `KEY_ESC`）；还带过 `2402`（恢复 SoC 的 TX SoundWire 端口描述），后来证明不需要、已从 series 去掉 |
+| `7.2.15-9` | M3.5 候选：`2404`–`2406`（erhai 的 ADSP 消息修复：q6v5、GLINK、APR） |
+| `7.2.15-10` | M3.5 麦克风根因修复 `2407`（wcd939x 按声道报告/切换 SoundWire 开关）；去掉 `2402`，TX SoundWire 布局回到 erhai 的 |

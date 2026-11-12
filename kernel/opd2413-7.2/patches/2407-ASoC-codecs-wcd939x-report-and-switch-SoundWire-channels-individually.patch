@@ -1,0 +1,75 @@
+From: Kholin <oodzchen@gmail.com>
+Subject: [PATCH] ASoC: codecs: wcd939x: report and switch SoundWire channels individually
+
+The "ADCn Switch" style controls add or remove one channel of a codec
+SoundWire port, but their get handler reports the port: all four ADC
+switches of the TX device read 1 as soon as one of them is on, because
+ADC1-ADC4 share WCD939X_ADC_1_4_PORT. Saving the mixer state (alsactl
+store at shutdown) therefore records ADC2 and ADC3 as on, and restoring
+it at the next boot sets their channel bits. With only ADC1 and ADC4
+routed (the OnePlus Pad 2 Pro microphones), the codec then transmits a
+four-channel port (mask 0xf, or 0x6 in another boot) while the SoC side
+expects two, and capture returns full-scale noise; whether a boot works
+depends on the mixer state it restored. The put handler also always
+returned 1.
+
+Report the channel's own bit in the port's channel mask, keep
+port_enable as "any channel of the port is on", and return whether the
+mask changed.
+
+Seen on OPD2413 (SM8750, WCD9395): the codec port 1 channel-enable
+register read 0xf with ADC2/ADC3 restored on; after turning them off it
+read 0x9 and the microphones recorded normally.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ sound/soc/codecs/wcd939x.c | 20 ++++++++++++++------
+ 1 file changed, 14 insertions(+), 6 deletions(-)
+
+diff --git a/sound/soc/codecs/wcd939x.c b/sound/soc/codecs/wcd939x.c
+index 80f3e7276..559424388 100644
+--- a/sound/soc/codecs/wcd939x.c
++++ b/sound/soc/codecs/wcd939x.c
+@@ -2053,7 +2053,13 @@ static int wcd939x_get_swr_port(struct snd_kcontrol *kcontrol,
+ 	}
+ 	portidx = wcd->ch_info[ch_id].port_num;
+ 
+-	ucontrol->value.integer.value[0] = wcd->port_enable[portidx] ? 1 : 0;
++	/*
++	 * Several channels share one port (ADC1-4 on the TX device): report
++	 * this channel, not the port, so that saving and restoring the mixer
++	 * state cannot turn on channels nobody asked for.
++	 */
++	ucontrol->value.integer.value[0] =
++		!!(wcd->port_config[portidx - 1].ch_mask & wcd->ch_info[ch_id].ch_mask);
+ 
+ 	return 0;
+ }
+@@ -2079,7 +2085,8 @@ static int wcd939x_set_swr_port(struct snd_kcontrol *kcontrol,
+ 	struct wcd939x_priv *wcd939x = snd_soc_component_get_drvdata(comp);
+ 	struct wcd939x_sdw_priv *wcd = wcd939x->sdw_priv[mixer->shift];
+ 	unsigned int ch_id = mixer->reg;
+-	unsigned int portidx;
++	unsigned int portidx, old_mask;
++	bool enable;
+ 
+ 	/* in HPH PCM mode the HPH stream rides the HIFI_PCM port */
+ 	if (wcd939x->hph_pcm_enabled && !wcd->is_tx) {
+@@ -2089,12 +2096,13 @@ static int wcd939x_set_swr_port(struct snd_kcontrol *kcontrol,
+ 			ch_id = WCD939X_HIFI_PCM_R;
+ 	}
+ 	portidx = wcd->ch_info[ch_id].port_num;
++	enable = !!ucontrol->value.integer.value[0];
++	old_mask = wcd->port_config[portidx - 1].ch_mask;
+ 
+-	wcd->port_enable[portidx] = !!ucontrol->value.integer.value[0];
++	wcd939x_connect_port(wcd, portidx, ch_id, enable);
++	wcd->port_enable[portidx] = !!wcd->port_config[portidx - 1].ch_mask;
+ 
+-	wcd939x_connect_port(wcd, portidx, ch_id, wcd->port_enable[portidx]);
+-
+-	return 1;
++	return wcd->port_config[portidx - 1].ch_mask != old_mask;
+ }
+ 
+ /* MBHC Related */
