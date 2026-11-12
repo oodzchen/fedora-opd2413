@@ -1413,3 +1413,22 @@ mpv、Firefox 仍是软解（Fedora `ffmpeg-free` 的专利限制），用户选
 - 清理（用户批准）：删除平板 `/var/tmp/opd2413/`（约 948 MB）、`/var/tmp` 下的 7.3 内核包和杂项、`/var/lib/opd2413-pstore/` 下 35 个旧记录目录。
   设备包 0.1-14：`opd2413-pstore-keep.service` 改调 `/usr/libexec/opd2413/pstore-keep`，目录名 `NNNNNN-<boot id>`（计数器，不靠开机早期不可信的时钟），只留最新 20 份；脚本在主机上用 25 次模拟验证过。
   技术债 #27、#30 解除。主机上常用的平板检查脚本存到 `private/scripts/`。
+
+### 2026-11-12 20:15 起：迁移桌面配置后开机数秒黑屏与夜灯（Night Light / DSPP PCC）排查
+
+迁移主机 KDE 配置到平板 `~colin` 后，出现两类显示问题：
+
+1. **迁移带入的 `~colin/.config/plasma-workspace/env/kwin_vars.sh`**：内含 `KWIN_USE_OVERLAYS=0`、`KWIN_DRM_NO_DIRECT_SCANOUT=1`，导致 KWin DRM 提交报 `Atomic commit failed: Permission denied (EACCES)`。删除该文件后恢复。
+2. **开机进入桌面几秒后黑屏（背光亮、声音正常、画面全黑）**：
+   - 现象：重启自动登录进入桌面后先正常显示数秒，随后物理屏幕变全黑（背光仍为 615/2047，Wayland 合成器截图画面正常）。
+   - 取证（`private/display-nightlight-20261112/`）：
+     - `/proc/interrupts`：`msm` 中断停在 1888 不再增长，两路 `dsi_isr` 均为 246。
+     - `tools/kms-snapshot-diff.py` 对比 `private/display-repro3/display/base/kms` 与黑屏时的 `kms-black-nightlight`：
+       - `dspp_0_pcc`、`dspp_1_pcc`：`0x0000: 0 -> 1`（`PCC_EN`），`0x0010: 0 -> 0x0000a55a`（R），`0x0020: 0 -> 0x00007949`（G），`0x0030: 0 -> 0x00005477`（B），对应 KWin `nightlight` 插件在日落时段下发的 4500 K 色温矩阵。
+       - `ctl_0`：`0x0094 = 0x80c008c0`、`0x0180 = 0x1`、`0x0184 = 0x3`、`0x018c = 0x6`、`0x0844: 0x31 -> 0x33`；`sspp_8` 的 `0x00d0` 停在 `0x00000c80`。与之前 60 Hz 切回 120 Hz 在线模式切换导致 `ctl_0` 卡死、停止取帧的寄存器形态一致。
+   - 内核根因（`0068-drm-msm-dpu-lutdma-dspp-igc-gamut.patch`，`drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c`）：
+     1. **开启夜灯触发运行中在线 modeset 卡死 `ctl_0`**：`dpu_crtc_get_topology()` 仅在 `dpu_crtc_state_needs_dspp(crtc_state)` 为真（`ctm`、`gamma_lut`、`degamma_lut` 或 `lut3d` 非空）时才设 `topology.num_dspp = topology.num_lm`；`dpu_crtc_check_mode_changed()` 在 `dpu_crtc_state_needs_dspp(old) != dpu_crtc_state_needs_dspp(new)` 时强制置 `new_crtc_state->mode_changed = true`。开机初始时 `ctm == NULL`（`num_dspp = 0`）；进入桌面几秒后 KWin `nightlight` 插件激活并提交 `CTM` blob，`needs_dspp` 从 `false` 变 `true`，触发不经熄屏断电的在线 modeset，导致 `ctl_0` 卡死黑屏。
+     2. **关闭夜灯后 `dspp_0_pcc` / `dspp_1_pcc` 无法清零（屏幕残留 4500 K 偏黄）**：当禁用夜灯使 `state->ctm` 变回 `NULL` 时，`dpu_crtc_state_needs_dspp()` 返回 `false`，`dpu_crtc_assign_resources()` 将 `cstate->mixers[i].hw_dspp` 置为 `NULL`。随后 `_dpu_crtc_setup_cp_blocks()` 中因 `if (!dspp) continue;` 直接跳过，`if (!state->ctm) dspp->ops.setup_pcc(dspp, NULL)`（向 `base + 0x0` 写 `PCC_DIS = 0`）成为不可达死代码，且 `ctl_0` 未解除 DSPP 关联，导致 4500 K 的 PCC 系数一直残留在硬件寄存器中（`kms-after-dpms-reset` 验证确认），需重启复位 MDSS 后才回到 0。
+   - 当前规避与后续修复方向：
+     - 临时规避（技术债 #35）：在平板 `~colin/.config/kwinrc` 中设 `[NightColor] Active=false`、`[Plugins] nightlightEnabled=false`，重启 `plasma-kwin_wayland.service` 并执行一次 `kscreen-doctor --dpms off/on` 复位 `ctl_0`（`msm` 中断恢复 120/s，用户确认桌面显示恢复）。
+     - 后续内核修复方向：修改 `dpu_crtc.c` 的 `dpu_crtc_get_topology()`，在硬件 DSPP 数量充足时开机首次 modeset 即常驻分配 `topology.num_dspp = topology.num_lm`，并去掉 `dpu_crtc_check_mode_changed()` 中因 `dpu_crtc_state_needs_dspp` 变化触发的 `mode_changed = true`。这样夜灯开启、渐变调节与关闭（`setup_pcc(dspp, NULL)` 写 `PCC_DIS`）均只走每帧 `color_mgmt_changed` 路径，既不会触发在线 modeset 黑屏，关闭时也能正常将 `dspp_pcc` 清零。

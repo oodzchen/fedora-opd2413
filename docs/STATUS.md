@@ -64,7 +64,7 @@ M2 剩下的被动观察项：开机提示音毛刺再出现时当场取证；�
 - `/var/lib/opd2413-pstore/` 下有 6 个按启动命名的记录目录。
 - SELinux enforcing，firewalld 运行中（public 区）。sshd 只允许密钥登录；2026-11-12 起 firewalld 不再对所有来源开放 ssh，只放行家里局域网的 /24 网段和 IPv6 链路本地（rich rule，已持久化）。
   换网络后 SSH 进不来时，在平板上用 `firewall-cmd --zone=public --list-rich-rules` 查、按新网段改。
-- 自动登录到 `colin`，自动锁屏已关；KDE 空闲熄屏已恢复默认。显示模式只有 120 Hz。
+- 自动登录到 `colin`，自动锁屏已关；KDE 空闲熄屏已恢复默认。显示模式只有 120 Hz。`~colin/.config/kwinrc` 中已临时禁用 `nightlight` 插件（技术债 #35）。
 - sda17（`ARMADA_BOOT`）：未挂载、clean；保留旧 `/boot` 文件和 `opd2413-bootlog/` 下 11-11 的采集日志（都已取回主机）。
   16:36 的整分区备份在主机。分区表、Android 各分区未改动。
 - 2026-11-12 清理：`/var/tmp/opd2413/`（约 948 MB 实验备份、安装包副本、录音，证据已在主机 `private/`）和旧的 pstore 记录目录已删除；pstore 记录改为只保留最新 20 份（设备包 0.1-14）。
@@ -78,7 +78,7 @@ M2 剩下的被动观察项：开机提示音毛刺再出现时当场取证；�
 | `out/pkg-test/`、`out/qemu-test/` | 两个离线测试的证据 |
 | `private/esp-20261110/esp-sda16.img` | ESP 整分区备份（含 `KSHIM.CHO`） |
 | `out/kernel-tree/` | kern2 源码树的副本 + 1411/1412 + `fedora-netfilter-lsm.config`，见 kernel/README.md |
-| `private/display-*` | 黑屏排查的证据和抓取脚本 |
+| `private/display-*` | 黑屏排查的证据和抓取脚本（含 `private/display-nightlight-20261112/` 夜灯触发 `ctl_0` 卡死黑屏与 `dspp_pcc` 残留的寄存器快照） |
 | `private/bootlogs/` | `tools/bootlog/fetch-bootlogs.py` 每次取回的日志（pstore、sda17 采集文件、内核 journal） |
 | `private/m3-exp12-20261111/`、`m3-exp13-…`、`m3-exp14-…` | 第 12–14 次的脚本和记录；第 13 次的含 7.3 启动的完整 journal |
 | `out/m3k/` | 7.2.15 源码树（git，分支 `series3`，可由 `tools/kernel/apply-armada-series.sh` 重现）、`build.sh`、构建和测试日志 |
