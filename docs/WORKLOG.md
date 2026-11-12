@@ -1396,3 +1396,12 @@ GStreamer 注册了 `v4l2h264dec`、`v4l2h265dec`、`v4l2vp9dec`、`v4l2av1dec` 
 
 **结果：M3.4a 视频硬解真机通过（GStreamer 路径：H.264、HEVC 硬解；VP9 走软解规避 V4L2 VP9 的停帧问题）。** 固件包 `opd2413-firmware-16.0.10.600-2`、设备包 0.1-13、Showtime 为默认视频播放器。
 mpv、Firefox 仍是软解（Fedora `ffmpeg-free` 的专利限制），用户选择暂不处理（iris-vaapi、RPM Fusion ffmpeg 留作以后）。
+
+### 2026-11-12 16:24 起：M3.2b PPS 实测（用户：电量 69 %，其他先放一放）
+
+拔线状态 69 %、30 °C，`pps_enable=Y`（停止/重启阈值 80/75 %）。采样 2 s 一次。用户插上的是 Chicony W20-045N1A（45 W，标签只有 5/9/15/20 V 固定档，**没有 PPS 档**）：
+系统识别为 `PD`（不是 `PD_PPS`），`PD: requested 9000 mV`，USB 侧 8.94 V × 1.99 A ≈ 18 W，电池约 +3.1 A、4.18–4.22 V、28 °C；erhai_pps 按设计不介入。**PPS 没法用这个充电器测。**
+（`battmgr` 对固定档只请求 9 V、输入上限 2 A，15/20 V 档不用，这是 erhai 的策略。）
+- 借插着电做了欠的冷启动：16:31 `systemctl poweroff`，48 s 后回来。7.2.15-10、`running`、失败 0、Enforcing、AVC 0、GPU/Wi-Fi/蓝牙/声卡/两个摄像头/传感器服务正常，
+  麦克风录音正常（−32.7 dBFS），开机 9 V 协商成功；上次 journal 正常结束、pstore 空。**7.2.15-10 冷启动验证通过。** 证据 `private/m3-pps-20261112/`。
+- 用户没有 PPS 充电器，PPS 实测搁置（M3.2b 记为待测：驱动、电荷泵探测、`pps_enable=Y` 已真机确认，只差真正进入 PPS 的验证）。
