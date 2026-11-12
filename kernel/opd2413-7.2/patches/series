@@ -8,3 +8,5 @@
 
 # M3.2 battery and charging (a: fixed 9 V PD; PPS drivers not built)
 2101-power-supply-qcom_battmgr-take-the-erhai-v0.7.2-driver.patch
+2102-usb-typec-mux-wcd939x-usbss-DP-DM-route-for-the-charge-pump.patch
+2103-power-supply-add-the-erhai-SC8547A-charge-pump-and-PPS-engine.patch

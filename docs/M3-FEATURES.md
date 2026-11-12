@@ -77,7 +77,7 @@ erhai v0.7.2 相对 7.2.15 与蓝牙有关的改动只有三处：
 
 注意：本机 7.2.15-1 开机日志里也有一次 `Frame reassembly failed (-84)`（下载固件时），之后 setup 成功；是否会出现 `5fbc7cbd1` 描述的超时，要上机先在 7.2.15-1 上试一次关开作对照。
 
-## M3.2 电池与充电（2026-11-12，M3.2a 真机通过）
+## M3.2 电池与充电（2026-11-12，M3.2a 真机通过，M3.2b 离线通过）
 
 现状（7.2.15-2，只读查看）：电量、电压、电流、温度、健康度、满充容量都能读，upower 正常。问题：
 
@@ -95,7 +95,7 @@ PPS 本身在单独的 `erhai_pps`、`sc8547a` 驱动里（另有手写笔充电
 | 步 | 内容 | 版本 |
 |---|---|---|
 | M3.2a | `2101`：battmgr 整文件；PPS 驱动不编译，只有固定 9 V PD | `7.2.15-3` |
-| M3.2b | PPS：`sc8547a`、`erhai_pps` 及温度窗口等（erhai `1264c7f48`、`7d7c1f6f0`、`af5949fb9` 的 PPS 部分、`440c72cd1`、`14516496a`、`b46305b07`） | 以后，单独批准 |
+| M3.2b | PPS：`2102`（wcd939x-usbss，erhai `af5949fb9` 的这部分）、`2103`（`sc8547a`、`erhai_pps` 整文件，含 12–44 °C 温度窗口），配置为模块；板级 DTS 里两个 SC8547A 节点 Armada 已经有了 | `7.2.15-4` |
 
 M3.2a 真机结果：快充充电器上开机 2 s 内协商到固定 9 V（8.94–8.98 V，输入上限 2 A）；电脑 USB 口只有 5 V，驱动正确地留在 5 V；
 电流符号正确（拔电 −0.8 至 −1.0 A）；`power_now` 消失。附带变化：电池节点名 `battery` → `qcom-battmgr-bat`，不再导出 `charge_now`、
@@ -132,6 +132,19 @@ M3.3a 实际做法：设备包 0.1-9 的 `90-opd2413-sleep.conf`（`MemorySleepM
 电源键 2 次、合盖 3 次、`systemctl suspend`+RTC 1 次，全部 s2idle、失败 0、唤醒源正确、恢复后外设正常（WORKLOG 09:30 起）。
 
 M3.3b 实际结果：去掉三个 `*_ignore_unused` 后功能正常但 CX 仍不塌陷；真正的阻塞是 `sync_state() pending`——相机 ISP（`ad27000.isp`）、两个 CSI PHY、GPU 的 GMU 没有驱动，interconnect、RPMh 电源域、gcc 等一直保持开机时的最大投票。加 `fw_devlink.sync_state=timeout`（启动约 10 s 后强制 sync_state）后，60 s 挂起里约 59.5 s CX 塌陷、DDR 自刷新。现行启动参数：没有 `*_ignore_unused`，有 `fw_devlink.sync_state=timeout`（技术债 #34：等相机 ISP/CSI PHY 驱动（M3.4）和 GMU 驱动绑定（erhai `6f237b23c` 等）合入后去掉）。
+
+## M3.4 传感器、摄像头、视频硬解（2026-11-12，离线评估）
+
+erhai v0.7.2 的状态（`onepluspad-2pro-mainline` README）：视频硬解（Iris，H.264/H.265/VP9，GStreamer 和 Firefox VA-API）✅；前后摄（SC820CS/SC1300CS，libcamera）🟡 能预览拍照、
+画质未调；自动旋转、环境光、指南针、陀螺仪（SSC）✅，接近传感器本机没有。
+
+| 子项 | 内核 | 固件 | 用户态（Fedora 45） | 备注 |
+|---|---|---|---|---|
+| 视频硬解 | iris 20 个文件 +186/−36（本树与 erhai 各改各的，要逐个合） | `qcom/sm8750/erhai/vpu35_4v.mbn`，主机上没有，要从设备的原厂分区只读提取 | GStreamer v4l2 解码在 Fedora 里有；Firefox 的 VA-API 要 erhai 的 `iris-vaapi` | 现在每次挂起/恢复都在找这个固件（日志噪声） |
+| 摄像头 | camss、CSI PHY 驱动、两个传感器驱动、对焦马达 `cn3927`，共约 +4900 行 | 无 | Fedora 有 libcamera 0.7.2（软件 ISP），可能要 erhai 的调校文件 | 合入后相机 ISP/CSI PHY 有了驱动，可以去掉 `fw_devlink.sync_state=timeout`（技术债 #34）；GMU 还要另外处理 |
+| 传感器 | 基本不用改（FastRPC 已在） | 每台机器的 sensor registry 在 Android 的 persist 分区，只读复制 | Fedora 没有 `hexagonrpcd`、`libssc`；`iio-sensor-proxy` 3.9 没编 SSC 支持 → 要自己打三个包 | registry 必须在 ADSP 传感器域建立前就位；改动全在用户态 |
+
+建议顺序：视频硬解（内核改动小、马上能用）→ 摄像头内核部分（顺带去掉临时启动参数）→ 传感器（纯用户态打包）。待用户确认。
 
 ## 回馈 erhai
 

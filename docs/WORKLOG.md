@@ -1208,3 +1208,43 @@ hibernation 三项仍禁止）。用 systemd 的 `MemorySleepMode=` 而不是启
 
 **结果：M3.3b 真机通过（插着 USB 时 CX 塌陷、DDR 自刷新约占挂起时间的 98 %）。** 技术债 #1 解除，新增 #34（`fw_devlink.sync_state=timeout` 是临时做法）。
 拔线待机耗电（`aosd`）没测。
+
+### 2026-11-12 10:20 起：M3.2b PPS 快充
+
+用户要求先提交（分支 `m3-7.2-features`，两个提交），再做 PPS，然后其他。
+离线：erhai 的 PPS 由 `erhai_pps`（PPS 协商状态机）和 `sc8547a`（电荷泵）组成，battmgr 侧的挂钩已在 `2101`；`sc8547a` 链接依赖 erhai 对 `wcd939x-usbss.c` 的改动
+（串行 VOOC 用的 D+/D- 切换，默认不用），该差异在 Armada `0063` 之上严格应用。板级 DTS 的两个 SC8547A 节点与 erhai 相同（Armada 已移植）。
+新补丁 `2102`、`2103` 和配置片段 `m3-2b-pps.config`（模块）；在干净基线上整套 `apply-opd2413-features.sh` 通过，驱动文件与 erhai 逐字节相同；W=1 编译没有新警告。
+构建 `7.2.15-4.opd2413`。
+
+注意：erhai_pps 只在电量低于 80 % 时快充（低于 75 % 才重新开始），现在电量 97 %，PPS 不会介入；真正的快充测试要等电量降到 75 % 以下。
+平板上还有 7.3 时期留下的 `/etc/modprobe.d/opd2413-pps.conf`（`pps_enable=0`），会让 PPS 不工作；它是运行时可改的模块参数，测试时可以直接打开。
+
+10:26 构建完成，离线核对通过：配置只多 `CHARGER_SC8547A=m`、`CHARGER_ERHAI_PPS=m`；DTB 相同；模块多 `sc8547a.ko`（别名 `of:…southchip,sc8547a`）、`erhai_pps.ko`（`platform:erhai-pps`）；
+`tests/package-install-test.sh` 通过（`out/m3k/pkg-test4/`）。包 `kernel-opd2413-7.2.15-4.opd2413`（`902b83a5…`）。
+
+**上机计划（待批准）**：
+
+1. `boot-select default fedora-7.2.15-3.opd2413`（修好后第一次真正固定），装 7.2.15-4（按上限卸掉 7.2.15-2，回退项变成 7.2.15-3），`tablet-reboot.py --entry fedora-7.2.15-4.opd2413`。
+   这次启动 `opd2413-pps.conf` 还在，PPS 关着。
+2. 判据：M1 验收项；两个 SC8547A 都探测成功、`erhai_pps` 绑定；快充充电器上仍协商到 9 V；RTC 挂起 60 s 唤醒且 CX 塌陷；没有新错误类别。
+3. 删除 7.3 时期的 `/etc/modprobe.d/opd2413-pps.conf`，运行时 `pps_enable=1`：电量 97 % 时 PPS 应保持不介入。
+4. 设为默认、冷启动复查。真正的 PPS 快充（电量 < 75 %）等电量降下来再测。
+
+10:30 起，用户批准全部 4 步。执行：
+
+- ① `boot-select default fedora-7.2.15-3.opd2413` 写入 `fedora-7.2.15-3.opd2413.conf`，平板上 `bootctl` 确认默认项确实是它（修复后第一次真正固定）；装 7.2.15-4（卸掉 7.2.15-2，回退项 7.2.15-3）；
+  一次性启动 7.2.15-4，40 s 回来。
+- ② 自动验收：`running`、失败 0、Enforcing、AVC 0、GPU、Wi-Fi、蓝牙、声卡、无新错误类别；`sc8547a 3-006f: master charge pump probed`、`1-006f: slave …`，
+  `erhai-pps` 已绑定（`pps_enable=N`，当时 `opd2413-pps.conf` 还在）。用户之前已拔掉充电器（电池放电约 1.5 A），9 V 这一项没法测。
+  拔线状态下 RTC 挂起 120 s：`cxsd`/`ddr` 一次进入、驻留 2294751219（≈ 119.5 s），`aosd` 仍为 0（拔线也没有到 AOSS sleep）。
+- ③ 备份后删除 `/etc/modprobe.d/opd2413-pps.conf`（7.3 时期的 `pps_enable=0`），运行时 `pps_enable=1`；没接充电器，PPS 没有动作。
+- ④ 10:37 `boot-select default 'fedora-*'`（`bootctl` 确认为 7.2.15-4）后 `systemctl poweroff`。**没插充电器时关机不会自动开机**，平板停在关机状态，需要用户按电源键开机。
+- 用户说明：拔电是有意的，为了把电量放到 75 % 以下做 PPS 测试；10:47 用户按电源键开机。复查：7.2.15-4、`running`、失败 0、Enforcing、AVC 0、
+  两个电荷泵探测成功、无新错误类别（这一次是真正的冷启动）。
+- 但 `pps_enable` 仍为 N：7.2.15-4 的 initramfs 是在 `opd2413-pps.conf` 还在时生成的，里面带着 `options erhai_pps pps_enable=0`，而 `erhai_pps` 正是在 initramfs 里加载的。
+  `kernel-install add 7.2.15-4.opd2413` 重新生成 initramfs（不再含该文件，启动参数不变），`tablet-reboot.py` 热重启 39 s 回来：`pps_enable=Y`。
+  教训：改 `/etc/modprobe.d` 后要重新生成 initramfs（写进 STATUS 的"已知的坑"）。initramfs 改动后还欠一次冷启动，等用户插回充电器时做（插着电关机会自动开机）。
+- 现在电量 97 %，拔线放电中。PPS 实测等电量低于 75 % 后插快充。
+
+10:55 起：等放电期间做 M3.4 离线评估（只读），写进 [M3-FEATURES.md](M3-FEATURES.md)"M3.4"。建议顺序：视频硬解 → 摄像头内核 → 传感器用户态，待用户确认。

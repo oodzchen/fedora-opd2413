@@ -5,7 +5,9 @@
 
 ## 唯一的下一步
 
-**下一步待用户选：M3.2b（PPS 快充）或 M3.4（传感器/摄像头/视频硬解）。** M3.3 已真机通过；M3.4 的相机 ISP/CSI PHY 驱动还能去掉临时参数 `fw_devlink.sync_state=timeout`（技术债 #34）。
+**M3.2b PPS 快充真机测试：等电量降到 75 % 以下（用户在拔线放电），然后插快充。** `7.2.15-4.opd2413`（SC8547A 电荷泵 + erhai PPS 引擎）已是默认内核，
+驱动加载、电荷泵探测、`pps_enable=Y` 已确认。测试时看：`erhai_pps` 日志进入 PPS、VBUS 升到约 8–10 V、电池电流明显大于 9 V 固定档时、电荷泵温度和电池温度、拔线回退到 5 V；
+同时补做：插电冷启动一次（initramfs 改过）、快充充电器上 9 V 固定档仍可用（PPS 退出后）。之后用户要求做 M3.4（传感器/摄像头/视频硬解）。
 测试新内核用 `tools/tablet-reboot.py --entry …`（重启前会用 `bootctl` 核对将启动的条目）；装新内核前先 `boot-select default <当前条目>`。
 
 M3.3 2026-11-12 真机通过：s2idle 可用（设备包 0.1-9/0.1-10，`MemorySleepMode=s2idle`），用户在 KDE 里把电源键、合盖设为睡眠；
@@ -19,7 +21,7 @@ M3 第 0 步（内核基线 7.2.6 → 7.2.15）2026-11-12 真机通过：`7.2.15
 M3 顺序：~~蓝牙~~ → ~~电池与充电（9 V）~~ → 休眠与按键 → 传感器/摄像头/硬解（[M3-FEATURES.md](M3-FEATURES.md)）。
 7.3 基线暂停，改为 M6（[M3-KERNEL.md](M3-KERNEL.md) 顶部有暂停时的状态）。发现和修复可以回馈 erhai，每次提交前先问。
 
-还没清理、需要另行批准的：`/etc/modprobe.d/opd2413-pps.conf`（只对 7.3 有意义）、根分区 `/var/tmp/opd2413/` 下的实验备份（技术债 #27）。
+还没清理、需要另行批准的：根分区 `/var/tmp/opd2413/` 下的实验备份（技术债 #27）。
 
 M2 剩下的被动观察项：开机提示音毛刺再出现时当场取证；空闲自动熄屏能否恢复。
 
@@ -31,7 +33,9 @@ M2 剩下的被动观察项：开机提示音毛刺再出现时当场取证；�
 
 - 一次性启动的测试内核如果在挂上根分区之前就复位，会一直重复启动它：在 kShimC 菜单选 "Fedora boot menu"，再在 systemd-boot 里选正常内核。
 - 用 ramoops 取证时：长按电源会丢记录；不是每种复位都保内存。
-- 没有网络和画面时先**短按**电源键，用户态活着就会正常关机，journal 完整。
+- 没有网络和画面时先**短按**电源键，用户态活着就会正常关机，journal 完整。（现在 KDE 里电源键设成了睡眠，短按会挂起而不是关机。）
+- **没插电时 `systemctl poweroff` 不会自动开机**，要人按电源键；冷启动验证前先确认插着电。
+- 改了 `/etc/modprobe.d` 要重新生成 initramfs（`kernel-install add <版本> /lib/modules/<版本>/vmlinuz`），否则 initramfs 里加载的模块还用旧参数。
 
 ## 接手时先做这几件事
 
@@ -41,19 +45,19 @@ M2 剩下的被动观察项：开机提示音毛刺再出现时当场取证；�
 3. 改了 `device/` 或任何 spec，按 [BUILD.md](BUILD.md) 重新构建、跑离线测试，再拷到平板用 `dnf install ./*.rpm` 装。
 4. 关机会自动重新开机（插着电时）。需要冷启动验证时可以直接经 SSH `systemctl poweroff`，约 40 秒后回来。
 
-## 设备状态（2026-11-12 10:12）
+## 设备状态（2026-11-12 10:50）
 
-- 10:09 冷启动后运行：Fedora 45 KDE，内核 `7.2.15-3.opd2413`，`running`。启动参数没有 `*_ignore_unused`、有 `fw_devlink.sync_state=timeout`（7.2.15-2 回退条目仍是旧参数）。
-  s2idle 可用（电源键、合盖、空闲按 KDE 设置挂起），挂起时 CX 塌陷。插着快充、9 V 充电。蓝牙打开，有一个用户配对的设备。
-  `/etc/kernel/cmdline` 改前的备份在 `/var/tmp/opd2413/m3-sleep/cmdline-100831/`。
-- systemd-boot：`loader.conf` 默认 `fedora-*`（选版本最高的）；条目 `fedora-7.2.15-3.opd2413`、`fedora-7.2.15-2.opd2413`。
+- 10:49 运行：Fedora 45 KDE，内核 `7.2.15-4.opd2413`（默认，`fedora-*`），`running`。启动参数没有 `*_ignore_unused`、有 `fw_devlink.sync_state=timeout`。
+  s2idle 可用，挂起时 CX 塌陷。PPS 引擎已开（`pps_enable=Y`）。用户拔线放电中（电量 97 %）。蓝牙打开，有一个用户配对的设备。
+  `/etc/kernel/cmdline` 改前的备份在 `/var/tmp/opd2413/m3-sleep/cmdline-100831/`；删掉的 `opd2413-pps.conf` 备份在 `/var/tmp/opd2413/m3-pps-20261112/`。
+- systemd-boot：`loader.conf` 默认 `fedora-*`（选版本最高的）；条目 `fedora-7.2.15-4.opd2413`、`fedora-7.2.15-3.opd2413`（回退，参数相同）。
   ESP 空闲约 268 MiB；固定路径 `/dtbs/qcom/sm8750-oneplus-pad2pro.dtb` 是 7.2.15 的（与内核 3 相同）。
 - `boot_b` = `07bf1b53…`（fedora1：菜单 ColorOS / Fedora / Fedora boot menu，倒计时 10 s，默认项仍是 ColorOS）；KSHIM.CHO 记住 Fedora。
   上一版 `492f2cdf…` 的整分区回读在主机 `private/bootflow-20261111/boot_b-readonly.img`。
-- 软件包：`kernel-opd2413-7.2.15-3`、`7.2.15-2`，`opd2413-device-0.1-10`、`opd2413-audio-0.1-5`。`installonly_limit=2`：再装一个内核会卸掉 7.2.15-2。
+- 软件包：`kernel-opd2413-7.2.15-4`、`7.2.15-3`，`opd2413-device-0.1-10`、`opd2413-audio-0.1-5`。`installonly_limit=2`：再装一个内核会卸掉 7.2.15-3。
   内核 3（`7.2.6-3`）08:45 经用户同意卸载，它的包仍在主机 `out/rpms/`。
 - 7.3 测试内核、"M3 test" 和 "Log capture" 两个条目、ESP 上的 `opd2413-bootlog/` 已于 11-11 23:29 删除（备份在 `/var/tmp/opd2413/m3k-install-*/`）。
-- `/etc/modprobe.d/opd2413-pps.conf`：`options erhai_pps pps_enable=0`（7.2 内核没有这个模块，无影响）。`/etc/kernel/tries` 已删除。
+- `/etc/modprobe.d/opd2413-pps.conf` 已删除（11-12）。`/etc/kernel/tries` 已删除。
 - `/var/lib/opd2413-pstore/` 下有 6 个按启动命名的记录目录。
 - SELinux enforcing，firewalld 运行中（public 区）。sshd 监听所有地址（Fedora 默认），与 AGENTS 设备安全规则 8 不符，未处理。
 - 自动登录到 `colin`，自动锁屏已关；KDE 空闲熄屏已恢复默认。显示模式只有 120 Hz。
@@ -80,6 +84,8 @@ M2 剩下的被动观察项：开机提示音毛刺再出现时当场取证；�
 | `private/m3-bt-20261112/` | M3.1 蓝牙的对照、安装、用户实测和冷启动证据 |
 | `out/rpmbuild/RPMS/aarch64/kernel-opd2413-7.2.15-3.opd2413.aarch64.rpm` | 平板上的默认内核（M3.2a）；`out/m3k/rpms3/`、`pkg-test3/` 是它的离线测试 |
 | `private/m3-batt-20261112/` | M3.2a 的安装、读数、拔插采样和冷启动证据 |
+| `out/rpmbuild/RPMS/aarch64/kernel-opd2413-7.2.15-4.opd2413.aarch64.rpm` | 平板上的默认内核（M3.2b PPS）；`out/m3k/rpms4/`、`pkg-test4/` 是它的离线测试 |
+| `private/m3-pps-20261112/` | M3.2b 的安装、挂起、冷启动证据 |
 | `out/m3-rpm5/` | 诊断内核 `7.3.3-5.opd2413` 的构建脚本和日志（编译完成，19:50 在打包前中止，没有包） |
 | `out/rpmbuild/RPMS/noarch/opd2413-device-0.1-10.noarch.rpm` | 平板上现在装的设备包（0.1-9 起允许 s2idle，0.1-10 修 boot-select 的条目 id） |
 | `private/m3-sleep-20261112/` | M3.3 的 pm_test、s2idle、按键挂起证据 |
