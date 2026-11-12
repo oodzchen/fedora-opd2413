@@ -151,6 +151,16 @@ erhai v0.7.2 的状态（`onepluspad-2pro-mainline` README）：视频硬解（I
 摄像头（M3.4b，`7.2.15-5`）真机通过：erhai 的 46 个相机提交 `2301`–`2346`，libcamera 0.7.2（Fedora）simple 管线 + 软件 ISP，Snapshot 前后摄预览、拍照、录像正常，约 32 fps。已知限制：没有自动对焦、没有传感器调校（偏色、四角暗、画质低）。相机 ISP/CSI PHY 有了驱动后，interconnect、rpmhpd、camcc 的 sync_state 自然完成，技术债 #34 只剩 GMU。
 录像无声音而是满幅噪音：麦克风采集本身坏了（见 WORKLOG 2026-11-12 M3.4b），另立"麦克风"一项。
 
+## M3.4c 传感器（2026-11-12 真机通过）
+
+`packaging/opd2413-sensors/`：按 erhai-sensors 打 Fedora RPM（来源和改动见该目录 README）。私有前缀 `/usr/libexec/opd2413-sensors` 下的 hexagonrpcd、libssc、带 SSC 的
+iio-sensor-proxy（Fedora 的 iio-sensor-proxy 文件不动，用 systemd drop-in 换 ExecStart），ROM 传感器配置从 erhai 检出读取并按哈希核对，
+每台机器的 registry 从主机上的 persist 分区备份（11-02）只读导出（`private/sensors-persist-20261102/`，361 个文件）。
+`tools/build-sensors-rpm.sh 0.1 1`：在 aarch64 Fedora 45 容器里构建，hexagonrpc 测试 19/19 通过、libssc 投递测试通过；私有库经 RUNPATH 解析。
+平板上有 `/dev/fastrpc-adsp-secure`，Fedora 的 iio-sensor-proxy 已装（未运行）。
+
+真机：导入 registry 并重启后三个服务 active、AVC 0；自动旋转方向正确（用户实测），环境光随遮挡变化（约 85 → 1 lux），指南针、陀螺仪可用；挂起时传感器流暂停、恢复后重启，CX 塌陷不受影响。KDE Plasma 6.8 没有环境光自动亮度（用户暂不需要）。
+
 ## M3.5 麦克风、M3.6 键盘（2026-11-12 真机通过）
 
 麦克风：录到满幅噪音、且逐次启动时好时坏。根因：WCD939x 的 ADC1–4 共用一个 SoundWire 端口，`wcd939x_get_swr_port()` 按端口报告开关状态，

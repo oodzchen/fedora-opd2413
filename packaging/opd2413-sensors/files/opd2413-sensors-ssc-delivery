@@ -1,0 +1,105 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Override, for this boot only, how the ADSP sensor core delivers the
+# accelerometer stream to iio-sensor-proxy: for measurements that change one
+# setting at a time, and as the fallback to the delivery libssc used to ask
+# for.
+#
+#   opd2413-sensors-ssc-delivery [--no-restart] status
+#   opd2413-sensors-ssc-delivery [--no-restart] default
+#   opd2413-sensors-ssc-delivery [--no-restart] wakeup|nowakeup [BATCH_US [FLUSH_US]]
+#
+# Without an override libssc chooses by sensor type: the accelerometer
+# stream is requested with non-wakeup delivery and without batching, so the
+# sensor core does not signal the application processor for every sample.
+# "wakeup" forces wake-up delivery, the requests of libssc 0.4.4; "nowakeup"
+# forces non-wakeup delivery. Both apply to every stream of the proxy.
+#
+# The override is an environment file under /run that the proxy unit reads
+# (drop-in 80-opd2413-ssc.conf); "default" removes it, and so does the next
+# boot. A running proxy is restarted to apply the change; the file server
+# stays attached and the ADSP is not restarted. The sample gate's own
+# ssccli run at boot does not read the file.
+set -eu
+
+ENV_DIR=${OPD2413_SENSORS_SSC_ENV_DIR:-/run/opd2413-sensors-ssc}
+ENV_FILE=$ENV_DIR/env
+SYSTEMCTL=${OPD2413_SENSORS_SYSTEMCTL:-systemctl}
+UNIT=iio-sensor-proxy.service
+NAME=${0##*/}
+
+usage() {
+	echo "usage: $NAME [--no-restart] status|default|wakeup|nowakeup [BATCH_US [FLUSH_US]]" >&2
+	exit 2
+}
+
+period() {
+	case $1 in
+	'' | *[!0-9]* | 0*)
+		echo "$NAME: $2 must be a positive whole number of microseconds" >&2
+		exit 2
+		;;
+	esac
+	# Both periods are uint32 on the wire.
+	if [ ${#1} -gt 10 ] || ! awk -v v="$1" 'BEGIN { exit !(v + 0 <= 4294967295) }'; then
+		echo "$NAME: $2 exceeds 4294967295 us" >&2
+		exit 2
+	fi
+}
+
+show() {
+	if [ -f "$ENV_FILE" ]; then
+		echo "selection: $(grep -v '^#' "$ENV_FILE" | tr '\n' ' ')"
+	else
+		echo 'selection: default (by sensor type: accelerometer non-wakeup, no batching)'
+	fi
+	echo "proxy: $("$SYSTEMCTL" show "$UNIT" -p ActiveState -p MainPID | tr '\n' ' ')"
+}
+
+apply() {
+	# Only a running proxy is restarted; one that is stopped (for example
+	# because the sample gate failed) stays stopped.
+	[ "$restart" = yes ] && "$SYSTEMCTL" try-restart "$UNIT"
+	show
+}
+
+restart=yes
+if [ "${1:-}" = --no-restart ]; then
+	restart=no
+	shift
+fi
+[ $# -ge 1 ] || usage
+mode=$1
+shift
+
+case $mode in
+status)
+	[ $# -eq 0 ] || usage
+	show
+	;;
+default)
+	[ $# -eq 0 ] || usage
+	rm -f "$ENV_FILE"
+	apply
+	;;
+wakeup | nowakeup)
+	[ $# -le 2 ] || usage
+	[ $# -lt 1 ] || period "$1" BATCH_US
+	[ $# -lt 2 ] || period "$2" FLUSH_US
+	umask 022
+	mkdir -p "$ENV_DIR"
+	tmp=$ENV_FILE.new
+	{
+		echo "# Written by $NAME for this boot; \"$NAME default\" removes it."
+		echo "SSC_SUSPEND_MODE=$mode"
+		[ $# -lt 1 ] || echo "SSC_BATCH_PERIOD_US=$1"
+		[ $# -lt 2 ] || echo "SSC_FLUSH_PERIOD_US=$2"
+	} >"$tmp"
+	mv -f "$tmp" "$ENV_FILE"
+	apply
+	;;
+*)
+	usage
+	;;
+esac

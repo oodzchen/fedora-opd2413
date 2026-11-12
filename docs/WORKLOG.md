@@ -1350,3 +1350,24 @@ ADC 开关读数正确（ADC1/4 开、ADC2/3 关），没有 `CMD timeout`、没
 
 **结果：M3.5 麦克风真机通过（7.2.15-10 + opd2413-audio 0.1-12）；M3.6 键盘（Esc、麦克风键、锁屏键，7.2.15-8 起 + 设备包 0.1-11）真机通过。** 默认内核 `7.2.15-10.opd2413`，回退 `7.2.15-9`。
 可回馈 erhai/上游的发现：`2407`（wcd939x 开关按端口报告导致多开声道，wcd938x 同样写法）、`2403`（Esc 键）、hwdb 的麦克风/锁屏键映射。
+
+### 2026-11-12 15:25 起：M3.4c 传感器（用户：提交；电量不够先跳过快充，先完善别的）
+
+已提交 `1c004bf`。离线：按 erhai-sensors 做 `packaging/opd2413-sensors/`（三个上游源码 + 23 个补丁原样，单元/udev/脚本只改名字和路径），`tools/build-sensors-rpm.sh` 在 aarch64 容器里构建出
+`opd2413-sensors-0.1-1.aarch64.rpm`（`cb435323…`）；构建时测试通过。registry 从主机的 persist 备份只读导出（debugfs rdump，不碰平板的 persist 分区）。
+
+**上机计划（待批准）**：
+1. `dnf install` 这个 RPM（会从 Fedora 源带上 `protobuf-c`）；把 registry 副本拷到平板 `/var/tmp`，用 `opd2413-sensors-import-registry` 导入 `/var/lib/opd2413/sensors`。
+2. 重启（ADSP 传感器域只在建立时读一次 registry）。
+3. 判据：`opd2413-sensors-rpcd`、`-gate`、`iio-sensor-proxy` 起来；`monitor-sensor` 报加速度计方向、环境光数值；没有 AVC；用户转动平板确认自动旋转，看自动亮度/光线读数。
+   挂起前后传感器流暂停/恢复，挂起深度不变（`cxsd` 计数）。
+
+15:33 起，用户批准。`dnf install opd2413-sensors-0.1-1`（带上 protobuf-c），`rpm -V` 干净，sysusers 建了 `fastrpc`；registry 副本导入（357 个文件 + `sns_reg_version`，平板上的临时副本已删）；
+装包后 udev 触发让 rpcd 提前起来了一次，gate 等不到样本失败（registry 是导入前建立的传感器域读的，符合 erhai 的说明）。重启后：
+`opd2413-sensors-rpcd`、`-gate`（130 个重力样本）、`iio-sensor-proxy` 都 active，AVC 0，失败单元 0；`monitor-sensor`：加速度计方向 normal/tilted-up、环境光约 86 lux、指南针航向约 297.7°，
+D-Bus 有陀螺仪。hexagonrpcd 报一串找不到的 json（erhai 同样）。RTC 挂起 60 s：`cxsd` 一次、驻留约 59.2 s，`opd2413-sensors-sleep` 挂起前停掉 iio-sensor-proxy、恢复后重新启动，读数恢复。
+证据 `private/m3-sensors-20261112/`。待用户试自动旋转。
+- 用户实测：拔下键盘转动平板，自动旋转方向都正确。遮挡光线传感器两次：读数从约 80–90 lux 降到 20–30 lux 和约 1 lux，松开后回升（`light-trace.txt`），传感器正常。
+  界面亮度不变是因为 KDE Plasma 6.8.2 的 powerdevil 没有环境光自动亮度功能（erhai 在 GNOME 上有）；用户表示暂不需要自动亮度。
+
+**结果：M3.4c 传感器真机通过（自动旋转、环境光读数、指南针、陀螺仪 D-Bus 可用；挂起深度不受影响）。** 接近传感器本机没有。
