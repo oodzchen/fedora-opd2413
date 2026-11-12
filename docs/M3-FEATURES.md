@@ -131,7 +131,9 @@ pmdomain 性能态恢复、clk、dwc3-qcom（挂起期间推迟 VBUS 覆盖）�
 M3.3a 实际做法：设备包 0.1-9 的 `90-opd2413-sleep.conf`（`MemorySleepMode=s2idle`），没改启动参数；电源键、合盖动作由用户在 KDE 电源管理里设为睡眠。
 电源键 2 次、合盖 3 次、`systemctl suspend`+RTC 1 次，全部 s2idle、失败 0、唤醒源正确、恢复后外设正常（WORKLOG 09:30 起）。
 
-M3.3b 实际结果：去掉三个 `*_ignore_unused` 后功能正常但 CX 仍不塌陷；真正的阻塞是 `sync_state() pending`——相机 ISP（`ad27000.isp`）、两个 CSI PHY、GPU 的 GMU 没有驱动，interconnect、RPMh 电源域、gcc 等一直保持开机时的最大投票。加 `fw_devlink.sync_state=timeout`（启动约 10 s 后强制 sync_state）后，60 s 挂起里约 59.5 s CX 塌陷、DDR 自刷新。现行启动参数：没有 `*_ignore_unused`，有 `fw_devlink.sync_state=timeout`（技术债 #34：等相机 ISP/CSI PHY 驱动（M3.4）和 GMU 驱动绑定（erhai `6f237b23c` 等）合入后去掉）。
+M3.3b 实际结果：去掉三个 `*_ignore_unused` 后功能正常但 CX 仍不塌陷；真正的阻塞是 `sync_state() pending`——相机 ISP（`ad27000.isp`）、两个 CSI PHY、GPU 的 GMU 没有驱动，interconnect、RPMh 电源域、gcc 等一直保持开机时的最大投票。加 `fw_devlink.sync_state=timeout`（启动约 10 s 后强制 sync_state）后，60 s 挂起里约 59.5 s CX 塌陷、DDR 自刷新。键盘按键不能唤醒（2026-11-12 查明，与 erhai 相同）：`oneplus-pogo-keyboard` 在挂起时给已连接的键盘发休眠命令，只在没接键盘时把检测脚（gpio96）设为唤醒中断（接上键盘会唤醒）；键盘走 UART（`880000.serial`），挂起期间没有任何来自键盘的唤醒中断（`serial0-0` 的 wakeup 计数一直是 0）。原厂驱动按显示状态让键盘睡/醒。要支持按键唤醒，得先确认睡眠中的键盘按键时会不会在 UART 上发数据，再把 UART RX 脚设成唤醒中断（geni 串口支持），并防误唤醒。现在能唤醒的是电源键、开盖、RTC。
+
+现行启动参数：没有 `*_ignore_unused`，有 `fw_devlink.sync_state=timeout`（技术债 #34：等相机 ISP/CSI PHY 驱动（M3.4）和 GMU 驱动绑定（erhai `6f237b23c` 等）合入后去掉）。
 
 ## M3.4 传感器、摄像头、视频硬解（2026-11-12，离线评估）
 
