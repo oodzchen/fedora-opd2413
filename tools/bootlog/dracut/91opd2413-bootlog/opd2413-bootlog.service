@@ -1,0 +1,26 @@
+[Unit]
+Description=OPD2413 opt-in initramfs persistent kernel evidence
+DefaultDependencies=no
+ConditionPathExists=/etc/initrd-release
+ConditionKernelCommandLine=rd.opd2413.bootlog=1
+Requires=dev-disk-by\x2dpartlabel-ARMADA_BOOT.device
+After=systemd-udevd.service dev-disk-by\x2dpartlabel-ARMADA_BOOT.device
+Before=initrd-root-fs.target initrd-cleanup.service
+Conflicts=initrd-cleanup.service
+JobTimeoutSec=45s
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/libexec/opd2413-bootlog/control start
+ExecStopPost=/usr/libexec/opd2413-bootlog/control stop
+TimeoutStartSec=30s
+TimeoutStopSec=10s
+KillMode=control-group
+KillSignal=SIGTERM
+Restart=no
+UMask=0077
+LimitCORE=0
+LimitFSIZE=16M
+StandardOutput=journal+console
+StandardError=journal+console

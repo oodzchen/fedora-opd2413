@@ -1,0 +1,16 @@
+# Undo `boot-select next`: once any kernel has mounted the root file system,
+# loader.conf points at the normal default again, so a later crash or reset
+# boots the normal kernel. Logs which loader entry this boot came from.
+[Unit]
+Description=Restore the default boot entry after a one-shot boot (OPD2413)
+DefaultDependencies=no
+ConditionPathExists=/var/lib/opd2413-boot/next.json
+RequiresMountsFor=/boot/efi /var/lib
+After=local-fs.target
+Before=sysinit.target shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/opd2413/boot-select restore

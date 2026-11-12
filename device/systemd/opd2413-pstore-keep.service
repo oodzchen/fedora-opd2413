@@ -1,0 +1,27 @@
+# ramoops keeps the kernel console of the previous boot across a warm reset
+# (reboot, panic reboot, firmware-triggered reset), which is the only log of a
+# kernel that died before it could mount anything. Fedora's
+# systemd-pstore.service then moves each record to a fixed file name under
+# /var/lib/systemd/pstore and erases it from pstore, so the log of one failed
+# boot is replaced by whatever the next reboot leaves behind (normally the one
+# line "reboot: Restarting system" of a quiet kernel).
+#
+# Copy the records first, into a directory named after the boot that found
+# them. Ordering only: if this unit fails, systemd-pstore still archives.
+# Enabled by the package through a sysinit.target.wants symlink (no [Install]).
+[Unit]
+Description=Keep the previous boot's pstore records (OPD2413 boot diagnostics)
+DefaultDependencies=no
+ConditionDirectoryNotEmpty=/sys/fs/pstore
+ConditionVirtualization=!container
+After=systemd-remount-fs.service
+Before=systemd-pstore.service sysinit.target shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+StateDirectory=opd2413-pstore
+StateDirectoryMode=0700
+UMask=0077
+ExecStart=/usr/bin/cp -rT /sys/fs/pstore %S/opd2413-pstore/%b

@@ -1,0 +1,8 @@
+#!/bin/bash
+# Without opt-in, create no dependency at all (Conditions alone still pull deps).
+set -euo pipefail
+export LC_ALL=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
+. /usr/libexec/opd2413-bootlog/lib.sh
+[[ $# -ge 1 ]] || exit 1
+bootlog_generate "$1" /proc/cmdline /etc/initrd-release \
+    /usr/lib/systemd/system/opd2413-bootlog.service

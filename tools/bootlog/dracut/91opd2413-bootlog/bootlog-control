@@ -1,0 +1,67 @@
+#!/bin/bash
+# Only installed in an explicitly built diagnostic initramfs, never in the RPM.
+set -euo pipefail
+export LC_ALL=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
+umask 077
+. /usr/libexec/opd2413-bootlog/lib.sh
+
+[[ $# == 1 && $1 =~ ^(start|stop)$ ]] || { bootlog_fail 'expected start or stop'; exit 1; }
+[[ -f /etc/initrd-release ]] || { bootlog_fail 'not in initramfs'; exit 1; }
+[[ ${INVOCATION_ID-} =~ ^[0-9a-f]{32}$ ]] || { bootlog_fail 'missing systemd invocation ID'; exit 1; }
+IFS= read -r boot < /proc/sys/kernel/random/boot_id
+bootlog_uuid "$boot" || exit 1
+parent=/run/opd2413-bootlog
+runtime=$parent/$INVOCATION_ID
+mount=$runtime/mnt
+device=/dev/sda17
+sysfs=/sys/class/block/sda17
+expected=boot-$boot-$INVOCATION_ID
+
+case "$1" in
+start)
+    bootlog_enabled /proc/cmdline || { bootlog_fail 'diagnostic flag not enabled exactly once'; exit 1; }
+    [[ -b $device && ! -L $device && $(readlink -f /dev/disk/by-partlabel/ARMADA_BOOT) == "$device" ]] || exit 1
+    [[ -f /etc/opd2413-bootlog.identity && ! -L /etc/opd2413-bootlog.identity &&
+       $(stat -c '%u:%a' /etc/opd2413-bootlog.identity) == 0:600 ]] || exit 1
+    properties=$(udevadm info --query=property --name="$device")
+    bootlog_identity "$properties" "$(readlink -f "$sysfs")" "$(<"$sysfs/partition")" \
+        "$(<"$sysfs/size")" "$(<"$sysfs/ro")" "$(</etc/opd2413-bootlog.identity)"
+    major_minor=$(<"$sysfs/dev")
+    [[ $major_minor =~ ^[0-9]+:[0-9]+$ ]] || exit 1
+    bootlog_unmounted "$major_minor" /proc/self/mountinfo
+    bootlog_unmounted "$major_minor" /proc/1/mountinfo
+    superblock=$(dumpe2fs -h "$device")
+    awk '/^Filesystem state:/ {n++; if($3!="clean") bad=1}
+         /^Filesystem features:/ {f++; for(i=3;i<=NF;i++)
+             if($i=="needs_recovery" || $i=="orphan_present") bad=1}
+         END {exit(n!=1 || f!=1 || bad)}' <<< "$superblock" ||
+        { bootlog_fail 'filesystem needs recovery; no repair or journal replay attempted'; exit 1; }
+    bootlog_private_dir "$parent"
+    [[ ! -e $runtime && ! -L $runtime ]] || { bootlog_fail 'existing invocation state'; exit 1; }
+    mkdir -m 0700 -- "$runtime" "$mount"
+    bootlog_mount ext4 "$device" "$mount"
+    bootlog_mount_matches "$mount" "$major_minor" /proc/self/mountinfo
+    directory=$(bootlog_prepare "$mount" "$boot" "$INVOCATION_ID")
+    [[ $directory == "$mount/opd2413-bootlog/$expected" ]] || exit 1
+    (set -o noclobber; printf '%s\n' "$expected" > "$runtime/owned-logdir")
+    # exec keeps the notify sender as systemd's MainPID. No orphaned shell child.
+    exec /usr/libexec/opd2413-bootlog/kmsg-to-file --output "$directory/kernel.raw" \
+        --require-start-zero --notify
+    ;;
+stop)
+    [[ -e $runtime || -L $runtime ]] || exit 0
+    [[ -d $runtime && ! -L $runtime && $(stat -c '%u:%a' "$runtime") == 0:700 ]] || exit 1
+    major_minor=$(<"$sysfs/dev")
+    [[ $major_minor =~ ^[0-9]+:[0-9]+$ ]] || exit 1
+    directory=
+    if [[ -e $runtime/owned-logdir || -L $runtime/owned-logdir ]]; then
+        [[ -f $runtime/owned-logdir && ! -L $runtime/owned-logdir &&
+           $(stat -c '%u:%a' "$runtime/owned-logdir") == 0:600 ]] || exit 1
+        IFS= read -r owned < "$runtime/owned-logdir"
+        [[ $owned == "$expected" ]] || exit 1
+        directory=$mount/opd2413-bootlog/$owned
+    fi
+    bootlog_finish "$mount" "$major_minor" /proc/self/mountinfo "$directory" \
+        "${SERVICE_RESULT:-unknown}" "${EXIT_CODE:-unknown}" "${EXIT_STATUS:-unknown}"
+    ;;
+esac

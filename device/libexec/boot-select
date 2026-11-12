@@ -1,0 +1,433 @@
+#!/usr/bin/python3 -I
+"""Choose what the OnePlus Pad 2 Pro boots next, without touching its menus.
+
+Two layers decide a boot:
+
+  kShimC menu (boot_b)   ColorOS / Fedora / Fedora boot menu. It starts the
+                         entry remembered in the ESP file KSHIM.CHO.
+  systemd-boot           Fedora's kernel entries; "Fedora" boots the
+                         `default` of /boot/efi/loader/loader.conf.
+
+U-Boot keeps EFI variables in RAM only and never writes storage, so systemd-boot
+one-shot variables and boot counting cannot work here. Instead:
+
+  boot-select status             what is selected now
+  boot-select kshim NAME         remember a kShimC entry (ColorOS, Fedora, ...)
+           [--manifest IMAGE]    ...for the manifest of another boot_b image
+  boot-select next ENTRY         boot loader entry ENTRY once (see below)
+  boot-select default VALUE      set loader.conf `default` (an entry id or a glob)
+  boot-select restore            undo `next` (run early in every boot)
+
+`next` sets loader.conf `default` and leaves a note. opd2413-boot-restore.service
+puts the old default back as soon as any kernel reaches the root file system,
+so a crash after that point returns to the normal kernel. A kernel that resets
+before mounting the root boots again, until someone picks another entry in
+"Fedora boot menu".
+
+The KSHIM.CHO record format mirrors Armada's
+porting/oneplus-pad-2-pro/kshim/{choice_journal.h,boot_choice.c}. A record is
+valid only for the exact manifest bytes, the ESP partition GUID and the
+provision nonce, so each of the two record pages can serve a different boot_b.
+Only one 4 KiB data page of the existing file is written, through the mounted
+file system; the raw extent is read back with O_DIRECT.
+"""
+import argparse
+import datetime
+import json
+import mmap
+import os
+import re
+import struct
+import sys
+import zlib
+from pathlib import Path
+
+PAGE = 4096
+FILE_SIZE = 4 * PAGE
+MAGIC = 0x464D504B  # 'KPMF'
+EXECUTABLE = 1 << 2
+
+ESP = Path('/boot/efi')
+ESP_DEVICE = Path('/dev/disk/by-partlabel/ARMADA')
+BOOT_B = Path('/dev/disk/by-partlabel/boot_b')
+LOADER_CONF = ESP / 'loader/loader.conf'
+ENTRIES = ESP / 'loader/entries'
+STATE = Path('/var/lib/opd2413-boot/next.json')
+
+
+def crc(data):
+    return zlib.crc32(data) & 0xffffffff  # same as choice_crc()
+
+
+# --- kShimC manifest and records -------------------------------------------
+
+class Manifest:
+    """The kShimC manifest a boot image declares at payload+0x20 (offset, size)."""
+
+    def __init__(self, boot_image):
+        if boot_image[:8] != b'ANDROID!':
+            raise ValueError('not an Android boot image')
+        payload = boot_image[PAGE:]
+        offset, size = struct.unpack_from('<QQ', payload, 0x20)
+        if not 0 < size <= PAGE:
+            raise ValueError('manifest size out of range')
+        self.bytes = bytes(payload[offset:offset + size])
+        magic, major, minor, count, self.default, self.timeout_ms = struct.unpack_from('<IHHIII', self.bytes)
+        if magic != MAGIC or (major, minor) != (0, 1) or not 0 < count <= 50:
+            raise ValueError('not a kShimC 0.1 manifest')
+        self.entries = []  # (name, identity hash, 0 if not selectable)
+        o = 60
+        for _ in range(count):
+            flags, = struct.unpack_from('<I', self.bytes, o + 20)
+            name_len, = struct.unpack_from('<I', self.bytes, o + 52)
+            raw = self.bytes[o:o + 56 + name_len]
+            self.entries.append((raw[56:].decode(), crc(raw) if flags & EXECUTABLE else 0))
+            o = (o + 56 + name_len + 3) & ~3
+        self.selectable = count - 1  # the last entry is the attached shim
+
+    def names(self):
+        return [name for name, ident in self.entries[:self.selectable] if ident]
+
+    def index(self, name):
+        names = [e[0] for e in self.entries[:self.selectable]]
+        if names.count(name) != 1 or not self.entries[names.index(name)][1]:
+            raise ValueError(f'{name!r} is not a selectable kShimC entry; choose from {self.names()}')
+        return names.index(name)
+
+
+class Journal:
+    """KSHIM.CHO contents: two record pages at `base`, the provision page after them."""
+
+    def __init__(self, data):
+        if len(data) != FILE_SIZE:
+            raise ValueError('KSHIM.CHO must be 16 KiB')
+        self.data = bytes(data)
+        hits = [b for b in range(0, PAGE) if data[b + 2 * PAGE:b + 2 * PAGE + 8] == b'KSHPROV1']
+        if len(hits) != 1:
+            raise ValueError('KSHIM.CHO has no unique provision page')
+        self.base = hits[0]
+        prov = data[self.base + 2 * PAGE:self.base + 3 * PAGE]
+        if (struct.unpack_from('<II', prov, 8) != (1, FILE_SIZE) or not any(prov[48:64])
+                or crc(prov[:PAGE - 4]) != struct.unpack_from('<I', prov, PAGE - 4)[0]):
+            raise ValueError('KSHIM.CHO provision page is invalid')
+        self.guid, self.nonce = prov[16:32], prov[48:64]
+
+    def page(self, slot):
+        return self.data[self.base + slot * PAGE:self.base + (slot + 1) * PAGE]
+
+    def context(self, manifest):
+        return crc(manifest.bytes) ^ crc(self.guid) ^ crc(self.nonce)
+
+    def decode(self, slot, manifest):
+        p = self.page(slot)
+        if p[:8] != b'KSHMCHO1':
+            return None
+        version, entry, sequence, ctx, ident = struct.unpack_from('<IIQII', p, 8)
+        if (version != 1 or ctx != self.context(manifest) or not sequence or entry >= manifest.selectable
+                or not manifest.entries[entry][1] or ident != manifest.entries[entry][1]
+                or crc(p[:PAGE - 4]) != struct.unpack_from('<I', p, PAGE - 4)[0] or any(p[32:PAGE - 4])):
+            return None
+        return {'slot': slot, 'entry': entry, 'name': manifest.entries[entry][0], 'sequence': sequence}
+
+    def selected(self, manifest):
+        """Latest valid record for `manifest`, as kShimC's choice_latest() picks it."""
+        a, b = self.decode(0, manifest), self.decode(1, manifest)
+        if a and b and a['sequence'] == b['sequence'] and a['entry'] != b['entry']:
+            raise ValueError('conflicting KSHIM.CHO records')
+        if not a or (b and b['sequence'] > a['sequence']):
+            return b
+        return a
+
+    def plan(self, manifest, name, keep=None):
+        """(slot, page) selecting `name`, or None if it is already selected.
+
+        Overwrites the slot kShimC would overwrite (the one not holding the
+        latest record). `keep` is another manifest whose valid record must
+        survive: then the slot holding that record is never chosen.
+        """
+        entry = manifest.index(name)
+        latest = self.selected(manifest)
+        if latest and latest['entry'] == entry:
+            return None
+        protect = {r['slot'] for r in ([keep and self.selected(keep)] if keep else []) if r}
+        slot = 1 - latest['slot'] if latest else 0
+        if slot in protect:
+            slot = 1 - slot
+        if slot in protect:
+            raise ValueError('both pages are in use by records that must be kept')
+        raw = [struct.unpack_from('<Q', self.page(s), 16)[0] if self.page(s)[:8] == b'KSHMCHO1' else 0
+               for s in (0, 1)]
+        page = bytearray(PAGE)
+        page[:8] = b'KSHMCHO1'
+        struct.pack_into('<IIQII', page, 8, 1, entry, max(raw) + 1, self.context(manifest),
+                         manifest.entries[entry][1])
+        struct.pack_into('<I', page, PAGE - 4, crc(bytes(page[:PAGE - 4])))
+        return slot, bytes(page)
+
+
+# --- device access ----------------------------------------------------------
+
+def direct_read(device, offset, count):
+    """Read the block device bypassing its page cache (stale after file writes)."""
+    start = offset & ~4095
+    length = (offset - start + count + 4095) & ~4095
+    fd = os.open(device, os.O_RDONLY | os.O_DIRECT)
+    try:
+        with mmap.mmap(-1, length) as buf:
+            if os.preadv(fd, [buf], start) != length:
+                raise OSError('short read')
+            return bytes(buf[offset - start:offset - start + count])
+    finally:
+        os.close(fd)
+
+
+def raw_extent(device):
+    """Byte offset of KSHIM.CHO on the FAT16 ESP; requires a single contiguous chain."""
+    with open(device, 'rb', buffering=0) as disk:
+        b = disk.read(512)
+        sector, = struct.unpack_from('<H', b, 11)
+        spc, fats = b[13], b[16]
+        reserved, roots, spf = (struct.unpack_from('<H', b, n)[0] for n in (14, 17, 22))
+        if b[510:512] != b'\x55\xaa' or fats != 2 or not spf or not roots or not spc:
+            raise ValueError('ESP is not the expected FAT16 file system')
+        disk.seek(reserved * sector)
+        fat = disk.read(spf * sector)
+        if disk.read(spf * sector) != fat:
+            raise ValueError('FAT mirrors differ')
+        root = (reserved + fats * spf) * sector
+        disk.seek(root)
+        directory = disk.read(roots * 32)
+    found = [directory[i:i + 32] for i in range(0, len(directory), 32) if directory[i:i + 11] == b'KSHIM   CHO']
+    if len(found) != 1 or struct.unpack_from('<I', found[0], 28)[0] != FILE_SIZE or found[0][11] & 0x18:
+        raise ValueError('KSHIM.CHO missing or ambiguous in the ESP root directory')
+    first, = struct.unpack_from('<H', found[0], 26)
+    cluster = spc * sector
+    count = (FILE_SIZE + cluster - 1) // cluster
+    for i in range(count):
+        nxt, = struct.unpack_from('<H', fat, 2 * (first + i))
+        if (nxt != first + i + 1) if i + 1 < count else (nxt < 0xfff8):
+            raise ValueError('KSHIM.CHO is not one contiguous chain')
+    return root + (roots * 32 + sector - 1) // sector * sector + (first - 2) * cluster
+
+
+def boot_b_manifest(image=None):
+    if image:
+        return Manifest(Path(image).read_bytes())
+    with open(BOOT_B, 'rb') as dev:
+        head = dev.read(PAGE)
+        size, = struct.unpack_from('<I', head, 8)  # kernel_size: the kShimC packed image
+        return Manifest(head + dev.read(size))
+
+
+def read_journal():
+    return Journal((ESP / 'KSHIM.CHO').read_bytes())
+
+
+def write_kshim(manifest, name, keep=None):
+    device = ESP_DEVICE.resolve(strict=True)
+    path = ESP / 'KSHIM.CHO'
+    if os.stat(ESP).st_dev != os.stat(device).st_rdev:
+        raise ValueError(f'{ESP} is not mounted from {device}')
+    fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
+    try:
+        before = os.pread(fd, FILE_SIZE, 0)
+        os.fsync(fd)
+        os.sync()
+        offset = raw_extent(device)
+        if direct_read(device, offset, FILE_SIZE) != before:
+            raise ValueError('raw extent does not match KSHIM.CHO')
+        journal = Journal(before)
+        plan = journal.plan(manifest, name, keep)
+        if plan is None:
+            return journal.selected(manifest), False
+        slot, page = plan
+        at = journal.base + slot * PAGE
+        if os.pwrite(fd, page, at) != PAGE:
+            raise OSError('short write')
+        os.fsync(fd)
+        os.sync()
+        after = direct_read(device, offset, FILE_SIZE)
+        expected = before[:at] + page + before[at + PAGE:]
+        if after != expected or os.pread(fd, FILE_SIZE, 0) != expected:
+            raise OSError('KSHIM.CHO readback differs')
+    finally:
+        os.close(fd)
+    result = Journal(after).selected(manifest)
+    if not result or result['name'] != name:
+        raise OSError('written record does not decode')
+    if keep and (journal.selected(keep) or {}) != (Journal(after).selected(keep) or {}):
+        raise OSError('the record that had to be kept changed')
+    return result, True
+
+
+# --- systemd-boot default ---------------------------------------------------
+
+def loader_lines():
+    return LOADER_CONF.read_text().splitlines()
+
+
+def loader_default(lines):
+    found = [line.split(None, 1)[1] if len(line.split(None, 1)) == 2 else '' for line in lines
+             if line.split()[:1] == ['default']]
+    if len(found) != 1:
+        raise ValueError('loader.conf must have exactly one default line')
+    return found[0]
+
+
+def write_loader_default(value):
+    lines = loader_lines()
+    loader_default(lines)
+    text = '\n'.join(f'default {value}' if line.split()[:1] == ['default'] else line for line in lines) + '\n'
+    tmp = LOADER_CONF.with_name('loader.conf.opd2413-new')
+    with open(tmp, 'w') as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, LOADER_CONF)
+    dir_fd = os.open(LOADER_CONF.parent, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+    if loader_default(loader_lines()) != value:
+        raise OSError('loader.conf readback differs')
+
+
+def entry_ids():
+    return sorted(p.name[:-5] for p in ENTRIES.glob('*.conf'))
+
+
+def loader_id(name):
+    """What loader.conf `default` must say to pick entry NAME.
+
+    systemd-boot matches `default` (a glob) against the entry id, which keeps
+    the ".conf" suffix: "fedora-7.2.15-2.opd2413" matches nothing, and an
+    unmatched default silently falls back to the newest entry.
+    """
+    return name if name.endswith('.conf') else name + '.conf'
+
+
+def selected_entry():
+    """systemd-boot's LoaderEntrySelected for this boot (UTF-16, after a 4-byte attribute)."""
+    for p in Path('/sys/firmware/efi/efivars').glob('LoaderEntrySelected-*'):
+        return p.read_bytes()[4:].decode('utf-16-le').rstrip('\0')
+    return None
+
+
+# --- commands ---------------------------------------------------------------
+
+def cmd_status(args):
+    manifest = boot_b_manifest()
+    journal = read_journal()
+    record = journal.selected(manifest)
+    state = json.loads(STATE.read_text()) if STATE.exists() else None
+    status = {
+        'kshim_entries': manifest.names(),
+        'kshim_default': manifest.entries[manifest.default][0],
+        'kshim_timeout_s': manifest.timeout_ms / 1000,
+        'kshim_remembered': record['name'] if record else None,
+        'loader_default': loader_default(loader_lines()),
+        'loader_entries': entry_ids(),
+        'booted_entry': selected_entry(),
+        'pending_next': state,
+    }
+    if args.manifest:
+        other = boot_b_manifest(args.manifest)
+        r = journal.selected(other)
+        status['for_other_manifest'] = {'entries': other.names(), 'timeout_s': other.timeout_ms / 1000,
+                                        'remembered': r['name'] if r else None}
+    print(json.dumps(status, indent=2))
+
+
+def cmd_kshim(args):
+    target = boot_b_manifest(args.manifest)
+    keep = boot_b_manifest() if args.manifest and args.keep_current else None
+    record, written = write_kshim(target, args.name, keep)
+    print(json.dumps({'remembered': record['name'], 'sequence': record['sequence'], 'slot': record['slot'],
+                      'written': written, 'for': 'given image' if args.manifest else 'installed boot_b'}))
+
+
+def cmd_next(args):
+    entry = args.entry[:-5] if args.entry.endswith('.conf') else args.entry
+    if entry not in entry_ids():
+        raise SystemExit(f'no loader entry {entry!r}; entries: {entry_ids()}')
+    current = loader_default(loader_lines())
+    if STATE.exists():
+        previous = json.loads(STATE.read_text())['previous_default']
+    else:
+        previous = current
+    STATE.parent.mkdir(mode=0o700, exist_ok=True)
+    note = {'previous_default': previous, 'next': loader_id(entry),
+            'set_at': datetime.datetime.now().astimezone().isoformat(timespec='seconds')}
+    tmp = STATE.with_suffix('.new')
+    tmp.write_text(json.dumps(note) + '\n')
+    os.replace(tmp, STATE)
+    write_loader_default(loader_id(entry))
+    print(json.dumps(note))
+
+
+def cmd_default(args):
+    value = args.value[:-5] if args.value.endswith('.conf') else args.value
+    if not re.fullmatch(r'[A-Za-z0-9._@*+-]+', value):
+        raise SystemExit(f'invalid default {value!r}')
+    if '*' not in value and not value.startswith('@'):
+        if value not in entry_ids():
+            raise SystemExit(f'no loader entry {value!r}; entries: {entry_ids()}')
+        value = loader_id(value)
+    if STATE.exists():
+        # A one-shot is pending: the new value is what restore puts back.
+        note = json.loads(STATE.read_text())
+        note['previous_default'] = value
+        tmp = STATE.with_suffix('.new')
+        tmp.write_text(json.dumps(note) + '\n')
+        os.replace(tmp, STATE)
+        print(json.dumps({'default_after_next': value, 'next': note['next']}))
+        return
+    write_loader_default(value)
+    print(json.dumps({'default': value}))
+
+
+def cmd_restore(args):
+    booted = selected_entry()
+    if not STATE.exists():
+        print(f'nothing to restore; booted entry {booted}')
+        return
+    note = json.loads(STATE.read_text())
+    current = loader_default(loader_lines())
+    if current == note['next']:
+        write_loader_default(note['previous_default'])
+        print(f"booted {booted}; default restored from {note['next']} to {note['previous_default']}")
+    else:
+        print(f"booted {booted}; default is {current!r}, not the one-shot {note['next']!r}: left alone")
+    STATE.unlink()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest='command', required=True)
+    p = sub.add_parser('status')
+    p.add_argument('--manifest', help='also decode KSHIM.CHO for the manifest of this boot_b image')
+    p.set_defaults(func=cmd_status)
+    p = sub.add_parser('kshim')
+    p.add_argument('name')
+    p.add_argument('--manifest', help='write the record for the manifest of this boot_b image')
+    p.add_argument('--keep-current', action='store_true',
+                   help="with --manifest: never overwrite the installed boot_b's current record")
+    p.set_defaults(func=cmd_kshim)
+    p = sub.add_parser('next')
+    p.add_argument('entry')
+    p.set_defaults(func=cmd_next)
+    p = sub.add_parser('default')
+    p.add_argument('value')
+    p.set_defaults(func=cmd_default)
+    p = sub.add_parser('restore')
+    p.set_defaults(func=cmd_restore)
+    args = parser.parse_args()
+    try:
+        args.func(args)
+    except (ValueError, OSError) as error:
+        sys.exit(f'boot-select: {error}')
+
+
+if __name__ == '__main__':
+    main()

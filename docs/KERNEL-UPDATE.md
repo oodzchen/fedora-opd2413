@@ -9,12 +9,12 @@
   dnf 自动卸掉**最旧**的那个。
 - **默认项是版本最新的内核**：`loader.conf` 写的是 `default fedora-*`，systemd-boot 在匹配的条目里选排在最前（版本最高）的。
   装完新内核，下次开机就会进新内核。
-- **U-Boot 的 EFI 变量在系统运行时只读**：`bootctl set-default`、`bootctl set-oneshot` 都会失败。要临时选别的条目，只能在开机时
-  手选（kShimC 选 "Armada boot menu"，再在 systemd-boot 菜单里选）。
+- **U-Boot 的 EFI 变量在系统运行时只读**：`bootctl set-default`、`bootctl set-oneshot` 都会失败。用 `boot-select next <条目>`
+  （或主机 `tools/tablet-reboot.py --entry`）代替，见 [BOOT-CONTROL.md](BOOT-CONTROL.md)；开机时手选是 kShimC 选 "Fedora boot menu"，再在 systemd-boot 菜单里选。
 - **systemd-boot 的启动计数（`/etc/kernel/tries`、条目名里的 `+N`）不能用**：U-Boot 拒绝改名，开机时会打印一行红色的
   `Failed to rename ... Access denied`，条目不会被标记为坏，也不会自动回退。不要创建 `/etc/kernel/tries`。
-- **ramoops/pstore 拿不到上一次启动的日志**：这台机器重启后那块内存不保留（软重启也一样）。
-- **kShimC 会记住上次选的菜单项**（ESP 上的 `KSHIM.CHO`）。手选过 "Armada boot menu" 之后，下次要改回 "Armada"，
+- **ramoops 在热复位后保留**（长按电源会丢），systemd-pstore 会把记录搬走；用 `tools/bootlog/fetch-bootlogs.py` 取，见 [BOOT-LOGGING.md](BOOT-LOGGING.md)。
+- **kShimC 会记住上次选的菜单项**（ESP 上的 `KSHIM.CHO`）。手选过 "Fedora boot menu" 之后，用 `boot-select kshim Fedora` 改回，
   否则每次开机都停在 systemd-boot 菜单。
 - **版本号不能互为前缀**：卸载时 kernel-install 会删除所有 `fedora-<kver>*.conf`。版本号一律用 `7.2.6-<N>.opd2413`。
 - **每个条目带自己的 DTB**（`/fedora/<kver>/sm8750-oneplus-pad2pro.dtb`），回滚内核时 DTB 一起回滚。
@@ -76,7 +76,7 @@ grep -H ^options /boot/efi/loader/entries/fedora-*.conf
 
 ## 回滚
 
-- **临时**：开机时 kShimC 选 "Armada boot menu" → systemd-boot 菜单选旧内核。之后记得把 kShimC 改回 "Armada"。
+- **临时**：开机时 kShimC 选 "Fedora boot menu" → systemd-boot 菜单选旧内核。之后 `boot-select kshim Fedora` 改回。
 - **长期**：进入能用的内核后 `dnf remove kernel-opd2413-<坏的版本>`，默认项自然回到剩下的那个。
   不要靠改 `loader.conf` 的 `default` 来固定旧内核（它不归任何包管，改了容易忘）。
 - **用回退内核 `7.2.6-2.opd2413` 启动过**：它没有 SELinux，期间新建的文件没有标签。回到新内核后执行 `fixfiles onboot` 并重启

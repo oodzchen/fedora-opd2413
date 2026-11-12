@@ -36,11 +36,10 @@ Fedora 的软件包原样安装、由 dnf 管理；设备适配只通过几个�
 
 ```
 开机 → OEM ABL（不替换）
-     → boot_b 里的 kShimC 菜单（记住上次选择，记录在 ESP 的 KSHIM.CHO）
+     → boot_b 里的 kShimC 菜单（ColorOS / Fedora / Fedora boot menu，10 s；记住上次选择，记录在 ESP 的 KSHIM.CHO，见 BOOT-CONTROL.md）
         ├─ ColorOS：原 Android 内核，原样交接
-        ├─ "Armada"：          U-Boot quiet 模式，不显示菜单，启动 systemd-boot 默认项
-        ├─ "Armada boot menu"：U-Boot menu 模式，显示 systemd-boot 菜单（回滚入口）
-        └─ "Armada USB disk"： U 盘恢复入口
+        ├─ "Fedora"：          U-Boot quiet 模式，不显示菜单，启动 systemd-boot 默认项
+        └─ "Fedora boot menu"：U-Boot menu 模式，显示 systemd-boot 菜单（回滚入口，不倒计时）
      → U-Boot（嵌在 boot_b 里，UFS 只读）
         从 LUN0 上 PARTLABEL=ARMADA 的 FAT 分区加载：
           /dtbs/qcom/sm8750-oneplus-pad2pro.dtb
@@ -57,7 +56,7 @@ Fedora 的软件包原样安装、由 dnf 管理；设备适配只通过几个�
 3. systemd-boot 在 `/EFI/BOOT/BOOTAA64.EFI`，内核和 initramfs 都在 ESP 上
    （systemd-boot 只能读 FAT；U-Boot 的 UFS 驱动只读且有白名单）。
 
-菜单项标题里的 "Armada" 字样写在 `boot_b` 里，改名需要重写 `boot_b`，列为可选的后续项。
+菜单项标题写在 `boot_b` 里，2026-11-11 已改为 "Fedora"、去掉 U 盘入口（`boot_b` fedora1）。分区名仍是 `ARMADA*`（改要动 GPT）。
 
 ### Fedora 侧的集成方式
 
@@ -180,7 +179,7 @@ NFC、手写笔（用户决定忽略）。详见 [HARDWARE.md](HARDWARE.md)。
 
 - 用户态：`dnf upgrade`，和普通 Fedora 一样。
 - 内核：装新的 `kernel-opd2413` → `kernel-install` 写新条目 → 旧内核保留为上一项（只留两个）。
-  启动失败时在 kShimC 里选 "Armada boot menu"，从 systemd-boot 菜单选旧内核。步骤和注意事项见 [KERNEL-UPDATE.md](KERNEL-UPDATE.md)。
+  启动失败时在 kShimC 里选 "Fedora boot menu"，从 systemd-boot 菜单选旧内核。步骤和注意事项见 [KERNEL-UPDATE.md](KERNEL-UPDATE.md)。
 - 根文件系统：btrfs 子卷，重大升级前可以手动快照。
 - 救援：kShimC 的 USB 入口；最坏情况回 Android 后用 adb 处理 ESP。
 - ColorOS OTA 会覆盖 `boot`：需要重新把 kShimC 镜像写回活动槽（流程待在 M5 整理）。

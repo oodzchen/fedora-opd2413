@@ -5,51 +5,84 @@
 
 ## 唯一的下一步
 
-**M3a：查清 7.3 内核在平板上为什么启动后很快复位**。下一个实验（待用户同意）：给 ESP 上的测试启动项
-`opd2413-m3test.conf`（7.3.3-3）加上 `earlycon=efifb keep_bootcon`，使参数与唯一一次越过复位的那次完全相同。
-越过了：说明 earlycon 影响结果，而且屏幕上能看到后面的日志；仍复位：问题在 7.3.3-3 相对 7.3.3-2 的唯一改动 SHM bridge 上。
-所有上机记录和已排除的假设见 [WORKLOG.md](WORKLOG.md) 2026-11-11"M3a 上机"一节。
+**下一步待用户选：M3.2b（PPS 快充）或 M3.4（传感器/摄像头/视频硬解）。** M3.3 已真机通过；M3.4 的相机 ISP/CSI PHY 驱动还能去掉临时参数 `fw_devlink.sync_state=timeout`（技术债 #34）。
+测试新内核用 `tools/tablet-reboot.py --entry …`（重启前会用 `bootctl` 核对将启动的条目）；装新内核前先 `boot-select default <当前条目>`。
+
+M3.3 2026-11-12 真机通过：s2idle 可用（设备包 0.1-9/0.1-10，`MemorySleepMode=s2idle`），用户在 KDE 里把电源键、合盖设为睡眠；
+启动参数去掉三个 `*_ignore_unused`、加 `fw_devlink.sync_state=timeout` 后，挂起时 CX 塌陷、DDR 自刷新约 98 %（插着 USB）。
+另修了 `boot-select` 的一个错误：之前写入 loader.conf 的精确条目名不带 `.conf`，systemd-boot 匹配不上、退回最新条目。
+
+M3 第 2 项 M3.2a 2026-11-12 真机通过：`7.2.15-3.opd2413`（erhai v0.7.2 的 battmgr 整文件）是默认内核；快充充电器上固定 9 V PD，电流符号正确，冷启动复查通过。
+M3 第 1 项蓝牙 2026-11-12 真机通过：`7.2.15-2.opd2413`（erhai `5fbc7cbd1` + RFCOMM TTY、BNEP）是默认内核，用户用音箱和耳机实测正常，冷启动复查通过。
+M3 第 0 步（内核基线 7.2.6 → 7.2.15）2026-11-12 真机通过：`7.2.15-1.opd2413` 是默认内核，冷启动复查通过，用户确认画面、触控、键盘和触控板、
+声音、亮度、熄屏亮屏正常（WORKLOG"20:55 起"）。`boot-select next` 加自动恢复也已真机通过（[BOOT-CONTROL.md](BOOT-CONTROL.md)）。
+M3 顺序：~~蓝牙~~ → ~~电池与充电（9 V）~~ → 休眠与按键 → 传感器/摄像头/硬解（[M3-FEATURES.md](M3-FEATURES.md)）。
+7.3 基线暂停，改为 M6（[M3-KERNEL.md](M3-KERNEL.md) 顶部有暂停时的状态）。发现和修复可以回馈 erhai，每次提交前先问。
+
+还没清理、需要另行批准的：`/etc/modprobe.d/opd2413-pps.conf`（只对 7.3 有意义）、根分区 `/var/tmp/opd2413/` 下的实验备份（技术债 #27）。
+
 M2 剩下的被动观察项：开机提示音毛刺再出现时当场取证；空闲自动熄屏能否恢复。
 
 ## 当前阻塞
 
-7.3 内核在平板上起不来：选中后黑屏或红字后几秒内整机复位；唯一一次越过（7.3.3-2 + earlycon）在约 10 秒后黑屏卡死，
-SSH 连不上。复位后没有任何日志可读（ramoops 在这台机器上重启后不保留，见 WORKLOG）。内核 3 不受影响，是默认项。
+没有阻塞。默认内核 `7.2.15-3.opd2413`，Fedora 45 KDE 正常运行；7.2.15-2 是回退项（内核 3、7.2.15-1 已卸载）。
+
+已知的坑：
+
+- 一次性启动的测试内核如果在挂上根分区之前就复位，会一直重复启动它：在 kShimC 菜单选 "Fedora boot menu"，再在 systemd-boot 里选正常内核。
+- 用 ramoops 取证时：长按电源会丢记录；不是每种复位都保内存。
+- 没有网络和画面时先**短按**电源键，用户态活着就会正常关机，journal 完整。
 
 ## 接手时先做这几件事
 
 1. 读本文件；需要了解启动链和安装过程时读 [ARCHITECTURE.md](ARCHITECTURE.md) 和 [M1-INSTALL.md](M1-INSTALL.md)。
-2. 平板默认就进 Fedora（kShimC 菜单里的 "Armada" 项）。SSH：`OPD_OS=fedora private/ssh.sh`，
+2. 平板默认就进 Fedora（kShimC 菜单里的 "Fedora" 项，`boot-select status` 可查）。重启测试用 `tools/tablet-reboot.py`。SSH：`OPD_OS=fedora private/ssh.sh`，
    拷文件 `OPD_OS=fedora private/scp.sh`；IP 变了设 `OPD_HOST`，或在局域网里扫 22 端口找。
-3. 改了 `device/` 或任何 spec，按 [BUILD.md](BUILD.md) 重新构建、跑三个离线测试，再拷到平板用 `dnf install ./*.rpm` 装。
-4. 关机会自动重新开机（插着电时）。需要重启验证时可以直接经 SSH `systemctl poweroff`，约 60 秒后回来。
+3. 改了 `device/` 或任何 spec，按 [BUILD.md](BUILD.md) 重新构建、跑离线测试，再拷到平板用 `dnf install ./*.rpm` 装。
+4. 关机会自动重新开机（插着电时）。需要冷启动验证时可以直接经 SSH `systemctl poweroff`，约 40 秒后回来。
 
-## 设备状态（2026-11-11）
+## 设备状态（2026-11-12 10:12）
 
-- 平板运行 Fedora 45 KDE，内核 `7.2.6-3.opd2413`（默认项，带 SELinux 和 Fedora 的 netfilter 配置）。
-  `7.2.6-2.opd2413` 已卸载。设备包 `opd2413-device/audio-0.1-5`（`installonly_limit=2`）。
-- 另装了测试内核 `kernel-opd2413-7.3.3-3.opd2413`：kernel-install 生成的条目已改名为 `opd2413-m3test.conf`
-  （标题 "M3 test: 7.3.3-3 (no boot counter)"，排在菜单最后，不是默认项），参数去掉了 `quiet loglevel=3`、加了 `ignore_loglevel`。
-  这个条目是手工改的，卸载该内核时 kernel-install 不会删它，要手动删。
-- ESP 固定路径的 `/dtbs/qcom/sm8750-oneplus-pad2pro.dtb` 已被 `95-opd2413-dtb` 插件换成 7.3 的 DTB（只给 U-Boot 用；
-  每个条目用自己的 DTB，内核 3 不受影响）。回到只用内核 3 时，可对内核 3 重跑 `kernel-install add` 换回来。
-- `/etc/modprobe.d/opd2413-pps.conf`：`options erhai_pps pps_enable=0`（只对 7.3 内核有意义）。`/etc/kernel/tries` 已删除。
-- SELinux enforcing（`/etc/selinux/config`，启动参数里已没有 `enforcing=0`），firewalld 运行中（public 区）。
-- 自动登录到 `colin`，自动锁屏已关；KDE 空闲熄屏已恢复默认。
-- 显示模式只有 120 Hz。
-- Armada 已完全删除；`boot_b`、分区表、Android 各分区未改动。
-- 没有正在运行的设备任务。kShimC 记住的菜单项可能是 "Armada boot menu"（会停在 systemd-boot 菜单）。
+- 10:09 冷启动后运行：Fedora 45 KDE，内核 `7.2.15-3.opd2413`，`running`。启动参数没有 `*_ignore_unused`、有 `fw_devlink.sync_state=timeout`（7.2.15-2 回退条目仍是旧参数）。
+  s2idle 可用（电源键、合盖、空闲按 KDE 设置挂起），挂起时 CX 塌陷。插着快充、9 V 充电。蓝牙打开，有一个用户配对的设备。
+  `/etc/kernel/cmdline` 改前的备份在 `/var/tmp/opd2413/m3-sleep/cmdline-100831/`。
+- systemd-boot：`loader.conf` 默认 `fedora-*`（选版本最高的）；条目 `fedora-7.2.15-3.opd2413`、`fedora-7.2.15-2.opd2413`。
+  ESP 空闲约 268 MiB；固定路径 `/dtbs/qcom/sm8750-oneplus-pad2pro.dtb` 是 7.2.15 的（与内核 3 相同）。
+- `boot_b` = `07bf1b53…`（fedora1：菜单 ColorOS / Fedora / Fedora boot menu，倒计时 10 s，默认项仍是 ColorOS）；KSHIM.CHO 记住 Fedora。
+  上一版 `492f2cdf…` 的整分区回读在主机 `private/bootflow-20261111/boot_b-readonly.img`。
+- 软件包：`kernel-opd2413-7.2.15-3`、`7.2.15-2`，`opd2413-device-0.1-10`、`opd2413-audio-0.1-5`。`installonly_limit=2`：再装一个内核会卸掉 7.2.15-2。
+  内核 3（`7.2.6-3`）08:45 经用户同意卸载，它的包仍在主机 `out/rpms/`。
+- 7.3 测试内核、"M3 test" 和 "Log capture" 两个条目、ESP 上的 `opd2413-bootlog/` 已于 11-11 23:29 删除（备份在 `/var/tmp/opd2413/m3k-install-*/`）。
+- `/etc/modprobe.d/opd2413-pps.conf`：`options erhai_pps pps_enable=0`（7.2 内核没有这个模块，无影响）。`/etc/kernel/tries` 已删除。
+- `/var/lib/opd2413-pstore/` 下有 6 个按启动命名的记录目录。
+- SELinux enforcing，firewalld 运行中（public 区）。sshd 监听所有地址（Fedora 默认），与 AGENTS 设备安全规则 8 不符，未处理。
+- 自动登录到 `colin`，自动锁屏已关；KDE 空闲熄屏已恢复默认。显示模式只有 120 Hz。
+- sda17（`ARMADA_BOOT`）：未挂载、clean；保留旧 `/boot` 文件和 `opd2413-bootlog/` 下 11-11 的采集日志（都已取回主机）。
+  16:36 的整分区备份在主机。分区表、Android 各分区未改动。
+- 根分区的临时文件：`/var/tmp/opd2413/` 下各次实验的备份（技术债 #27）。
 
 ## 主机上的产物（都在忽略目录里，不进仓库）
 
 | 路径 | 内容 |
 |---|---|
-| `out/rpms/` | 四个软件包和 `SHA256SUMS`，与平板上装的一致（内核 3） |
+| `out/rpms/` | 四个软件包和 `SHA256SUMS`（内核 3 和设备包 0.1-5，比平板上的旧；现用的在 `out/rpmbuild/RPMS/`） |
 | `out/old-rpms/` | 以前的内核包（1、2、opd1、diag1、diag2），2 是平板上的回退内核 |
 | `out/pkg-test/`、`out/qemu-test/` | 两个离线测试的证据 |
 | `private/esp-20261110/esp-sda16.img` | ESP 整分区备份（含 `KSHIM.CHO`） |
 | `out/kernel-tree/` | kern2 源码树的副本 + 1411/1412 + `fedora-netfilter-lsm.config`，见 kernel/README.md |
 | `private/display-*` | 黑屏排查的证据和抓取脚本 |
+| `private/bootlogs/` | `tools/bootlog/fetch-bootlogs.py` 每次取回的日志（pstore、sda17 采集文件、内核 journal） |
+| `private/m3-exp12-20261111/`、`m3-exp13-…`、`m3-exp14-…` | 第 12–14 次的脚本和记录；第 13 次的含 7.3 启动的完整 journal |
+| `out/m3k/` | 7.2.15 源码树（git，分支 `series3`，可由 `tools/kernel/apply-armada-series.sh` 重现）、`build.sh`、构建和测试日志 |
+| `out/rpmbuild/RPMS/aarch64/kernel-opd2413-7.2.15-1.opd2413.aarch64.rpm` | 平板上的默认内核 |
+| `private/m3k-install-20261111/` | 7.2.15 装机和冷启动复查的证据 |
+| `out/rpmbuild/RPMS/aarch64/kernel-opd2413-7.2.15-2.opd2413.aarch64.rpm` | 平板上的默认内核（M3.1 蓝牙）；`out/m3k/rpms2/`、`pkg-test2/` 是它的离线测试 |
+| `private/m3-bt-20261112/` | M3.1 蓝牙的对照、安装、用户实测和冷启动证据 |
+| `out/rpmbuild/RPMS/aarch64/kernel-opd2413-7.2.15-3.opd2413.aarch64.rpm` | 平板上的默认内核（M3.2a）；`out/m3k/rpms3/`、`pkg-test3/` 是它的离线测试 |
+| `private/m3-batt-20261112/` | M3.2a 的安装、读数、拔插采样和冷启动证据 |
+| `out/m3-rpm5/` | 诊断内核 `7.3.3-5.opd2413` 的构建脚本和日志（编译完成，19:50 在打包前中止，没有包） |
+| `out/rpmbuild/RPMS/noarch/opd2413-device-0.1-10.noarch.rpm` | 平板上现在装的设备包（0.1-9 起允许 s2idle，0.1-10 修 boot-select 的条目 id） |
+| `private/m3-sleep-20261112/` | M3.3 的 pm_test、s2idle、按键挂起证据 |
 | `private/ssh.sh`、`private/scp.sh` | 连平板的 SSH / scp 包装（`OPD_OS=fedora` 用 Fedora 的地址和主机密钥） |
 | `private/install.env` | 用户给的初始密码 |
 
@@ -60,9 +93,10 @@ SSH 连不上。复位后没有任何日志可读（ramoops 在这台机器上�
 | M0 | 立项：决定、仓库、架构和进度文档 | 完成（2026-11-10） |
 | M1 | Fedora 45 KDE 用现有 7.2.6 内核从机内启动，功能与 Armada 持平，然后取代 Armada | 完成（2026-11-11） |
 | M2 | 运行中面板重新打开黑屏（已修）；标准化：SELinux、防火墙、每条目 DTB、内核升级和回滚流程（[KERNEL-UPDATE.md](KERNEL-UPDATE.md)）都已完成；开机提示音毛刺待再现 | 基本完成 |
-| M3 | 内核升到 Fedora 45 的当前内核（7.3.3），以 erhai v0.7.2 为设备改动主体，合入休眠、充电、蓝牙、相机、传感器（[M3-KERNEL.md](M3-KERNEL.md)） | 进行中：离线通过，真机失败（启动后复位），排查中 |
+| M3 | 在 7.2 内核（基线 7.2.15）上逐项合入 erhai 的功能：蓝牙、电池与充电、休眠与按键、传感器、摄像头、视频硬解（[M3-FEATURES.md](M3-FEATURES.md)） | 进行中：基线 7.2.15、蓝牙、电池与 9 V 充电、休眠与按键（含睡深）真机通过（2026-11-12）；剩 PPS（M3.2b）和传感器/摄像头/硬解（M3.4） |
 | M4 | 外设逐项验收和长尾问题（灰闪、USB 3 方向、DP 音频等） | 未开始 |
 | M5 | 维护：软件包自动重建、ColorOS OTA 后恢复流程、对外文档 | 未开始 |
+| M6 | 内核基线跟到 Fedora 45 的当前内核（7.3.x 或更新），原 M3（[M3-KERNEL.md](M3-KERNEL.md)） | 暂停（2026-11-11）：跳过 GPU 时真机启动；带 GPU 时真机失败（GMU 启动时复位） |
 
 ### M1 步骤
 
