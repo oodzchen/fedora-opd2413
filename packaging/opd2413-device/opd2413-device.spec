@@ -34,6 +34,7 @@ boot-select, which picks the next kShimC menu entry and kernel without the menus
 install -D -m 0755 %{srcdir}/libexec/ufs-guard %{buildroot}/usr/libexec/opd2413/ufs-guard
 install -D -m 0755 %{srcdir}/libexec/early-firmware %{buildroot}/usr/libexec/opd2413/early-firmware
 install -D -m 0755 %{srcdir}/libexec/boot-select %{buildroot}/usr/libexec/opd2413/boot-select
+install -D -m 0755 %{srcdir}/libexec/pstore-keep %{buildroot}/usr/libexec/opd2413/pstore-keep
 install -D -m 0644 %{srcdir}/udev/90-opd2413-ufs-guard.rules %{buildroot}/usr/lib/udev/rules.d/90-opd2413-ufs-guard.rules
 install -D -m 0644 %{srcdir}/udev/90-opd2413-pogo-keyboard.hwdb %{buildroot}/usr/lib/udev/hwdb.d/90-opd2413-pogo-keyboard.hwdb
 install -D -m 0644 %{srcdir}/environment.d/60-opd2413-video.conf %{buildroot}/usr/lib/environment.d/60-opd2413-video.conf

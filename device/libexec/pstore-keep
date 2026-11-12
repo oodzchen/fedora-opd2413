@@ -1,0 +1,16 @@
+#!/bin/sh
+# Copy the pstore records the previous boot left (ramoops) before
+# systemd-pstore moves them, into NNNNNN-<boot id> under the state directory,
+# and keep the newest KEEP copies. The early-boot clock is not trustworthy, so
+# the order comes from a counter, not from file times.
+set -eu
+dir=${STATE_DIRECTORY:-/var/lib/opd2413-pstore}
+keep=${OPD2413_PSTORE_KEEP:-20}
+boot=$(cat /proc/sys/kernel/random/boot_id | tr -d -)
+seq=$(cat "$dir/.seq" 2>/dev/null || echo 0)
+case $seq in ''|*[!0-9]*) seq=0 ;; esac
+seq=$((seq + 1))
+echo "$seq" > "$dir/.seq"
+cp -rT /sys/fs/pstore "$dir/$(printf %06d "$seq")-$boot"
+ls -1 "$dir" | grep -E '^[0-9]{6}-[0-9a-f]{32}$' | sort | head -n "-$keep" |
+    while read -r old; do rm -rf -- "${dir:?}/$old"; done

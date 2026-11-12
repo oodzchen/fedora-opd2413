@@ -6,8 +6,9 @@
 # boot is replaced by whatever the next reboot leaves behind (normally the one
 # line "reboot: Restarting system" of a quiet kernel).
 #
-# Copy the records first, into a directory named after the boot that found
-# them. Ordering only: if this unit fails, systemd-pstore still archives.
+# Copy the records first (/usr/libexec/opd2413/pstore-keep: NNNNNN-<boot id>,
+# the newest 20 are kept). Ordering only: if this unit fails, systemd-pstore
+# still archives.
 # Enabled by the package through a sysinit.target.wants symlink (no [Install]).
 [Unit]
 Description=Keep the previous boot's pstore records (OPD2413 boot diagnostics)
@@ -24,4 +25,4 @@ RemainAfterExit=yes
 StateDirectory=opd2413-pstore
 StateDirectoryMode=0700
 UMask=0077
-ExecStart=/usr/bin/cp -rT /sys/fs/pstore %S/opd2413-pstore/%b
+ExecStart=/usr/libexec/opd2413/pstore-keep

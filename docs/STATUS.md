@@ -26,8 +26,6 @@ M3 第 0 步（内核基线 7.2.6 → 7.2.15）2026-11-12 真机通过：`7.2.15
 M3 顺序：~~蓝牙~~ → ~~电池与充电（9 V）~~ → 休眠与按键 → 传感器/摄像头/硬解（[M3-FEATURES.md](M3-FEATURES.md)）。
 7.3 基线暂停，改为 M6（[M3-KERNEL.md](M3-KERNEL.md) 顶部有暂停时的状态）。发现和修复可以回馈 erhai，每次提交前先问。
 
-还没清理、需要另行批准的：根分区 `/var/tmp/opd2413/` 下的实验备份（技术债 #27）。
-
 M2 剩下的被动观察项：开机提示音毛刺再出现时当场取证；空闲自动熄屏能否恢复。
 
 ## 当前阻塞
@@ -59,16 +57,17 @@ M2 剩下的被动观察项：开机提示音毛刺再出现时当场取证；�
   ESP 空闲约 268 MiB；固定路径 `/dtbs/qcom/sm8750-oneplus-pad2pro.dtb` 是 7.2.15 的（与内核 3 相同）。
 - `boot_b` = `07bf1b53…`（fedora1：菜单 ColorOS / Fedora / Fedora boot menu，倒计时 10 s，默认项仍是 ColorOS）；KSHIM.CHO 记住 Fedora。
   上一版 `492f2cdf…` 的整分区回读在主机 `private/bootflow-20261111/boot_b-readonly.img`。
-- 软件包：`kernel-opd2413-7.2.15-10`、`7.2.15-9`，`opd2413-device-0.1-13`、`opd2413-audio-0.1-12`、`opd2413-sensors-0.1-1`、`opd2413-firmware-16.0.10.600-2`、`showtime`（registry 在 `/var/lib/opd2413/sensors`）。`installonly_limit=2`：再装一个内核会卸掉 7.2.15-9。
+- 软件包：`kernel-opd2413-7.2.15-10`、`7.2.15-9`，`opd2413-device-0.1-14`、`opd2413-audio-0.1-12`、`opd2413-sensors-0.1-1`、`opd2413-firmware-16.0.10.600-2`、`showtime`（registry 在 `/var/lib/opd2413/sensors`）。`installonly_limit=2`：再装一个内核会卸掉 7.2.15-9。
   内核 3（`7.2.6-3`）08:45 经用户同意卸载，它的包仍在主机 `out/rpms/`。
 - 7.3 测试内核、"M3 test" 和 "Log capture" 两个条目、ESP 上的 `opd2413-bootlog/` 已于 11-11 23:29 删除（备份在 `/var/tmp/opd2413/m3k-install-*/`）。
 - `/etc/modprobe.d/opd2413-pps.conf` 已删除（11-12）。`/etc/kernel/tries` 已删除。
 - `/var/lib/opd2413-pstore/` 下有 6 个按启动命名的记录目录。
-- SELinux enforcing，firewalld 运行中（public 区）。sshd 监听所有地址（Fedora 默认），与 AGENTS 设备安全规则 8 不符，未处理。
+- SELinux enforcing，firewalld 运行中（public 区）。sshd 只允许密钥登录；2026-11-12 起 firewalld 不再对所有来源开放 ssh，只放行家里局域网的 /24 网段和 IPv6 链路本地（rich rule，已持久化）。
+  换网络后 SSH 进不来时，在平板上用 `firewall-cmd --zone=public --list-rich-rules` 查、按新网段改。
 - 自动登录到 `colin`，自动锁屏已关；KDE 空闲熄屏已恢复默认。显示模式只有 120 Hz。
 - sda17（`ARMADA_BOOT`）：未挂载、clean；保留旧 `/boot` 文件和 `opd2413-bootlog/` 下 11-11 的采集日志（都已取回主机）。
   16:36 的整分区备份在主机。分区表、Android 各分区未改动。
-- 根分区的临时文件：`/var/tmp/opd2413/` 下各次实验的备份（技术债 #27）。
+- 2026-11-12 清理：`/var/tmp/opd2413/`（约 948 MB 实验备份、安装包副本、录音，证据已在主机 `private/`）和旧的 pstore 记录目录已删除；pstore 记录改为只保留最新 20 份（设备包 0.1-14）。
 
 ## 主机上的产物（都在忽略目录里，不进仓库）
 

@@ -1405,3 +1405,11 @@ mpv、Firefox 仍是软解（Fedora `ffmpeg-free` 的专利限制），用户选
 - 借插着电做了欠的冷启动：16:31 `systemctl poweroff`，48 s 后回来。7.2.15-10、`running`、失败 0、Enforcing、AVC 0、GPU/Wi-Fi/蓝牙/声卡/两个摄像头/传感器服务正常，
   麦克风录音正常（−32.7 dBFS），开机 9 V 协商成功；上次 journal 正常结束、pstore 空。**7.2.15-10 冷启动验证通过。** 证据 `private/m3-pps-20261112/`。
 - 用户没有 PPS 充电器，PPS 实测搁置（M3.2b 记为待测：驱动、电荷泵探测、`pps_enable=Y` 已真机确认，只差真正进入 PPS 的验证）。
+
+### 2026-11-12 17:00 起：收尾（用户：先做完安全和收尾，OTA 不管，然后看键盘唤醒和 60 Hz）
+
+- SSH（AGENTS 规则 8）：sshd 本来就只允许密钥登录、root 禁密码；用户选择用防火墙收紧。firewalld public 区去掉 `ssh` 服务，加 rich rule 只放行家里局域网 /24 和 `fe80::/10`；
+  先改运行时、新开一条 SSH 确认能连再 `--runtime-to-permanent`。没有改 sshd 的监听地址（DHCP 地址会变）。
+- 清理（用户批准）：删除平板 `/var/tmp/opd2413/`（约 948 MB）、`/var/tmp` 下的 7.3 内核包和杂项、`/var/lib/opd2413-pstore/` 下 35 个旧记录目录。
+  设备包 0.1-14：`opd2413-pstore-keep.service` 改调 `/usr/libexec/opd2413/pstore-keep`，目录名 `NNNNNN-<boot id>`（计数器，不靠开机早期不可信的时钟），只留最新 20 份；脚本在主机上用 25 次模拟验证过。
+  技术债 #27、#30 解除。主机上常用的平板检查脚本存到 `private/scripts/`。
