@@ -1371,3 +1371,28 @@ D-Bus 有陀螺仪。hexagonrpcd 报一串找不到的 json（erhai 同样）。
   界面亮度不变是因为 KDE Plasma 6.8.2 的 powerdevil 没有环境光自动亮度功能（erhai 在 GNOME 上有）；用户表示暂不需要自动亮度。
 
 **结果：M3.4c 传感器真机通过（自动旋转、环境光读数、指南针、陀螺仪 D-Bus 可用；挂起深度不受影响）。** 接近传感器本机没有。
+
+### 2026-11-12 15:50 起：M3.4a 视频硬解（用户：提交，然后下一步）
+
+已提交 `f705302`。离线：缺的 `qcom/sm8750/erhai/vpu35_4v.mbn`（OnePlus 签名的 Iris 固件，原厂 `/vendor/firmware`）在 erhai 检出的 `packaging/firmware/` 里，SHA-256 与其清单一致（`4fbe0a97…`）；
+加进 `opd2413-firmware` 清单（固件本体不进仓库），构建 `opd2413-firmware-16.0.10.600-2`。本机 DTS 的 iris 节点已启用、固件路径就是这个。内核 iris 两边都做过解码顺序输出等改动（Armada `1030`–`1037`，erhai 另一套），先只加固件试。
+测试片源在主机 `out/video/`（ffmpeg 生成的 1080p30 H.264 High、HEVC、VP9 各 10 s）。
+
+**上机计划（待批准）**：装固件包 600-2（必要时重启让 iris 重新初始化）；看 iris 固件加载、`gst-inspect-1.0` 出现 v4l2 解码器；用 `gst-launch-1.0` 把三段片源解到 fakesink，记帧数、耗时、CPU；
+再请用户用播放器播放视频。之后视结果决定是否对齐 erhai 的 iris 改动。
+
+15:53 起，用户批准。装 `opd2413-firmware-16.0.10.600-2`（`rpm -V` 干净），不重启：`/dev/video0` = `qcom-iris-decoder`、`video1` = `qcom-iris-encoder`，
+GStreamer 注册了 `v4l2h264dec`、`v4l2h265dec`、`v4l2vp9dec`、`v4l2av1dec` 和 H.264/H.265 编码器。三段 1080p30 片源（各 300 帧）硬件解码都出满 300 帧，各约 0.35 s、CPU 约 0.06 s；
+解出的 H.264 首帧画面正确（`h264-frame.jpg`）；对照 openh264 软件解码 1.85 s、CPU 1.81 s。**Iris 硬解（GStreamer v4l2 路径）真机通过，现有内核即可。**
+但默认播放器 mpv（及基于 FFmpeg 的应用）用不上：Fedora 的 `ffmpeg-free` 没有 H.264/HEVC 的 v4l2m2m 封装、也没有原生 H.264/HEVC 解码器（只有 openh264），
+`--hwdec=v4l2m2m-copy/auto-safe` 都回落到软件（≈2 s/10 s 片源）。VP9 有 `vp9_v4l2m2m`。erhai 给 Firefox/GStreamer 用的是自己的 VA-API 驱动 `iris-vaapi`（phxinyang/qualcomm-iris-vaapi）。
+- 用户选择：装一个 GStreamer 播放器，其余（iris-vaapi、RPM Fusion ffmpeg）先不做。`playbin` 对三种片源都自动选 `v4l2h264dec`/`v4l2h265dec`/`v4l2vp9dec`。
+  从 Fedora 源装 `showtime`（GNOME 播放器，erhai 默认用的），用 `xdg-mime` 设为 colin 的 mp4/mkv/webm/mov/avi/mpeg/ogg/m4v 默认程序（之前没有 `mimeapps.list`）；
+  测试片源拷到 `~colin/Videos/opd2413-test/`。
+- 用户实测 Showtime：H.264、HEVC 直接流畅播放；**VP9 卡住**（mpv 软解流畅）。与 erhai 记录一致：V4L2 VP9 解码器在播放器开播时的刷新/重启之后不再出帧（gst-launch 直通到 fakesink 时没问题）。
+  修法（用户批准）：设备包 0.1-13 加 `/usr/lib/environment.d/60-opd2413-video.conf`，`GST_PLUGIN_FEATURE_RANK=${GST_PLUGIN_FEATURE_RANK:-v4l2vp9dec:0}`，
+  VP9 改由软件 `vp9dec`，H.264/HEVC 仍走 `v4l2h264dec`/`v4l2h265dec`。已装（`rpm -V` 干净）；环境生成器输出确认，`playbin` 选择核对过。需注销重新登录后生效，待用户复测。
+- 用户注销重新登录后复测：Showtime 播放 VP9 正常，H.264/HEVC 仍正常。
+
+**结果：M3.4a 视频硬解真机通过（GStreamer 路径：H.264、HEVC 硬解；VP9 走软解规避 V4L2 VP9 的停帧问题）。** 固件包 `opd2413-firmware-16.0.10.600-2`、设备包 0.1-13、Showtime 为默认视频播放器。
+mpv、Firefox 仍是软解（Fedora `ffmpeg-free` 的专利限制），用户选择暂不处理（iris-vaapi、RPM Fusion ffmpeg 留作以后）。

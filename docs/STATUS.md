@@ -5,11 +5,11 @@
 
 ## 唯一的下一步
 
-**下一步：M3.4a 视频硬解（Iris）。** 内核 iris 本树与 erhai 各改各的约 20 个文件要合；固件 `qcom/sm8750/erhai/vpu35_4v.mbn` 主机上没有，要从原厂分区或 OTA 提取物只读取得；
-用户态 GStreamer 的 v4l2 解码 Fedora 自带，Firefox 的 VA-API 需要 erhai 的 `iris-vaapi`。先离线评估，上机前问用户。
-并行：PPS 实测（电量降到 75 % 以下插快充，同时补插电冷启动）。
+**M3 只剩 PPS 快充实测（M3.2b）：电量降到 75 % 以下插快充，同时补插电冷启动（7.2.15-10 起改过 initramfs/内核后只做过热重启）。** 其余 M3 功能都已真机通过。
+之后的候选（待用户定）：DP 外接显示、USB 3、拔线待机耗电实测、7.3 基线（M6）、把可回馈的修复整理给 erhai/上游。
 测试新内核用 `tools/tablet-reboot.py --entry …`；装新内核前先 `boot-select default <当前条目>`。拔线调试时每次重启后都要重新起 `opd2413-debug-inhibit`。
 
+M3.4a 视频硬解 2026-11-12 真机通过：固件 `opd2413-firmware-16.0.10.600-2`（加 `vpu35_4v.mbn`），GStreamer 硬解 H.264/HEVC，Showtime 为默认播放器，VP9 软解（设备包 0.1-13）。
 M3.4c 传感器 2026-11-12 真机通过：`opd2413-sensors-0.1-1`（hexagonrpcd + libssc + SSC 版 iio-sensor-proxy，registry 已导入），自动旋转、环境光、指南针、陀螺仪可用。
 M3.5 麦克风、M3.6 键盘 2026-11-12 真机通过：默认内核 `7.2.15-10.opd2413`，设备包 0.1-11，音频包 0.1-12。
 M3.4b 摄像头 2026-11-12 真机通过：`7.2.15-5.opd2413`，前后摄预览、拍照、录像；无自动对焦、无调校。
@@ -59,7 +59,7 @@ M2 剩下的被动观察项：开机提示音毛刺再出现时当场取证；�
   ESP 空闲约 268 MiB；固定路径 `/dtbs/qcom/sm8750-oneplus-pad2pro.dtb` 是 7.2.15 的（与内核 3 相同）。
 - `boot_b` = `07bf1b53…`（fedora1：菜单 ColorOS / Fedora / Fedora boot menu，倒计时 10 s，默认项仍是 ColorOS）；KSHIM.CHO 记住 Fedora。
   上一版 `492f2cdf…` 的整分区回读在主机 `private/bootflow-20261111/boot_b-readonly.img`。
-- 软件包：`kernel-opd2413-7.2.15-10`、`7.2.15-9`，`opd2413-device-0.1-11`、`opd2413-audio-0.1-12`、`opd2413-sensors-0.1-1`（registry 在 `/var/lib/opd2413/sensors`）。`installonly_limit=2`：再装一个内核会卸掉 7.2.15-9。
+- 软件包：`kernel-opd2413-7.2.15-10`、`7.2.15-9`，`opd2413-device-0.1-13`、`opd2413-audio-0.1-12`、`opd2413-sensors-0.1-1`、`opd2413-firmware-16.0.10.600-2`、`showtime`（registry 在 `/var/lib/opd2413/sensors`）。`installonly_limit=2`：再装一个内核会卸掉 7.2.15-9。
   内核 3（`7.2.6-3`）08:45 经用户同意卸载，它的包仍在主机 `out/rpms/`。
 - 7.3 测试内核、"M3 test" 和 "Log capture" 两个条目、ESP 上的 `opd2413-bootlog/` 已于 11-11 23:29 删除（备份在 `/var/tmp/opd2413/m3k-install-*/`）。
 - `/etc/modprobe.d/opd2413-pps.conf` 已删除（11-12）。`/etc/kernel/tries` 已删除。
@@ -99,7 +99,9 @@ M2 剩下的被动观察项：开机提示音毛刺再出现时当场取证；�
 | `private/m3-sensors-20261112/` | 传感器安装、读数、挂起证据 |
 | `private/m3-mic-20261112/` | 麦克风排查全过程：录音统计、寄存器转储、实验 DTB、坏录音样本 |
 | `out/m3-rpm5/` | 诊断内核 `7.3.3-5.opd2413` 的构建脚本和日志（编译完成，19:50 在打包前中止，没有包） |
-| `out/rpmbuild/RPMS/noarch/opd2413-device-0.1-11.noarch.rpm` | 平板上现在装的设备包（0.1-9 起允许 s2idle，0.1-10 修 boot-select 的条目 id，0.1-11 加键盘 hwdb） |
+| `out/rpmbuild/RPMS/noarch/opd2413-device-0.1-13.noarch.rpm` | 平板上现在装的设备包（0.1-9 起允许 s2idle，0.1-10 修 boot-select 的条目 id，0.1-11 加键盘 hwdb，0.1-13 VP9 走软解） |
+| `out/rpmbuild/RPMS/noarch/opd2413-firmware-16.0.10.600-2.noarch.rpm` | 平板上的固件包（加 Iris 固件） |
+| `out/video/`、`private/m3-video-20261112/` | 视频测试片源、解码记录 |
 | `private/m3-sleep-20261112/` | M3.3 的 pm_test、s2idle、按键挂起证据 |
 | `private/ssh.sh`、`private/scp.sh` | 连平板的 SSH / scp 包装（`OPD_OS=fedora` 用 Fedora 的地址和主机密钥） |
 | `private/install.env` | 用户给的初始密码 |
@@ -158,7 +160,7 @@ Armada 下的结论见 [HARDWARE.md](HARDWARE.md)。换了发行版后都要重�
 | 电量、温控 | 真机通过 | 电量、电流（符号正确）、温度读数正常（M3.2a）；温控未单独验 |
 | 传感器、自动旋转 | 真机通过 | 2026-11-12，opd2413-sensors（M3.4c）：自动旋转、环境光、指南针、陀螺仪；KDE 无自动亮度 |
 | 摄像头 | 真机通过 | 2026-11-12，7.2.15-5 起（M3.4b）：前后摄预览/拍照/录像；无自动对焦、无调校 |
-| 视频硬解 | 真机失败 | 缺 `qcom/sm8750/erhai/vpu35_4v.mbn`（Armada 下同样失败）；固件在原厂 OTA 的 vendor 里，erhai 已收录 |
+| 视频硬解 | 真机通过 | 2026-11-12（M3.4a）：固件 600-2 后 GStreamer 硬解 H.264/HEVC，Showtime 为默认播放器；VP9 走软解；mpv/Firefox 仍软解（ffmpeg-free） |
 | DP 外接显示 | 有源码线索 | erhai |
 | USB 3 双向 | 待调研 | |
 | 合盖、电源键、音量键 | 真机通过 | 合盖/电源键挂起唤醒（M3.3）；音量键正常；键盘 Esc、麦克风键、锁屏键（M3.6）。拔线时关机不会自动开机 |

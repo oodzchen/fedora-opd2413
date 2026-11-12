@@ -76,3 +76,6 @@ bbdfeec01b7de20e89c7e6906d7ea3fd89b896862de29396696a93dbb59fc77a  ath12k/WCN7860
 c774af903051e7af845435352fdb2ec6158835c4c95fd9323be22658971ffc6f  ath12k/WCN7860/hw2.0/regdb.bin
 84e210e2ba386a9bad91a2d9dd5d1f4e2559b385f226b463dcfa4d8159f5937f  qca/gngbtfw20.mbn
 a4586f5205dc3752f7d52fd6b7106b02ffe877774e5633018ac48be99d5a079b  qca/gngbtnv20.bin
+# [stock] Iris (VPU 3.5) video core image, OnePlus-signed, /vendor/firmware/vpu35_4v.mbn of the same OTA;
+#         read from the onepluspad-2pro-mainline checkout (packaging/firmware), same SHA-256 as its manifest.
+4fbe0a9709449bbb714a20acad9503b5e4e8feff51e0b76988370d1e753f9c65  qcom/sm8750/erhai/vpu35_4v.mbn

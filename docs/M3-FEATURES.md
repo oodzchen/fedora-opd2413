@@ -135,7 +135,7 @@ M3.3b 实际结果：去掉三个 `*_ignore_unused` 后功能正常但 CX 仍不
 
 现行启动参数：没有 `*_ignore_unused`，有 `fw_devlink.sync_state=timeout`（技术债 #34：等相机 ISP/CSI PHY 驱动（M3.4）和 GMU 驱动绑定（erhai `6f237b23c` 等）合入后去掉）。
 
-## M3.4 传感器、摄像头、视频硬解（2026-11-12，摄像头真机通过）
+## M3.4 传感器、摄像头、视频硬解（2026-11-12 真机通过）
 
 erhai v0.7.2 的状态（`onepluspad-2pro-mainline` README）：视频硬解（Iris，H.264/H.265/VP9，GStreamer 和 Firefox VA-API）✅；前后摄（SC820CS/SC1300CS，libcamera）🟡 能预览拍照、
 画质未调；自动旋转、环境光、指南针、陀螺仪（SSC）✅，接近传感器本机没有。
@@ -150,6 +150,13 @@ erhai v0.7.2 的状态（`onepluspad-2pro-mainline` README）：视频硬解（I
 
 摄像头（M3.4b，`7.2.15-5`）真机通过：erhai 的 46 个相机提交 `2301`–`2346`，libcamera 0.7.2（Fedora）simple 管线 + 软件 ISP，Snapshot 前后摄预览、拍照、录像正常，约 32 fps。已知限制：没有自动对焦、没有传感器调校（偏色、四角暗、画质低）。相机 ISP/CSI PHY 有了驱动后，interconnect、rpmhpd、camcc 的 sync_state 自然完成，技术债 #34 只剩 GMU。
 录像无声音而是满幅噪音：麦克风采集本身坏了（见 WORKLOG 2026-11-12 M3.4b），另立"麦克风"一项。
+
+## M3.4a 视频硬解（2026-11-12 真机通过）
+
+只缺固件：`vpu35_4v.mbn`（OnePlus 签名，从 erhai 检出按哈希取得，进 `opd2413-firmware` 600-2 的清单）；现有内核的 iris 即可，没有合 erhai 的 iris 改动。
+GStreamer 的 `v4l2h264dec`/`v4l2h265dec`/`v4l2vp9dec`/`v4l2av1dec` 注册，1080p30 10 s 片源解码约 0.35 s、几乎不占 CPU；`playbin` 自动选硬件解码。
+Showtime（Fedora 源）设为默认视频播放器：H.264、HEVC 硬解流畅；V4L2 VP9 在播放器开播的刷新后停帧（erhai 同），设备包 0.1-13 用 `GST_PLUGIN_FEATURE_RANK=v4l2vp9dec:0` 让 VP9 走软解。
+限制：mpv、Firefox 用 Fedora `ffmpeg-free`，没有 H.264/HEVC 硬解接口，仍是软解；可选方案 erhai 的 `iris-vaapi`（VA-API）或 RPM Fusion ffmpeg，用户暂不需要。
 
 ## M3.4c 传感器（2026-11-12 真机通过）
 
