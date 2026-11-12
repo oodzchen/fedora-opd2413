@@ -135,7 +135,7 @@ M3.3b 实际结果：去掉三个 `*_ignore_unused` 后功能正常但 CX 仍不
 
 现行启动参数：没有 `*_ignore_unused`，有 `fw_devlink.sync_state=timeout`（技术债 #34：等相机 ISP/CSI PHY 驱动（M3.4）和 GMU 驱动绑定（erhai `6f237b23c` 等）合入后去掉）。
 
-## M3.4 传感器、摄像头、视频硬解（2026-11-12，离线评估）
+## M3.4 传感器、摄像头、视频硬解（2026-11-12，摄像头真机通过）
 
 erhai v0.7.2 的状态（`onepluspad-2pro-mainline` README）：视频硬解（Iris，H.264/H.265/VP9，GStreamer 和 Firefox VA-API）✅；前后摄（SC820CS/SC1300CS，libcamera）🟡 能预览拍照、
 画质未调；自动旋转、环境光、指南针、陀螺仪（SSC）✅，接近传感器本机没有。
@@ -146,7 +146,10 @@ erhai v0.7.2 的状态（`onepluspad-2pro-mainline` README）：视频硬解（I
 | 摄像头 | camss、CSI PHY 驱动、两个传感器驱动、对焦马达 `cn3927`，共约 +4900 行 | 无 | Fedora 有 libcamera 0.7.2（软件 ISP），可能要 erhai 的调校文件 | 合入后相机 ISP/CSI PHY 有了驱动，可以去掉 `fw_devlink.sync_state=timeout`（技术债 #34）；GMU 还要另外处理 |
 | 传感器 | 基本不用改（FastRPC 已在） | 每台机器的 sensor registry 在 Android 的 persist 分区，只读复制 | Fedora 没有 `hexagonrpcd`、`libssc`；`iio-sensor-proxy` 3.9 没编 SSC 支持 → 要自己打三个包 | registry 必须在 ADSP 传感器域建立前就位；改动全在用户态 |
 
-建议顺序：视频硬解（内核改动小、马上能用）→ 摄像头内核部分（顺带去掉临时启动参数）→ 传感器（纯用户态打包）。待用户确认。
+用户定的顺序：摄像头 → 传感器（视频硬解之后再说）。
+
+摄像头（M3.4b，`7.2.15-5`）真机通过：erhai 的 46 个相机提交 `2301`–`2346`，libcamera 0.7.2（Fedora）simple 管线 + 软件 ISP，Snapshot 前后摄预览、拍照、录像正常，约 32 fps。已知限制：没有自动对焦、没有传感器调校（偏色、四角暗、画质低）。相机 ISP/CSI PHY 有了驱动后，interconnect、rpmhpd、camcc 的 sync_state 自然完成，技术债 #34 只剩 GMU。
+录像无声音而是满幅噪音：麦克风采集本身坏了（见 WORKLOG 2026-11-12 M3.4b），另立"麦克风"一项。
 
 ## 回馈 erhai
 

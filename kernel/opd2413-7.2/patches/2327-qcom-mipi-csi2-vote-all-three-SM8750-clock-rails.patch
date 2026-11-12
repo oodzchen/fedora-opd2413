@@ -1,0 +1,72 @@
+From c4b5a48bdf13b1ce45ea38e9907a12080293ac19 Mon Sep 17 00:00:00 2001
+From: yzddmr6 <46088090+yzddmr6@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 04:55:51 +0800
+Subject: [PATCH] phy: qcom-mipi-csi2: vote all three SM8750 clock rails
+
+Add the SM8750 match and power-domain descriptor for Titan, MMCX, MX and MXC. Reuse the existing lane sequence, hardware operations, clocks and supplies. The common sequencing code already handles a variable number of scaled domains; a separate descriptor prevents the Kaanapali fallback from omitting MX.
+
+Link: https://raw.githubusercontent.com/OnePlusOSS/android_kernel_oneplus_sm8750/fe7332c9b344a4000a3fc92bb72dcac76c4d7bc5/drivers/clk/qcom/camcc-sun.c
+
+Assisted-by: LLM
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ .../qualcomm/phy-qcom-mipi-csi2-3ph-dphy.c    | 23 +++++++++++++++++++
+ .../phy/qualcomm/phy-qcom-mipi-csi2-core.c    |  1 +
+ drivers/phy/qualcomm/phy-qcom-mipi-csi2.h     |  1 +
+ 3 files changed, 25 insertions(+)
+
+diff --git a/drivers/phy/qualcomm/phy-qcom-mipi-csi2-3ph-dphy.c b/drivers/phy/qualcomm/phy-qcom-mipi-csi2-3ph-dphy.c
+index 658a39463..13ddce987 100644
+--- a/drivers/phy/qualcomm/phy-qcom-mipi-csi2-3ph-dphy.c
++++ b/drivers/phy/qualcomm/phy-qcom-mipi-csi2-3ph-dphy.c
+@@ -405,3 +405,26 @@ const struct mipi_csi2phy_soc_cfg mipi_csi2_dphy_3nm_kaanapali = {
+ 	.genpds = x1e_genpds,
+ 	.num_genpds = ARRAY_SIZE(x1e_genpds),
+ };
++
++static struct mipi_csi2_genpd sm8750_genpds[] = {
++	{ .name = "top", .scaled = false },
++	{ .name = "mmcx", .scaled = true },
++	{ .name = "mx", .scaled = true },
++	{ .name = "mxc", .scaled = true },
++};
++
++const struct mipi_csi2phy_soc_cfg mipi_csi2_dphy_3nm_sm8750 = {
++	.ops = &phy_qcom_mipi_csi2_ops_3ph_1_0,
++	.reg_info = {
++		.init_seq = lane_regs_x1e80100,
++		.lane_array_size = ARRAY_SIZE(lane_regs_x1e80100),
++		.common_regs_offset = 0x1000,
++		.common_status_offset = 0x138,
++	},
++	.supply_names = (const char **)x1e_supplies,
++	.num_supplies = ARRAY_SIZE(x1e_supplies),
++	.clk_names = (const char **)x1e_clks,
++	.num_clk = ARRAY_SIZE(x1e_clks),
++	.genpds = sm8750_genpds,
++	.num_genpds = ARRAY_SIZE(sm8750_genpds),
++};
+diff --git a/drivers/phy/qualcomm/phy-qcom-mipi-csi2-core.c b/drivers/phy/qualcomm/phy-qcom-mipi-csi2-core.c
+index aff9e66f0..e303a64b1 100644
+--- a/drivers/phy/qualcomm/phy-qcom-mipi-csi2-core.c
++++ b/drivers/phy/qualcomm/phy-qcom-mipi-csi2-core.c
+@@ -445,6 +445,7 @@ static int phy_qcom_mipi_csi2_probe(struct platform_device *pdev)
+ static const struct of_device_id phy_qcom_mipi_csi2_of_match_table[] = {
+ 	{ .compatible	= "qcom,x1e80100-csi2-phy", .data = &mipi_csi2_dphy_4nm_x1e },
+ 	{ .compatible	= "qcom,kaanapali-csi2-phy", .data = &mipi_csi2_dphy_3nm_kaanapali },
++	{ .compatible	= "qcom,sm8750-csi2-phy", .data = &mipi_csi2_dphy_3nm_sm8750 },
+ 	{ }
+ };
+ MODULE_DEVICE_TABLE(of, phy_qcom_mipi_csi2_of_match_table);
+diff --git a/drivers/phy/qualcomm/phy-qcom-mipi-csi2.h b/drivers/phy/qualcomm/phy-qcom-mipi-csi2.h
+index 2355a1db9..59f41e561 100644
+--- a/drivers/phy/qualcomm/phy-qcom-mipi-csi2.h
++++ b/drivers/phy/qualcomm/phy-qcom-mipi-csi2.h
+@@ -95,5 +95,6 @@ struct mipi_csi2phy_device {
+ 
+ extern const struct mipi_csi2phy_soc_cfg mipi_csi2_dphy_4nm_x1e;
+ extern const struct mipi_csi2phy_soc_cfg mipi_csi2_dphy_3nm_kaanapali;
++extern const struct mipi_csi2phy_soc_cfg mipi_csi2_dphy_3nm_sm8750;
+ 
+ #endif /* __PHY_QCOM_MIPI_CSI2_H__ */

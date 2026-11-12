@@ -1,0 +1,259 @@
+From 7386d7b4340f746adeeca5493836e1c9ac6e1413 Mon Sep 17 00:00:00 2001
+From: yzddmr6 <46088090+yzddmr6@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 19:50:51 +0800
+Subject: [PATCH] media: qcom: camss: report frame starts on SM8750
+
+libcamera applies sensor exposure and gain at the start of the frame they
+are meant for when the pipeline offers a V4L2 frame sync event. Without
+one it writes them whenever its algorithms produce them, at an arbitrary
+point in the frame, and loses track of which frame they apply to, so its
+exposure control reacts to frames exposed with other values than it
+assumes.
+
+Enable the start-of-frame interrupt of the RDI paths on the full CSID 980
+and queue V4L2_EVENT_FRAME_SYNC on the CSID subdevice. The event carries
+the sequence number the frame's buffer will be given: buffers are numbered
+as they complete, and the buffer done of the previous frame is handled
+first. Other CSID versions do not report frame starts and reject the
+subscription as before.
+
+Assisted-by: LLM
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ .../platform/qcom/camss/camss-csid-980.c      | 26 ++++++++++++++
+ .../media/platform/qcom/camss/camss-csid.c    | 35 ++++++++++++++++++-
+ .../media/platform/qcom/camss/camss-csid.h    |  4 +++
+ drivers/media/platform/qcom/camss/camss-vfe.c | 21 +++++++++++
+ drivers/media/platform/qcom/camss/camss-vfe.h |  1 +
+ drivers/media/platform/qcom/camss/camss.c     | 11 ++++++
+ drivers/media/platform/qcom/camss/camss.h     |  1 +
+ 7 files changed, 98 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/media/platform/qcom/camss/camss-csid-980.c b/drivers/media/platform/qcom/camss/camss-csid-980.c
+index 7298a9590..0fa020e5c 100644
+--- a/drivers/media/platform/qcom/camss/camss-csid-980.c
++++ b/drivers/media/platform/qcom/camss/camss-csid-980.c
+@@ -122,7 +122,11 @@
+ 	(csid_is_lite(csid) ? 0xEC : 0x114 + 0x10 * (rdi))
+ #define CSID_CSI2_RDIN_IRQ_CLEAR(rdi) \
+ 	(csid_is_lite(csid) ? 0xF4 : 0x11C + 0x10 * (rdi))
++#define		INFO_INPUT_SOF				BIT(12)
+ #define		INFO_RUP_DONE				BIT(23)
++/* Full CSID only: per-RDI interrupt mask and its summary bit in the top mask. */
++#define CSID_CSI2_RDIN_IRQ_MASK(rdi)		(0x118 + 0x10 * (rdi))
++#define		TOP_IRQ_RDI(rdi)			BIT(16 + (rdi))
+ 
+ static void __csid_full_aup_rup_trigger(struct csid_device *csid)
+ {
+@@ -304,6 +308,23 @@ static void __csid_configure_rdi_stream(struct csid_device *csid, u8 enable, u8
+ 	writel(val, csid->base + rdi_cfg0_offset);
+ }
+ 
++/* Interrupt at the start of every frame on an RDI to report frame starts. */
++static void __csid_frame_sync_irq(struct csid_device *csid, u8 enable, u8 rdi)
++{
++	u32 top;
++
++	if (!csid->res->frame_sync)
++		return;
++
++	top = readl(csid->base + CSID_TOP_IRQ_MASK);
++	if (enable)
++		top |= TOP_IRQ_RDI(rdi);
++	else
++		top &= ~TOP_IRQ_RDI(rdi);
++	writel(enable ? INFO_INPUT_SOF : 0, csid->base + CSID_CSI2_RDIN_IRQ_MASK(rdi));
++	writel(top, csid->base + CSID_TOP_IRQ_MASK);
++}
++
+ static void csid_configure_stream(struct csid_device *csid, u8 enable)
+ {
+ 	u8 i, k;
+@@ -312,6 +333,7 @@ static void csid_configure_stream(struct csid_device *csid, u8 enable)
+ 
+ 	for (i = 0; i < MSM_CSID_MAX_SRC_STREAMS_980; i++) {
+ 		if (csid->phy.en_vc & BIT(i)) {
++			__csid_frame_sync_irq(csid, enable, i);
+ 			__csid_configure_rdi_stream(csid, enable, i, 0);
+ 			__csid_configure_rx_vc(csid, 0);
+ 
+@@ -371,6 +393,10 @@ static irqreturn_t csid_isr(int irq, void *dev)
+ 
+ 			if (buf_done_val & BIT(BUF_DONE_IRQ_STATUS_RDI_OFFSET + i))
+ 				camss_buf_done(csid->camss, csid->id, i);
++
++			/* After buf done, so the event carries this frame's number. */
++			if (val & INFO_INPUT_SOF && csid->res->frame_sync)
++				csid_frame_start(csid, i);
+ 		}
+ 	}
+ 
+diff --git a/drivers/media/platform/qcom/camss/camss-csid.c b/drivers/media/platform/qcom/camss/camss-csid.c
+index 5725a944e..3f3cd0bba 100644
+--- a/drivers/media/platform/qcom/camss/camss-csid.c
++++ b/drivers/media/platform/qcom/camss/camss-csid.c
+@@ -1311,9 +1311,42 @@ static int csid_link_setup(struct media_entity *entity,
+ 	return 0;
+ }
+ 
++/*
++ * csid_frame_start - Report the start of a frame on a source stream
++ * @csid: CSID device
++ * @port_id: Source stream (RDI) index
++ *
++ * Called from the interrupt handler. The event carries the sequence number
++ * that the frame's buffer will be given, so that userspace can tell which
++ * frame a sensor control written at this point applies to.
++ */
++void csid_frame_start(struct csid_device *csid, int port_id)
++{
++	struct v4l2_event event = {
++		.type = V4L2_EVENT_FRAME_SYNC,
++		.u.frame_sync.frame_sequence =
++			camss_next_sequence(csid->camss, csid->id, port_id),
++	};
++
++	v4l2_event_queue(csid->subdev.devnode, &event);
++}
++
++static int csid_subscribe_event(struct v4l2_subdev *sd, struct v4l2_fh *fh,
++				struct v4l2_event_subscription *sub)
++{
++	struct csid_device *csid = v4l2_get_subdevdata(sd);
++
++	if (sub->type != V4L2_EVENT_FRAME_SYNC)
++		return v4l2_ctrl_subdev_subscribe_event(sd, fh, sub);
++	if (!csid->res->frame_sync)
++		return -EINVAL;
++
++	return v4l2_event_subscribe(fh, sub, 4, NULL);
++}
++
+ static const struct v4l2_subdev_core_ops csid_core_ops = {
+ 	.s_power = csid_set_power,
+-	.subscribe_event = v4l2_ctrl_subdev_subscribe_event,
++	.subscribe_event = csid_subscribe_event,
+ 	.unsubscribe_event = v4l2_event_subdev_unsubscribe,
+ };
+ 
+diff --git a/drivers/media/platform/qcom/camss/camss-csid.h b/drivers/media/platform/qcom/camss/camss-csid.h
+index 8edf3548d..7aa3992cb 100644
+--- a/drivers/media/platform/qcom/camss/camss-csid.h
++++ b/drivers/media/platform/qcom/camss/camss-csid.h
+@@ -141,6 +141,8 @@ struct csid_hw_ops {
+ 
+ struct csid_subdev_resources {
+ 	bool is_lite;
++	/* The interrupt handler reports the start of each frame. */
++	bool frame_sync;
+ 	const struct csid_hw_ops *hw_ops;
+ 	const struct parent_dev_ops *parent_dev_ops;
+ 	const struct csid_formats *formats;
+@@ -202,6 +204,8 @@ const struct csid_format_info *csid_get_fmt_entry(const struct csid_format_info
+ 						  unsigned int nformats,
+ 						  u32 code);
+ 
++void csid_frame_start(struct csid_device *csid, int port_id);
++
+ int msm_csid_subdev_init(struct camss *camss, struct csid_device *csid,
+ 			 const struct camss_subdev_resources *res, u8 id);
+ 
+diff --git a/drivers/media/platform/qcom/camss/camss-vfe.c b/drivers/media/platform/qcom/camss/camss-vfe.c
+index ffa61ce02..aba96647f 100644
+--- a/drivers/media/platform/qcom/camss/camss-vfe.c
++++ b/drivers/media/platform/qcom/camss/camss-vfe.c
+@@ -444,6 +444,27 @@ u32 vfe_hw_version(struct vfe_device *vfe)
+ 	return hw_version;
+ }
+ 
++/*
++ * vfe_next_sequence - Sequence number of the next buffer on a write master
++ * @vfe: VFE Device
++ * @wm: Write master id
++ *
++ * Buffers are numbered as they complete, so this is the number the frame
++ * that is starting will carry.
++ */
++u32 vfe_next_sequence(struct vfe_device *vfe, int wm)
++{
++	unsigned long flags;
++	u32 sequence = 0;
++
++	spin_lock_irqsave(&vfe->output_lock, flags);
++	if (vfe->wm_output_map[wm] != VFE_LINE_NONE)
++		sequence = vfe->line[vfe->wm_output_map[wm]].output.sequence;
++	spin_unlock_irqrestore(&vfe->output_lock, flags);
++
++	return sequence;
++}
++
+ /*
+  * vfe_buf_done - Process write master done interrupt
+  * @vfe: VFE Device
+diff --git a/drivers/media/platform/qcom/camss/camss-vfe.h b/drivers/media/platform/qcom/camss/camss-vfe.h
+index c402ef170..981575685 100644
+--- a/drivers/media/platform/qcom/camss/camss-vfe.h
++++ b/drivers/media/platform/qcom/camss/camss-vfe.h
+@@ -286,6 +286,7 @@ int vfe_enable_v2(struct vfe_line *line);
+  * @wm: Write master id
+  */
+ void vfe_buf_done(struct vfe_device *vfe, int wm);
++u32 vfe_next_sequence(struct vfe_device *vfe, int wm);
+ 
+ /*
+  * vfe_get_output_v2 - Get vfe output line
+diff --git a/drivers/media/platform/qcom/camss/camss.c b/drivers/media/platform/qcom/camss/camss.c
+index 719cc7def..ff0a037bc 100644
+--- a/drivers/media/platform/qcom/camss/camss.c
++++ b/drivers/media/platform/qcom/camss/camss.c
+@@ -4486,6 +4486,7 @@ static const struct camss_subdev_resources csid_res_sm8750[] = {
+ 		.interrupt = { "csid0" },
+ 		.csid = {
+ 			.is_lite = false,
++			.frame_sync = true,
+ 			.parent_dev_ops = &vfe_parent_dev_ops,
+ 			.hw_ops = &csid_ops_980,
+ 			.formats = &csid_formats_gen2
+@@ -4500,6 +4501,7 @@ static const struct camss_subdev_resources csid_res_sm8750[] = {
+ 		.interrupt = { "csid1" },
+ 		.csid = {
+ 			.is_lite = false,
++			.frame_sync = true,
+ 			.parent_dev_ops = &vfe_parent_dev_ops,
+ 			.hw_ops = &csid_ops_980,
+ 			.formats = &csid_formats_gen2
+@@ -4514,6 +4516,7 @@ static const struct camss_subdev_resources csid_res_sm8750[] = {
+ 		.interrupt = { "csid2" },
+ 		.csid = {
+ 			.is_lite = false,
++			.frame_sync = true,
+ 			.parent_dev_ops = &vfe_parent_dev_ops,
+ 			.hw_ops = &csid_ops_980,
+ 			.formats = &csid_formats_gen2
+@@ -5502,6 +5505,14 @@ void camss_buf_done(struct camss *camss, int hw_id, int port_id)
+ 	}
+ }
+ 
++u32 camss_next_sequence(struct camss *camss, int hw_id, int port_id)
++{
++	if (hw_id >= camss->res->vfe_num)
++		return 0;
++
++	return vfe_next_sequence(&camss->vfe[hw_id], port_id);
++}
++
+ /*
+  * camss_register_entities - Register subdev nodes and create links
+  * @camss: CAMSS device
+diff --git a/drivers/media/platform/qcom/camss/camss.h b/drivers/media/platform/qcom/camss/camss.h
+index 516153e1c..58ac221e3 100644
+--- a/drivers/media/platform/qcom/camss/camss.h
++++ b/drivers/media/platform/qcom/camss/camss.h
+@@ -181,6 +181,7 @@ int camss_vfe_get(struct camss *camss, int id);
+ void camss_vfe_put(struct camss *camss, int id);
+ void camss_delete(struct camss *camss);
+ void camss_buf_done(struct camss *camss, int hw_id, int port_id);
++u32 camss_next_sequence(struct camss *camss, int hw_id, int port_id);
+ void camss_reg_update(struct camss *camss, int hw_id,
+ 		      int port_id, bool is_clear);
+ 

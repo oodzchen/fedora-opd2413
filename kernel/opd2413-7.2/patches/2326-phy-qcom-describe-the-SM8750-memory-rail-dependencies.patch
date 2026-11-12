@@ -1,0 +1,139 @@
+From d21df4c8ff3654f8199e9b935a07ee2d1d99d31d Mon Sep 17 00:00:00 2001
+From: yzddmr6 <46088090+yzddmr6@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 04:55:51 +0800
+Subject: [PATCH] dt-bindings: phy: qcom: describe the SM8750 memory rail
+ dependencies
+
+The SM8750 camera PHY core clock votes MMCX, MX and MXC, in addition to the Titan GDSC. The stock device tree identifies three independent ARC resources and the vendor CAMCC frequency table applies its corner to all three.
+
+Describe a distinct four-domain SM8750 PHY, retain the three-domain layout for existing SoCs, and update the CAMSS example. The Kaanapali fallback cannot describe the additional rail. Use the documented 266666667 Hz low-SVS-D1 point in the example instead of the old 300 MHz value.
+
+Link: https://raw.githubusercontent.com/OnePlusOSS/android_kernel_oneplus_sm8750/fe7332c9b344a4000a3fc92bb72dcac76c4d7bc5/drivers/clk/qcom/camcc-sun.c
+
+Assisted-by: LLM
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ .../bindings/media/qcom,sm8750-camss.yaml     | 16 +++++----
+ .../bindings/phy/qcom,x1e80100-csi2-phy.yaml  | 35 ++++++++++++++-----
+ 2 files changed, 36 insertions(+), 15 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/media/qcom,sm8750-camss.yaml b/Documentation/devicetree/bindings/media/qcom,sm8750-camss.yaml
+index 1ee0e6878..9bee1c25c 100644
+--- a/Documentation/devicetree/bindings/media/qcom,sm8750-camss.yaml
++++ b/Documentation/devicetree/bindings/media/qcom,sm8750-camss.yaml
+@@ -315,8 +315,7 @@ examples:
+         };
+ 
+         csiphy0: phy@ada9000 {
+-            compatible = "qcom,sm8750-csi2-phy",
+-                         "qcom,kaanapali-csi2-phy";
++            compatible = "qcom,sm8750-csi2-phy";
+             reg = <0x0 0x0ada9000 0x0 0x2000>;
+ 
+             clocks = <&camcc CAM_CC_CSIPHY0_CLK>,
+@@ -328,14 +327,16 @@ examples:
+ 
+             interrupts = <GIC_SPI 477 IRQ_TYPE_EDGE_RISING>;
+ 
+-            operating-points-v2 = <&csiphy_mxc_opp_table>;
++            operating-points-v2 = <&csiphy_opp_table>;
+ 
+             power-domains = <&camcc CAM_CC_TITAN_TOP_GDSC>,
+                             <&rpmhpd RPMHPD_MMCX>,
++                            <&rpmhpd RPMHPD_MX>,
+                             <&rpmhpd RPMHPD_MXC>;
+             power-domain-names = "top",
+                                  "mmcx",
+-                                 "mx";
++                                 "mx",
++                                 "mxc";
+ 
+             vdda-0p9-supply = <&vreg_0p9_supply>;
+             vdda-1p2-supply = <&vreg_1p2_supply>;
+@@ -362,12 +363,13 @@ examples:
+                 };
+             };
+ 
+-            csiphy_mxc_opp_table: opp-table {
++            csiphy_opp_table: opp-table {
+                 compatible = "operating-points-v2";
+ 
+-                opp-300000000 {
+-                    opp-hz = /bits/ 64 <300000000>;
++                opp-266666667 {
++                    opp-hz = /bits/ 64 <266666667>;
+                     required-opps = <&rpmhpd_opp_low_svs_d1>,
++                                    <&rpmhpd_opp_low_svs_d1>,
+                                     <&rpmhpd_opp_low_svs_d1>;
+                 };
+             };
+diff --git a/Documentation/devicetree/bindings/phy/qcom,x1e80100-csi2-phy.yaml b/Documentation/devicetree/bindings/phy/qcom,x1e80100-csi2-phy.yaml
+index ecf46e00d..9cc756362 100644
+--- a/Documentation/devicetree/bindings/phy/qcom,x1e80100-csi2-phy.yaml
++++ b/Documentation/devicetree/bindings/phy/qcom,x1e80100-csi2-phy.yaml
+@@ -16,13 +16,10 @@ description:
+ 
+ properties:
+   compatible:
+-    oneOf:
+-      - enum:
+-          - qcom,kaanapali-csi2-phy
+-          - qcom,x1e80100-csi2-phy
+-      - items:
+-          - const: qcom,sm8750-csi2-phy
+-          - const: qcom,kaanapali-csi2-phy
++    enum:
++      - qcom,kaanapali-csi2-phy
++      - qcom,sm8750-csi2-phy
++      - qcom,x1e80100-csi2-phy
+ 
+   reg:
+     maxItems: 1
+@@ -45,16 +42,20 @@ properties:
+     type: object
+ 
+   power-domains:
++    minItems: 3
+     items:
+       - description: Titan Top GDSC - Titan ISP Block, Global Distributed Switch Controller.
+       - description: MMCX voltage rail
+-      - description: MXC or MXA voltage rail
++      - description: MX voltage rail on SM8750, MXC or MXA on other SoCs
++      - description: MXC voltage rail on SM8750
+ 
+   power-domain-names:
++    minItems: 3
+     items:
+       - const: top
+       - const: mmcx
+       - const: mx
++      - const: mxc
+ 
+   vdda-0p9-supply:
+     description: Phandle to a 0.9V regulator supply to a PHY.
+@@ -134,6 +135,24 @@ properties:
+       - port@0
+       - port@1
+ 
++allOf:
++  - if:
++      properties:
++        compatible:
++          const: qcom,sm8750-csi2-phy
++    then:
++      properties:
++        power-domains:
++          minItems: 4
++        power-domain-names:
++          minItems: 4
++    else:
++      properties:
++        power-domains:
++          maxItems: 3
++        power-domain-names:
++          maxItems: 3
++
+ required:
+   - compatible
+   - reg

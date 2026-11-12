@@ -50,3 +50,4 @@
 | `7.2.15-2` | M3.1 蓝牙：`2001`（erhai `5fbc7cbd1`，hci_qca 断电时复位 IBS 状态）+ `m3-1-bluetooth.config`（RFCOMM TTY、BNEP） |
 | `7.2.15-3` | M3.2a 电池与充电：`2101`（erhai v0.7.2 的 battmgr 整文件：电流符号、去掉 POWER_NOW、充电阈值改用属性 24、USB 外设供电、固定 9 V PD、充电通知不唤醒）。PPS 驱动（`CHARGER_ERHAI_PPS`、`CHARGER_SC8547A`）不编译 |
 | `7.2.15-4` | M3.2b PPS：`2102`（wcd939x-usbss 的 D+/D- 切换）、`2103`（SC8547A 电荷泵和 erhai PPS 引擎）+ `m3-2b-pps.config` |
+| `7.2.15-5` | M3.4b 摄像头：`2301`–`2346`（erhai 的相机系列 46 个提交）+ `m3-4b-camera.config` |

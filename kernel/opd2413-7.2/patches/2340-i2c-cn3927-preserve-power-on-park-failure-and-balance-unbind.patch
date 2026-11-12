@@ -1,0 +1,66 @@
+From 789c8df4a49e51cc004494eb45224047356a312f Mon Sep 17 00:00:00 2001
+From: yading <187273358+BUSHIGEMENNI@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 10:26:48 +0800
+Subject: [PATCH] media: i2c: cn3927: preserve power on park failure and
+ balance unbind
+
+A failed park must not leave runtime PM active after cutting power.
+Return -EBUSY before disabling supplies so runtime PM does not latch a
+permanent error. On removal there is no future close to retry the park,
+so explicitly release the supplies even when the last park fails.
+
+Adapted from BUSHIGEMENNI/linux-sm8750-erhai commits
+3e05cd567e63c589a43a79f40819bb2baba8403d,
+7dc097445115e06e017d18dc785f3787c844e557 and
+9a27923965737a3cf5edc5009f4412a499a4f6e6.
+
+Link: https://github.com/yzddmr6/onepluspad-2pro-mainline/issues/12
+Assisted-by: LLM
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ drivers/media/i2c/cn3927.c | 14 +++++++++-----
+ 1 file changed, 9 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/media/i2c/cn3927.c b/drivers/media/i2c/cn3927.c
+index 2d9b09633..e61113453 100644
+--- a/drivers/media/i2c/cn3927.c
++++ b/drivers/media/i2c/cn3927.c
+@@ -147,7 +147,7 @@ static int cn3927_runtime_suspend(struct device *dev)
+ 	struct cn3927_device *cn3927 = to_cn3927(subdev);
+ 	int focus;
+ 	int err;
+-	int ret = 0;
++	int ret;
+ 
+ 	focus = cn3927->focus & ~(CN3927_PARK_STEP - 1);
+ 	if (focus < CN3927_PARK_POSITION)
+@@ -158,12 +158,12 @@ static int cn3927_runtime_suspend(struct device *dev)
+ 
+ 		if (err) {
+ 			dev_warn(dev, "failed to park lens: %d\n", err);
+-			break;
++			return -EBUSY;
+ 		}
+ 		usleep_range(CN3927_MOVE_DELAY_US, CN3927_MOVE_DELAY_US + 100);
+ 	}
+ 
+-	/* Once powered off, runtime PM must also consider the device off. */
++	/* A failed park leaves the device active and its supplies enabled. */
+ 	ret = regulator_bulk_disable(ARRAY_SIZE(cn3927->supplies), cn3927->supplies);
+ 	return ret;
+ }
+@@ -283,8 +283,12 @@ static void cn3927_remove(struct i2c_client *client)
+ 
+ 	v4l2_async_unregister_subdev(subdev);
+ 	pm_runtime_disable(&client->dev);
+-	if (!pm_runtime_status_suspended(&client->dev))
+-		cn3927_runtime_suspend(&client->dev);
++	if (!pm_runtime_status_suspended(&client->dev)) {
++		/* Unbind cannot defer parking: balance the remaining rail votes. */
++		if (cn3927_runtime_suspend(&client->dev))
++			regulator_bulk_disable(ARRAY_SIZE(cn3927->supplies),
++					       cn3927->supplies);
++	}
+ 	pm_runtime_set_suspended(&client->dev);
+ 	cn3927_cleanup(cn3927);
+ }

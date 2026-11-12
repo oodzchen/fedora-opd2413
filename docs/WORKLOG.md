@@ -1248,3 +1248,31 @@ hibernation 三项仍禁止）。用 systemd 的 `MemorySleepMode=` 而不是启
 - 现在电量 97 %，拔线放电中。PPS 实测等电量低于 75 % 后插快充。
 
 10:55 起：等放电期间做 M3.4 离线评估（只读），写进 [M3-FEATURES.md](M3-FEATURES.md)"M3.4"。建议顺序：视频硬解 → 摄像头内核 → 传感器用户态，待用户确认。
+
+### 2026-11-12 11:00 起：M3.4b 摄像头（用户：先不管键盘唤醒；不插电调试，做摄像头和传感器）
+
+离线：erhai v0.7.2 里相机相关的 46 个提交（CAMSS SM8750、CSI2 PHY 驱动和 phy core、两个 SmartSens 传感器、CN3927 对焦马达、pmdomain 性能态）去掉 DTS/defconfig 部分后，
+在本树上按 erhai 顺序全部严格应用，33 个代码文件与 erhai 逐字节相同；本机 `sm8750.dtsi` 的 CAMSS/CCI/CSIPHY 节点和板级 DTS 的相机节点（`&camss`、`&cci0`、`&i2c9`、两个传感器、对焦马达）
+都已与 erhai 相同（Armada 移植过），所以 DTB 不变。补丁 `2301`–`2346`，配置片段 `m3-4b-camera.config`。
+11:46 构建 `7.2.15-5.opd2413`（`a03b03db…`）：配置差异只有片段里的项；DTB 相同；模块多 `phy-qcom-mipi-csi2`、`sc1300cs`、`sc820cs`、`cn3927`，DMA-BUF 两个堆改为内建；
+`tests/package-install-test.sh` 通过（`out/m3k/pkg-test5/`）。
+此时平板 SSH 超时：拔线时 KDE 按电池策略空闲挂起了。
+
+11:50 起，用户批准全部 4 步（含调试期间的 `systemd-inhibit --what=idle` 抑制锁，作为临时单元 `opd2413-debug-inhibit` 运行，重启即失效）。
+
+- ② 先 `boot-select default fedora-7.2.15-4.opd2413`（`bootctl` 确认），装 7.2.15-5（卸掉 7.2.15-3，回退 7.2.15-4），一次性启动 38 s 回来。
+- ③ 自动验收同前全部通过（`running`、失败 0、Enforcing、AVC 0、GPU/Wi-Fi/蓝牙/声卡）。相机：`qcom_camss`、`phy_qcom_mipi_csi2`、`sc1300cs`、`sc820cs`、`cn3927`、`i2c_qcom_cci` 都加载，
+  `/dev/media0` 和 30 个子设备。新日志一条 `qcom-camss ad27000.isp: csiphy 4 init fail`（随后探测成功，像是一次推迟探测）和三条 TPG 实体类型未初始化的提示。
+  **sync_state：interconnect、rpmhpd、camcc 不再超时，自然完成**；只剩 gcc、gpucc、gxclkctl 因 GMU 仍要靠 `fw_devlink.sync_state=timeout`（技术债 #34 缩小为 GMU 一项）。
+- ④ `dnf install libcamera-tools`（Fedora 源；libcamera、libcamera-ipa、pipewire-plugin-libcamera 已装）：`cam -l` 列出前摄 `camera@10`、后摄 `camera@36`，simple 管线 + 软件 ISP；
+  libcamera 0.7.2 没有 sc1300cs/sc820cs 的传感器辅助和调校文件（用 `uncalibrated.yaml`）。两路 1280×960 XRGB8888 各采 20 帧，约 31.8 fps；
+  前摄末帧平均亮度接近 0、后摄平均约 40 但几乎没有起伏（平板可能平放、镜头被挡，或 20 帧内曝光还没收敛），要看实际画面。装了 `snapshot`（GNOME 相机，Fedora 源）给用户看预览。
+- 用户实测 Snapshot：前后摄都有画面、方向正确，能拍照、录像；后摄不能对焦，整体画质低；**录像的声音全是刺耳噪音**。
+  对焦和画质：libcamera 0.7.2 的 simple 管线没有自动对焦算法，也没有这两颗传感器的调校（`uncalibrated.yaml`），erhai 文档同样写着"焦点固定在远处、偏色、四角偏暗"，属已知限制。
+  噪音：与相机无关，是麦克风采集坏了。`pw-record` 4 s：两声道 rms 约 31000、峰值满幅、每秒过零约 2.8–3.4 万次，即满幅的乱码数据而不是声音。
+  麦克风在本项目一直是"待调研"（STATUS 功能表），从没验收过。板级 DTS 的 TX SoundWire 端口布局（erhai `095062299`）本机已有；erhai 另有本树缺的
+  `lpass-tx/va-macro` 运行时 PM 时钟（`9ead6de36`、`385a9a869`）、`q6apm` 从 PCM trigger 启动采集图（`e85a25943`）、`wcd939x` 运行时 PM 链接（`e4f82a321`）等，另立一项处理。
+- 12:05 `boot-select default 'fedora-*'`（`bootctl` 确认 7.2.15-5），热重启 43 s 回来：`running`、失败 0、Enforcing、AVC 0，两个摄像头都在，强制 sync_state 只剩 3 个（GMU 相关）。
+  拔着电没做关机冷启动，等插电时补。
+
+**结果：M3.4b 摄像头真机通过（前后摄预览、拍照、录像；画质和对焦是已知限制）。** 默认内核 `7.2.15-5.opd2413`，回退 `7.2.15-4`。

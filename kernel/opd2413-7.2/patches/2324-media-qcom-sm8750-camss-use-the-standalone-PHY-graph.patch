@@ -1,0 +1,264 @@
+From 44fb2c68a0d515775b99ae65c43672f9a3c84f1e Mon Sep 17 00:00:00 2001
+From: yzddmr6 <46088090+yzddmr6@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 04:27:05 +0800
+Subject: [PATCH] dt-bindings: media: qcom,sm8750-camss: use the standalone PHY
+ graph
+
+The current CSI2 PHY provider and CAMSS consumer locate each other through media endpoints. The earlier SM8750 proposal still requires phys and phy-names and embeds providers below CAMSS, although the consumer no longer populates child devices.
+
+Describe sibling PHY providers and graph endpoints, require CAMSS ports, and use one-based data lanes. Remove the obsolete PHY cells and hardware clock-lane index from the example. The updated example validates with the accepted PHY binding; zero-based CAMSS lanes and legacy phys are rejected.
+
+Link: https://lore.kernel.org/r/20260918-b4-linux-next-25-03-13-dtsi-x1e80100-camss-v20-5-dc244e124e71@linaro.org
+
+Assisted-by: LLM
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ .../bindings/media/qcom,sm8750-camss.yaml     | 150 ++++++------------
+ 1 file changed, 49 insertions(+), 101 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/media/qcom,sm8750-camss.yaml b/Documentation/devicetree/bindings/media/qcom,sm8750-camss.yaml
+index fca288d2b..1ee0e6878 100644
+--- a/Documentation/devicetree/bindings/media/qcom,sm8750-camss.yaml
++++ b/Documentation/devicetree/bindings/media/qcom,sm8750-camss.yaml
+@@ -16,14 +16,6 @@ properties:
+   compatible:
+     const: qcom,sm8750-camss
+ 
+-  "#address-cells":
+-    const: 2
+-
+-  "#size-cells":
+-    const: 2
+-
+-  ranges: true
+-
+   reg:
+     maxItems: 13
+ 
+@@ -88,19 +80,6 @@ properties:
+       - const: vfe_lite0
+       - const: vfe_lite1
+ 
+-  phys:
+-    maxItems: 6
+-    description: CSIPHY 0-5 PHYs used by the CSID controllers.
+-
+-  phy-names:
+-    items:
+-      - const: csiphy0
+-      - const: csiphy1
+-      - const: csiphy2
+-      - const: csiphy3
+-      - const: csiphy4
+-      - const: csiphy5
+-
+   interconnects:
+     maxItems: 4
+ 
+@@ -136,8 +115,8 @@ properties:
+     $ref: /schemas/graph.yaml#/properties/ports
+ 
+     description:
+-      CSI input ports, one per CSID. Each port receives the CSI data
+-      decoded by the matching CSIPHY.
++      CSI input ports, one per CSIPHY. Each port connects to the output
++      endpoint of a standalone CSI2 PHY provider.
+ 
+     patternProperties:
+       "^port@[0-5]$":
+@@ -155,6 +134,9 @@ properties:
+               data-lanes:
+                 minItems: 1
+                 maxItems: 4
++                items:
++                  minimum: 1
++                  maximum: 4
+ 
+               bus-type:
+                 enum:
+@@ -164,16 +146,6 @@ properties:
+             required:
+               - data-lanes
+ 
+-patternProperties:
+-  "^phy@[0-9a-f]+$":
+-    $ref: /schemas/phy/qcom,x1e80100-csi2-phy.yaml#
+-    unevaluatedProperties: false
+-    description:
+-      CSIPHY blocks decoding the incoming MIPI CSI2 sensor streams.
+-
+-  "^opp-table(-.*)?$":
+-    type: object
+-
+ required:
+   - compatible
+   - reg
+@@ -187,8 +159,7 @@ required:
+   - iommus
+   - power-domains
+   - power-domain-names
+-  - phys
+-  - phy-names
++  - ports
+ 
+ additionalProperties: false
+ 
+@@ -199,7 +170,6 @@ examples:
+     #include <dt-bindings/interconnect/qcom,icc.h>
+     #include <dt-bindings/interconnect/qcom,sm8750-rpmh.h>
+     #include <dt-bindings/interrupt-controller/arm-gic.h>
+-    #include <dt-bindings/phy/phy.h>
+     #include <dt-bindings/power/qcom,rpmhpd.h>
+ 
+     soc {
+@@ -209,10 +179,6 @@ examples:
+         isp@ad27000 {
+             compatible = "qcom,sm8750-camss";
+ 
+-            #address-cells = <2>;
+-            #size-cells = <2>;
+-            ranges;
+-
+             reg = <0x0 0x0ad27000 0x0 0x2b00>,
+                   <0x0 0x0ad2a000 0x0 0x2b00>,
+                   <0x0 0x0ad2d000 0x0 0x2b00>,
+@@ -332,95 +298,77 @@ examples:
+                                  "ife2",
+                                  "top";
+ 
+-            phys = <&csiphy0 PHY_TYPE_DPHY>,
+-                   <&csiphy1 PHY_TYPE_DPHY>,
+-                   <&csiphy2 PHY_TYPE_DPHY>,
+-                   <&csiphy3 PHY_TYPE_DPHY>,
+-                   <&csiphy4 PHY_TYPE_DPHY>,
+-                   <&csiphy5 PHY_TYPE_DPHY>;
+-            phy-names = "csiphy0",
+-                        "csiphy1",
+-                        "csiphy2",
+-                        "csiphy3",
+-                        "csiphy4",
+-                        "csiphy5";
+-
+             ports {
+                 #address-cells = <1>;
+                 #size-cells = <0>;
+ 
+                 port@0 {
+                     reg = <0>;
+-                    #address-cells = <1>;
+-                    #size-cells = <0>;
+ 
+-                    camss_csiphy0_inep0: endpoint@0 {
+-                        reg = <0>;
+-                        data-lanes = <0 1 2 3>;
++                    camss_csiphy0_inep0: endpoint {
++                        data-lanes = <1 2 3 4>;
+                         remote-endpoint = <&csiphy0_out>;
+                     };
+                 };
+             };
+ 
+-            csiphy0: phy@ada9000 {
+-                compatible = "qcom,sm8750-csi2-phy",
+-                             "qcom,kaanapali-csi2-phy";
+-                reg = <0x0 0x0ada9000 0x0 0x2000>;
++        };
+ 
+-                clocks = <&camcc CAM_CC_CSIPHY0_CLK>,
+-                         <&camcc CAM_CC_CSI0PHYTIMER_CLK>,
+-                         <&camcc CAM_CC_CORE_AHB_CLK>;
+-                clock-names = "core",
+-                              "timer",
+-                              "ahb";
++        csiphy0: phy@ada9000 {
++            compatible = "qcom,sm8750-csi2-phy",
++                         "qcom,kaanapali-csi2-phy";
++            reg = <0x0 0x0ada9000 0x0 0x2000>;
+ 
+-                interrupts = <GIC_SPI 477 IRQ_TYPE_EDGE_RISING>;
++            clocks = <&camcc CAM_CC_CSIPHY0_CLK>,
++                     <&camcc CAM_CC_CSI0PHYTIMER_CLK>,
++                     <&camcc CAM_CC_CORE_AHB_CLK>;
++            clock-names = "core",
++                          "timer",
++                          "ahb";
+ 
+-                operating-points-v2 = <&csiphy_mxc_opp_table>;
++            interrupts = <GIC_SPI 477 IRQ_TYPE_EDGE_RISING>;
+ 
+-                power-domains = <&camcc CAM_CC_TITAN_TOP_GDSC>,
+-                                <&rpmhpd RPMHPD_MMCX>,
+-                                <&rpmhpd RPMHPD_MXC>;
+-                power-domain-names = "top",
+-                                     "mmcx",
+-                                     "mx";
++            operating-points-v2 = <&csiphy_mxc_opp_table>;
+ 
+-                vdda-0p9-supply = <&vreg_0p9_supply>;
+-                vdda-1p2-supply = <&vreg_1p2_supply>;
++            power-domains = <&camcc CAM_CC_TITAN_TOP_GDSC>,
++                            <&rpmhpd RPMHPD_MMCX>,
++                            <&rpmhpd RPMHPD_MXC>;
++            power-domain-names = "top",
++                                 "mmcx",
++                                 "mx";
+ 
+-                #phy-cells = <1>;
++            vdda-0p9-supply = <&vreg_0p9_supply>;
++            vdda-1p2-supply = <&vreg_1p2_supply>;
+ 
+-                ports {
+-                    #address-cells = <1>;
+-                    #size-cells = <0>;
++            ports {
++                #address-cells = <1>;
++                #size-cells = <0>;
+ 
+-                    port@0 {
+-                        reg = <0>;
++                port@0 {
++                    reg = <0>;
+ 
+-                        csiphy0_in: endpoint {
+-                            data-lanes = <0 1 2 3>;
+-                            clock-lanes = <7>;
+-                            remote-endpoint = <&sensor_out>;
+-                        };
++                    csiphy0_in: endpoint {
++                        data-lanes = <1 2 3 4>;
++                        remote-endpoint = <&sensor_out>;
+                     };
++                };
+ 
+-                    port@1 {
+-                        reg = <1>;
++                port@1 {
++                    reg = <1>;
+ 
+-                        csiphy0_out: endpoint {
+-                            remote-endpoint = <&camss_csiphy0_inep0>;
+-                        };
++                    csiphy0_out: endpoint {
++                        remote-endpoint = <&camss_csiphy0_inep0>;
+                     };
+                 };
++            };
+ 
+-                csiphy_mxc_opp_table: opp-table {
+-                    compatible = "operating-points-v2";
++            csiphy_mxc_opp_table: opp-table {
++                compatible = "operating-points-v2";
+ 
+-                    opp-300000000 {
+-                        opp-hz = /bits/ 64 <300000000>;
+-                        required-opps = <&rpmhpd_opp_low_svs_d1>,
+-                                        <&rpmhpd_opp_low_svs_d1>;
+-                    };
++                opp-300000000 {
++                    opp-hz = /bits/ 64 <300000000>;
++                    required-opps = <&rpmhpd_opp_low_svs_d1>,
++                                    <&rpmhpd_opp_low_svs_d1>;
+                 };
+             };
+         };

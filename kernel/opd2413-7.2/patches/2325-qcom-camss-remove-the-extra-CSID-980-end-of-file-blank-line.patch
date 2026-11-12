@@ -1,0 +1,24 @@
+From 029b26462f8408d7a18981564111c1eea1919108 Mon Sep 17 00:00:00 2001
+From: yzddmr6 <46088090+yzddmr6@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 04:27:05 +0800
+Subject: [PATCH] media: qcom: camss: remove the extra CSID 980 end-of-file
+ blank line
+
+Keep the imported driver unchanged apart from the whitespace reported by git diff --check.
+
+Assisted-by: LLM
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ drivers/media/platform/qcom/camss/camss-csid-980.c | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/drivers/media/platform/qcom/camss/camss-csid-980.c b/drivers/media/platform/qcom/camss/camss-csid-980.c
+index 16184fe69..7298a9590 100644
+--- a/drivers/media/platform/qcom/camss/camss-csid-980.c
++++ b/drivers/media/platform/qcom/camss/camss-csid-980.c
+@@ -451,4 +451,3 @@ const struct csid_hw_ops csid_ops_980 = {
+ 	.subdev_init = csid_subdev_init,
+ 	.reg_update = csid_subdev_reg_update,
+ };
+-

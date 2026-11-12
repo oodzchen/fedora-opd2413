@@ -1,0 +1,94 @@
+From 4cd63e9592720f11a041ac829353a34db0200885 Mon Sep 17 00:00:00 2001
+From: yzddmr6 <46088090+yzddmr6@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 06:30:44 +0800
+Subject: [PATCH] media: qcom: camss: release the parent reference on CSID
+ power-up failure
+
+CSID acquires its parent VFE before runtime PM, regulator, clock and reset setup. Errors after that acquisition return without putting the parent. The media pipeline does not call s_power(0) for the subdevice whose s_power(1) failed, so its rollback cannot release this reference.
+
+Unwind the acquired resources in reverse order and put the parent on every failure after a successful get. Keep the original error and leave references held by other users intact. Normal power-off is unchanged.
+
+Assisted-by: LLM
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ .../media/platform/qcom/camss/camss-csid.c    | 46 +++++++++----------
+ 1 file changed, 21 insertions(+), 25 deletions(-)
+
+diff --git a/drivers/media/platform/qcom/camss/camss-csid.c b/drivers/media/platform/qcom/camss/camss-csid.c
+index 48459b46a..5725a944e 100644
+--- a/drivers/media/platform/qcom/camss/camss-csid.c
++++ b/drivers/media/platform/qcom/camss/camss-csid.c
+@@ -696,44 +696,28 @@ static int csid_set_power(struct v4l2_subdev *sd, int on)
+ 
+ 		ret = pm_runtime_resume_and_get(dev);
+ 		if (ret < 0)
+-			return ret;
++			goto err_put_parent;
+ 
+ 		ret = regulator_bulk_enable(csid->num_supplies,
+ 					    csid->supplies);
+-		if (ret < 0) {
+-			pm_runtime_put_sync(dev);
+-			return ret;
+-		}
++		if (ret < 0)
++			goto err_put_runtime;
+ 
+ 		ret = csid_set_clock_rates(csid);
+-		if (ret < 0) {
+-			regulator_bulk_disable(csid->num_supplies,
+-					       csid->supplies);
+-			pm_runtime_put_sync(dev);
+-			return ret;
+-		}
++		if (ret < 0)
++			goto err_disable_regulators;
+ 
+ 		ret = camss_enable_clocks(csid->nclocks, csid->clock, dev);
+-		if (ret < 0) {
+-			regulator_bulk_disable(csid->num_supplies,
+-					       csid->supplies);
+-			pm_runtime_put_sync(dev);
+-			return ret;
+-		}
++		if (ret < 0)
++			goto err_disable_regulators;
+ 
+ 		csid->phy.need_vc_update = true;
+ 
+ 		enable_irq(csid->irq);
+ 
+ 		ret = csid->res->hw_ops->reset(csid);
+-		if (ret < 0) {
+-			disable_irq(csid->irq);
+-			camss_disable_clocks(csid->nclocks, csid->clock);
+-			regulator_bulk_disable(csid->num_supplies,
+-					       csid->supplies);
+-			pm_runtime_put_sync(dev);
+-			return ret;
+-		}
++		if (ret < 0)
++			goto err_disable_irq;
+ 
+ 		csid->res->hw_ops->hw_version(csid);
+ 	} else {
+@@ -745,6 +729,18 @@ static int csid_set_power(struct v4l2_subdev *sd, int on)
+ 		csid->res->parent_dev_ops->put(camss, csid->id);
+ 	}
+ 
++	return ret;
++
++err_disable_irq:
++	disable_irq(csid->irq);
++	camss_disable_clocks(csid->nclocks, csid->clock);
++err_disable_regulators:
++	regulator_bulk_disable(csid->num_supplies, csid->supplies);
++err_put_runtime:
++	pm_runtime_put_sync(dev);
++err_put_parent:
++	csid->res->parent_dev_ops->put(camss, csid->id);
++
+ 	return ret;
+ }
+ 

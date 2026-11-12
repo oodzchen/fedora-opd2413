@@ -1,0 +1,166 @@
+From 1a760659577fdd00011f5e607e2c9043ec402398 Mon Sep 17 00:00:00 2001
+From: yading <187273358+BUSHIGEMENNI@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 10:26:11 +0800
+Subject: [PATCH] media: i2c: align erhai sensor setup with hardware
+ observations
+
+Use the measured front sensor address, 19.2 MHz sensor clocks and the
+final Bayer phases reported by BUSHIGEMENNI: SC1300CS RGGB at 0x3221=0x66
+and SC820CS BGGR at 0x3221=0x00. Keep orientation metadata unchanged
+until physical orientation is established for this pipeline.
+
+Adapted from BUSHIGEMENNI/linux-sm8750-erhai commits
+cf04eff3703d4034ff077ca7f60194ce4b739322 and
+8afe07a3f8e25c703141eecd5495b4cee7cf46a6, retaining the existing sensor
+drivers and their original register-table attribution.
+
+Link: https://github.com/yzddmr6/onepluspad-2pro-mainline/issues/12
+Assisted-by: LLM
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ .../bindings/media/i2c/smartsens,sc1300cs.yaml        |  4 ++--
+ .../bindings/media/i2c/smartsens,sc820cs.yaml         |  8 ++++----
+ drivers/media/i2c/sc1300cs.c                          | 11 ++++++-----
+ drivers/media/i2c/sc820cs.c                           |  7 ++++---
+ 4 files changed, 16 insertions(+), 14 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/media/i2c/smartsens,sc1300cs.yaml b/Documentation/devicetree/bindings/media/i2c/smartsens,sc1300cs.yaml
+index f8d659def..b62ef8ebb 100644
+--- a/Documentation/devicetree/bindings/media/i2c/smartsens,sc1300cs.yaml
++++ b/Documentation/devicetree/bindings/media/i2c/smartsens,sc1300cs.yaml
+@@ -12,7 +12,7 @@ maintainers:
+ description:
+   The SC1300CS is a RAW image sensor with an I2C control interface
+   and a MIPI CSI-2 output. The supported configuration uses four D-PHY
+-  data lanes and a 24 MHz input clock.
++  data lanes and a 19.2 MHz input clock.
+ 
+ allOf:
+   - $ref: /schemas/media/video-interface-devices.yaml#
+@@ -85,7 +85,7 @@ examples:
+             reg = <0x36>;
+             clocks = <&camera_clk>;
+             assigned-clocks = <&camera_clk>;
+-            assigned-clock-rates = <24000000>;
++            assigned-clock-rates = <19200000>;
+             avdd-supply = <&camera_avdd>;
+             dvdd-supply = <&camera_dvdd>;
+             dovdd-supply = <&camera_dovdd>;
+diff --git a/Documentation/devicetree/bindings/media/i2c/smartsens,sc820cs.yaml b/Documentation/devicetree/bindings/media/i2c/smartsens,sc820cs.yaml
+index 30819092d..f714b81a1 100644
+--- a/Documentation/devicetree/bindings/media/i2c/smartsens,sc820cs.yaml
++++ b/Documentation/devicetree/bindings/media/i2c/smartsens,sc820cs.yaml
+@@ -12,7 +12,7 @@ maintainers:
+ description:
+   The SC820CS is a RAW image sensor with an I2C control interface
+   and a MIPI CSI-2 output. The supported configuration uses four D-PHY
+-  data lanes and a 24 MHz input clock.
++  data lanes and a 19.2 MHz input clock.
+ 
+ allOf:
+   - $ref: /schemas/media/video-interface-devices.yaml#
+@@ -80,12 +80,12 @@ examples:
+         #address-cells = <1>;
+         #size-cells = <0>;
+ 
+-        camera@20 {
++        camera@10 {
+             compatible = "smartsens,sc820cs";
+-            reg = <0x20>;
++            reg = <0x10>;
+             clocks = <&camera_clk>;
+             assigned-clocks = <&camera_clk>;
+-            assigned-clock-rates = <24000000>;
++            assigned-clock-rates = <19200000>;
+             avdd-supply = <&camera_avdd>;
+             dvdd-supply = <&camera_dvdd>;
+             dovdd-supply = <&camera_dovdd>;
+diff --git a/drivers/media/i2c/sc1300cs.c b/drivers/media/i2c/sc1300cs.c
+index 194186e5d..d989c894a 100644
+--- a/drivers/media/i2c/sc1300cs.c
++++ b/drivers/media/i2c/sc1300cs.c
+@@ -40,7 +40,7 @@
+ #define SC1300CS_VTS_MAX		0x7ffe
+ #define SC1300CS_EXPOSURE_MARGIN	5
+ #define SC1300CS_PIXEL_RATE	480000000
+-#define SC1300CS_XCLK_RATE	24000000
++#define SC1300CS_XCLK_RATE	19200000
+ 
+ static const s64 sc1300cs_link_freqs[] = { 600000000 };
+ /* Power-on order: I/O, digital core, analogue. */
+@@ -243,6 +243,7 @@ static const struct cci_reg_sequence sc1300cs_mode[] = {
+ 	{ CCI_REG8(0x3213), 0x08 },
+ 	{ CCI_REG8(0x3215), 0x11 },
+ 	{ CCI_REG8(0x3220), 0x00 },
++	/* Both flips: the captured mode starts with an RGGB pixel. */
+ 	{ CCI_REG8(0x3221), 0x66 },
+ 	{ CCI_REG8(0x5000), 0x1e },
+ 	{ CCI_REG8(0x5900), 0x01 },
+@@ -465,7 +466,7 @@ static int sc1300cs_set_format(struct v4l2_subdev *sd,
+ 	fmt->format = (struct v4l2_mbus_framefmt) {
+ 		.width = SC1300CS_WIDTH,
+ 		.height = SC1300CS_HEIGHT,
+-		.code = MEDIA_BUS_FMT_SBGGR10_1X10,
++		.code = MEDIA_BUS_FMT_SRGGB10_1X10,
+ 		.field = V4L2_FIELD_NONE,
+ 		.colorspace = V4L2_COLORSPACE_RAW,
+ 		.ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT,
+@@ -490,7 +491,7 @@ static int sc1300cs_enum_mbus_code(struct v4l2_subdev *sd,
+ {
+ 	if (code->index)
+ 		return -EINVAL;
+-	code->code = MEDIA_BUS_FMT_SBGGR10_1X10;
++	code->code = MEDIA_BUS_FMT_SRGGB10_1X10;
+ 	return 0;
+ }
+ 
+@@ -498,7 +499,7 @@ static int sc1300cs_enum_frame_size(struct v4l2_subdev *sd,
+ 				  struct v4l2_subdev_state *state,
+ 				  struct v4l2_subdev_frame_size_enum *fse)
+ {
+-	if (fse->index || fse->code != MEDIA_BUS_FMT_SBGGR10_1X10)
++	if (fse->index || fse->code != MEDIA_BUS_FMT_SRGGB10_1X10)
+ 		return -EINVAL;
+ 	fse->min_width = fse->max_width = SC1300CS_WIDTH;
+ 	fse->min_height = fse->max_height = SC1300CS_HEIGHT;
+@@ -589,7 +590,7 @@ static int sc1300cs_probe(struct i2c_client *client)
+ 	if (IS_ERR(sensor->xclk))
+ 		return dev_err_probe(dev, PTR_ERR(sensor->xclk), "failed to get clock\n");
+ 	if (clk_get_rate(sensor->xclk) != SC1300CS_XCLK_RATE)
+-		return dev_err_probe(dev, -EINVAL, "24 MHz clock required\n");
++		return dev_err_probe(dev, -EINVAL, "19.2 MHz clock required\n");
+ 	sensor->reset = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
+ 	if (IS_ERR(sensor->reset))
+ 		return dev_err_probe(dev, PTR_ERR(sensor->reset), "failed to get reset\n");
+diff --git a/drivers/media/i2c/sc820cs.c b/drivers/media/i2c/sc820cs.c
+index 424c52696..cb1d45547 100644
+--- a/drivers/media/i2c/sc820cs.c
++++ b/drivers/media/i2c/sc820cs.c
+@@ -40,7 +40,7 @@
+ #define SC820CS_VTS_MAX		0x7fff
+ #define SC820CS_EXPOSURE_MARGIN	4
+ #define SC820CS_PIXEL_RATE	264000000
+-#define SC820CS_XCLK_RATE	24000000
++#define SC820CS_XCLK_RATE	19200000
+ 
+ static const s64 sc820cs_link_freqs[] = { 368000000 };
+ /* Power-on order: I/O, digital core, analogue. */
+@@ -194,7 +194,8 @@ static const struct cci_reg_sequence sc820cs_mode[] = {
+ 	{ CCI_REG8(0x5780), 0x66 },
+ 	{ CCI_REG8(0x578d), 0x40 },
+ 	{ CCI_REG8(0x57aa), 0xeb },
+-	{ CCI_REG8(0x3221), 0x60 },
++	/* No flips: keep the BGGR phase advertised on the source pad. */
++	{ CCI_REG8(0x3221), 0x00 },
+ 	{ CCI_REG8(0x301f), 0x0e },
+ 	{ CCI_REG8(0x3200), 0x00 },
+ 	{ CCI_REG8(0x3201), 0x00 },
+@@ -557,7 +558,7 @@ static int sc820cs_probe(struct i2c_client *client)
+ 	if (IS_ERR(sensor->xclk))
+ 		return dev_err_probe(dev, PTR_ERR(sensor->xclk), "failed to get clock\n");
+ 	if (clk_get_rate(sensor->xclk) != SC820CS_XCLK_RATE)
+-		return dev_err_probe(dev, -EINVAL, "24 MHz clock required\n");
++		return dev_err_probe(dev, -EINVAL, "19.2 MHz clock required\n");
+ 	sensor->reset = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
+ 	if (IS_ERR(sensor->reset))
+ 		return dev_err_probe(dev, PTR_ERR(sensor->reset), "failed to get reset\n");

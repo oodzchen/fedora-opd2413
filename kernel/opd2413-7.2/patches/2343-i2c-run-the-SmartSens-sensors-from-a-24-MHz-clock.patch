@@ -1,0 +1,66 @@
+From 51d5f2dac643224622aad1398b4bd6caa6d8c9c8 Mon Sep 17 00:00:00 2001
+From: yzddmr6 <46088090+yzddmr6@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 19:49:27 +0800
+Subject: [PATCH] media: i2c: run the SmartSens sensors from a 24 MHz clock
+
+The register sequences of both sensors program their PLLs for a 24 MHz
+input clock, and the stock camera module data requests 24 MHz for both
+modules; the drivers' pixel rate and link frequency assume it as well.
+From 19.2 MHz the sensors ran at 80% of the designed rate, delivering 24
+instead of 30 frames per second with a bus slower than the drivers
+report.
+
+Request 24 MHz from the camera clock controller and require it in the
+drivers.
+
+Assisted-by: LLM
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ drivers/media/i2c/sc1300cs.c | 4 ++--
+ drivers/media/i2c/sc820cs.c  | 4 ++--
+ 2 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/media/i2c/sc1300cs.c b/drivers/media/i2c/sc1300cs.c
+index b090a90a2..b5d97bdae 100644
+--- a/drivers/media/i2c/sc1300cs.c
++++ b/drivers/media/i2c/sc1300cs.c
+@@ -40,7 +40,7 @@
+ #define SC1300CS_VTS_MAX		0x7ffe
+ #define SC1300CS_EXPOSURE_MARGIN	5
+ #define SC1300CS_PIXEL_RATE	480000000
+-#define SC1300CS_XCLK_RATE	19200000
++#define SC1300CS_XCLK_RATE	24000000
+ 
+ static const s64 sc1300cs_link_freqs[] = { 600000000 };
+ /* Power-on order: I/O, digital core, analogue. */
+@@ -610,7 +610,7 @@ static int sc1300cs_probe(struct i2c_client *client)
+ 	if (IS_ERR(sensor->xclk))
+ 		return dev_err_probe(dev, PTR_ERR(sensor->xclk), "failed to get clock\n");
+ 	if (clk_get_rate(sensor->xclk) != SC1300CS_XCLK_RATE)
+-		return dev_err_probe(dev, -EINVAL, "19.2 MHz clock required\n");
++		return dev_err_probe(dev, -EINVAL, "24 MHz clock required\n");
+ 	sensor->reset = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
+ 	if (IS_ERR(sensor->reset))
+ 		return dev_err_probe(dev, PTR_ERR(sensor->reset), "failed to get reset\n");
+diff --git a/drivers/media/i2c/sc820cs.c b/drivers/media/i2c/sc820cs.c
+index c2ac69c81..ff585a8eb 100644
+--- a/drivers/media/i2c/sc820cs.c
++++ b/drivers/media/i2c/sc820cs.c
+@@ -40,7 +40,7 @@
+ #define SC820CS_VTS_MAX		0x7fff
+ #define SC820CS_EXPOSURE_MARGIN	4
+ #define SC820CS_PIXEL_RATE	264000000
+-#define SC820CS_XCLK_RATE	19200000
++#define SC820CS_XCLK_RATE	24000000
+ 
+ static const s64 sc820cs_link_freqs[] = { 368000000 };
+ /* Power-on order: I/O, digital core, analogue. */
+@@ -578,7 +578,7 @@ static int sc820cs_probe(struct i2c_client *client)
+ 	if (IS_ERR(sensor->xclk))
+ 		return dev_err_probe(dev, PTR_ERR(sensor->xclk), "failed to get clock\n");
+ 	if (clk_get_rate(sensor->xclk) != SC820CS_XCLK_RATE)
+-		return dev_err_probe(dev, -EINVAL, "19.2 MHz clock required\n");
++		return dev_err_probe(dev, -EINVAL, "24 MHz clock required\n");
+ 	sensor->reset = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
+ 	if (IS_ERR(sensor->reset))
+ 		return dev_err_probe(dev, PTR_ERR(sensor->reset), "failed to get reset\n");

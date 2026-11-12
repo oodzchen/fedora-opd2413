@@ -1,0 +1,40 @@
+From 4ab9cc450fb0746845d8a8658517326e0257613d Mon Sep 17 00:00:00 2001
+From: yzddmr6 <46088090+yzddmr6@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 07:13:13 +0800
+Subject: [PATCH] pmdomain: core: cache the initial performance state of
+ virtual devices
+
+A virtual domain device starts runtime-suspended, but runtime PM is not enabled until after __genpd_dev_pm_attach(). Setting its required OPP before that point makes pm_runtime_suspended() return false and applies the vote immediately. A consumer that has not been opened can therefore keep a performance vote until its first resume/suspend cycle or detach.
+
+Cache the default state in rpm_pstate for virtual devices so their first runtime resume applies it. Leave the directly attached platform-device path unchanged. The virtual device remains runtime-PM-disabled while it is being attached.
+
+An ARM64 QEMU test with a synthetic provider reproduces the initial vote and checks idle, active/shared users, close/reopen, detach and the single-domain path using the real genpd and OPP core. Hardware provider testing remains separate.
+
+Assisted-by: LLM
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ drivers/pmdomain/core.c | 11 ++++++++---
+ 1 file changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/pmdomain/core.c b/drivers/pmdomain/core.c
+index 842c4169e..f19470675 100644
+--- a/drivers/pmdomain/core.c
++++ b/drivers/pmdomain/core.c
+@@ -3346,9 +3346,14 @@ static int genpd_set_required_opp(struct device *dev, unsigned int index)
+ 		ret = pstate;
+ 		goto err;
+ 	} else if (pstate > 0) {
+-		ret = dev_pm_genpd_set_performance_state(dev, pstate);
+-		if (ret)
+-			goto err;
++		/* Virtual devices start suspended with runtime PM still disabled. */
++		if (dev->bus == &genpd_bus_type) {
++			dev_gpd_data(dev)->rpm_pstate = pstate;
++		} else {
++			ret = dev_pm_genpd_set_performance_state(dev, pstate);
++			if (ret)
++				goto err;
++		}
+ 		dev_gpd_data(dev)->default_pstate = pstate;
+ 	}
+ 

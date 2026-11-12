@@ -1,0 +1,117 @@
+From 213e10ab74422a54a1b28bd86c48ec3768eddebd Mon Sep 17 00:00:00 2001
+From: yading <187273358+BUSHIGEMENNI@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 10:26:48 +0800
+Subject: [PATCH] media: i2c: expose the fixed SmartSens mode crop
+
+Seed the source crop when initializing or setting the fixed mode, and
+provide the selection operation used by libcamera. Both sensors output
+their full mode rectangle; do not expose writable cropping.
+
+Adapted from BUSHIGEMENNI/linux-sm8750-erhai commit
+a735ad33fc1463706c9c589f7ab600af428567ff for the current subdev-state API
+and extended to the rear sensor.
+
+Link: https://github.com/yzddmr6/onepluspad-2pro-mainline/issues/12
+Assisted-by: LLM
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ drivers/media/i2c/sc1300cs.c | 23 +++++++++++++++++++++++
+ drivers/media/i2c/sc820cs.c  | 23 +++++++++++++++++++++++
+ 2 files changed, 46 insertions(+)
+
+diff --git a/drivers/media/i2c/sc1300cs.c b/drivers/media/i2c/sc1300cs.c
+index 12b25bfb1..21423e88c 100644
+--- a/drivers/media/i2c/sc1300cs.c
++++ b/drivers/media/i2c/sc1300cs.c
+@@ -471,6 +471,10 @@ static int sc1300cs_set_format(struct v4l2_subdev *sd,
+ 		.xfer_func = V4L2_XFER_FUNC_NONE,
+ 	};
+ 	*v4l2_subdev_state_get_format(state, 0) = fmt->format;
++	*v4l2_subdev_state_get_crop(state, 0) = (struct v4l2_rect) {
++		.width = SC1300CS_WIDTH,
++		.height = SC1300CS_HEIGHT,
++	};
+ 	return 0;
+ }
+ 
+@@ -503,6 +507,24 @@ static int sc1300cs_enum_frame_size(struct v4l2_subdev *sd,
+ 	return 0;
+ }
+ 
++static int sc1300cs_get_selection(struct v4l2_subdev *sd,
++			       struct v4l2_subdev_state *state,
++			       struct v4l2_subdev_selection *sel)
++{
++	if (sel->pad)
++		return -EINVAL;
++
++	switch (sel->target) {
++	case V4L2_SEL_TGT_CROP:
++	case V4L2_SEL_TGT_CROP_DEFAULT:
++	case V4L2_SEL_TGT_CROP_BOUNDS:
++		sel->r = *v4l2_subdev_state_get_crop(state, 0);
++		return 0;
++	default:
++		return -EINVAL;
++	}
++}
++
+ static const struct v4l2_subdev_core_ops sc1300cs_core_ops = {
+ 	.subscribe_event = v4l2_ctrl_subdev_subscribe_event,
+ 	.unsubscribe_event = v4l2_event_subdev_unsubscribe,
+@@ -517,6 +539,7 @@ static const struct v4l2_subdev_pad_ops sc1300cs_pad_ops = {
+ 	.enum_frame_size = sc1300cs_enum_frame_size,
+ 	.get_fmt = v4l2_subdev_get_fmt,
+ 	.set_fmt = sc1300cs_set_format,
++	.get_selection = sc1300cs_get_selection,
+ 	.enable_streams = sc1300cs_enable_streams,
+ 	.disable_streams = sc1300cs_disable_streams,
+ };
+diff --git a/drivers/media/i2c/sc820cs.c b/drivers/media/i2c/sc820cs.c
+index 04063a333..ef03e01b2 100644
+--- a/drivers/media/i2c/sc820cs.c
++++ b/drivers/media/i2c/sc820cs.c
+@@ -439,6 +439,10 @@ static int sc820cs_set_format(struct v4l2_subdev *sd,
+ 		.xfer_func = V4L2_XFER_FUNC_NONE,
+ 	};
+ 	*v4l2_subdev_state_get_format(state, 0) = fmt->format;
++	*v4l2_subdev_state_get_crop(state, 0) = (struct v4l2_rect) {
++		.width = SC820CS_WIDTH,
++		.height = SC820CS_HEIGHT,
++	};
+ 	return 0;
+ }
+ 
+@@ -471,6 +475,24 @@ static int sc820cs_enum_frame_size(struct v4l2_subdev *sd,
+ 	return 0;
+ }
+ 
++static int sc820cs_get_selection(struct v4l2_subdev *sd,
++			       struct v4l2_subdev_state *state,
++			       struct v4l2_subdev_selection *sel)
++{
++	if (sel->pad)
++		return -EINVAL;
++
++	switch (sel->target) {
++	case V4L2_SEL_TGT_CROP:
++	case V4L2_SEL_TGT_CROP_DEFAULT:
++	case V4L2_SEL_TGT_CROP_BOUNDS:
++		sel->r = *v4l2_subdev_state_get_crop(state, 0);
++		return 0;
++	default:
++		return -EINVAL;
++	}
++}
++
+ static const struct v4l2_subdev_core_ops sc820cs_core_ops = {
+ 	.subscribe_event = v4l2_ctrl_subdev_subscribe_event,
+ 	.unsubscribe_event = v4l2_event_subdev_unsubscribe,
+@@ -485,6 +507,7 @@ static const struct v4l2_subdev_pad_ops sc820cs_pad_ops = {
+ 	.enum_frame_size = sc820cs_enum_frame_size,
+ 	.get_fmt = v4l2_subdev_get_fmt,
+ 	.set_fmt = sc820cs_set_format,
++	.get_selection = sc820cs_get_selection,
+ 	.enable_streams = sc820cs_enable_streams,
+ 	.disable_streams = sc820cs_disable_streams,
+ };

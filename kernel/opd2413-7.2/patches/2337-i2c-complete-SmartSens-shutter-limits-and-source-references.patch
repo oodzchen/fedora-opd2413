@@ -1,0 +1,75 @@
+From daf66c81e91512057782650a44c61d993f8d807a Mon Sep 17 00:00:00 2001
+From: yzddmr6 <46088090+yzddmr6@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 21:13:11 +0800
+Subject: [PATCH] media: i2c: complete SmartSens shutter limits and source
+ references
+
+The vendor SC1300CS implementation requires at least four exposure lines,
+in addition to even shutter values. Apply that minimum both at control
+creation and when vertical blanking changes the exposure range.
+
+Pin the exact source revision used for the sensor mode tables and actuator
+protocol, including updates after their initial introduction.
+
+Assisted-by: LLM
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ drivers/media/i2c/cn3927.c   | 1 +
+ drivers/media/i2c/sc1300cs.c | 5 +++--
+ drivers/media/i2c/sc820cs.c  | 1 +
+ 3 files changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/media/i2c/cn3927.c b/drivers/media/i2c/cn3927.c
+index 275756a96..2d9b09633 100644
+--- a/drivers/media/i2c/cn3927.c
++++ b/drivers/media/i2c/cn3927.c
+@@ -5,6 +5,7 @@
+  *
+  * Based on TheMojoMan's CN3927 driver in
+  * https://github.com/TheMojoMan/oneplus-erhai-linux
++ * revision 74ba8ddb4dc8fd930841b6802053b4362b59ce46.
+  * The unlock sequence and split DAC writes match the OnePlus Android
+  * actuator configuration. The focus DAC is 10 bits at registers 0x03/0x04.
+  */
+diff --git a/drivers/media/i2c/sc1300cs.c b/drivers/media/i2c/sc1300cs.c
+index b0fb01f56..194186e5d 100644
+--- a/drivers/media/i2c/sc1300cs.c
++++ b/drivers/media/i2c/sc1300cs.c
+@@ -4,6 +4,7 @@
+  *
+  * Based on TheMojoMan's sc1320cs driver in
+  * https://github.com/TheMojoMan/oneplus-erhai-linux
++ * revision 74ba8ddb4dc8fd930841b6802053b4362b59ce46.
+  * Register sequences originate from Android bus captures, not a datasheet.
+  * The original attribution is retained:
+  * Copyright (c) Qualcomm Innovation Center, Inc. All rights reserved.
+@@ -325,7 +326,7 @@ static int sc1300cs_set_ctrl(struct v4l2_ctrl *ctrl)
+ 
+ 	if (ctrl->id == V4L2_CID_VBLANK) {
+ 		exposure_max = (SC1300CS_HEIGHT + ctrl->val - SC1300CS_EXPOSURE_MARGIN) & ~1;
+-		ret = __v4l2_ctrl_modify_range(sensor->exposure, 2, exposure_max,
++		ret = __v4l2_ctrl_modify_range(sensor->exposure, 4, exposure_max,
+ 					       2, min(exposure_max, 1000));
+ 		if (ret)
+ 			return ret;
+@@ -390,7 +391,7 @@ static int sc1300cs_init_controls(struct sc1300cs *sensor)
+ 					 SC1300CS_VTS_MAX - SC1300CS_HEIGHT, 2,
+ 					 SC1300CS_VTS - SC1300CS_HEIGHT);
+ 	sensor->exposure = v4l2_ctrl_new_std(hdl, &sc1300cs_ctrl_ops, V4L2_CID_EXPOSURE,
+-					   2, (SC1300CS_VTS - SC1300CS_EXPOSURE_MARGIN) & ~1,
++					   4, (SC1300CS_VTS - SC1300CS_EXPOSURE_MARGIN) & ~1,
+ 					   2, 1000);
+ 	v4l2_ctrl_new_std(hdl, &sc1300cs_ctrl_ops, V4L2_CID_ANALOGUE_GAIN,
+ 			  1024, 16384, 8, 1024);
+diff --git a/drivers/media/i2c/sc820cs.c b/drivers/media/i2c/sc820cs.c
+index 6b414ffa0..424c52696 100644
+--- a/drivers/media/i2c/sc820cs.c
++++ b/drivers/media/i2c/sc820cs.c
+@@ -4,6 +4,7 @@
+  *
+  * Based on TheMojoMan's sc820cs driver in
+  * https://github.com/TheMojoMan/oneplus-erhai-linux
++ * revision 74ba8ddb4dc8fd930841b6802053b4362b59ce46.
+  * Register sequences originate from Android bus captures, not a datasheet.
+  * The original attribution is retained:
+  * Copyright (c) Qualcomm Innovation Center, Inc. All rights reserved.

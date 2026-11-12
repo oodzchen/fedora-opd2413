@@ -1,0 +1,54 @@
+From 036aaf50c1c1e3728fcce2f964936232d4e68f7d Mon Sep 17 00:00:00 2001
+From: yzddmr6 <46088090+yzddmr6@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 07:14:46 +0800
+Subject: [PATCH] pmdomain: core: handle performance restoration and power-on
+ failures
+
+Runtime resume currently ignores an error restoring the device performance state, allowing the consumer to continue without its required vote. It also leaves the restored vote behind when powering on the domain fails.
+
+Propagate the performance restoration error before attempting power-on. Drop the restored contribution on a power-on failure, while keeping the cached target for a subsequent resume. Keep the original error and let the existing aggregate handling preserve other consumers' votes.
+
+A real ARM64 genpd/runtime-PM test with synthetic provider failures reproduces both paths: a rejected state returns success, and failed power-on leaves state 256. Both now return -EIO with no residual contribution. The same suite covers initial idle, shared consumers, close/reopen, partial attachment cleanup and single-domain attachment (21 checks).
+
+Assisted-by: LLM
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ drivers/pmdomain/core.c | 16 +++++++++++-----
+ 1 file changed, 11 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/pmdomain/core.c b/drivers/pmdomain/core.c
+index f19470675..e10e7cd97 100644
+--- a/drivers/pmdomain/core.c
++++ b/drivers/pmdomain/core.c
+@@ -535,11 +535,13 @@ static int genpd_drop_performance_state(struct device *dev)
+ 	return 0;
+ }
+ 
+-static void genpd_restore_performance_state(struct device *dev,
+-					    unsigned int state)
++static int genpd_restore_performance_state(struct device *dev,
++					   unsigned int state)
+ {
+ 	if (state)
+-		genpd_set_performance_state(dev, state);
++		return genpd_set_performance_state(dev, state);
++
++	return 0;
+ }
+ 
+ static int genpd_dev_pm_set_performance_state(struct device *dev,
+@@ -1306,8 +1308,12 @@ static int genpd_runtime_resume(struct device *dev)
+ 		goto out;
+ 
+ 	genpd_lock(genpd);
+-	genpd_restore_performance_state(dev, gpd_data->rpm_pstate);
+-	ret = genpd_power_on(genpd, 0);
++	ret = genpd_restore_performance_state(dev, gpd_data->rpm_pstate);
++	if (!ret) {
++		ret = genpd_power_on(genpd, 0);
++		if (ret)
++			genpd_drop_performance_state(dev);
++	}
+ 	genpd_unlock(genpd);
+ 
+ 	if (ret)

@@ -1,0 +1,87 @@
+From 146281a72a3de3fb9698ea4fec908f6821b28362 Mon Sep 17 00:00:00 2001
+From: yzddmr6 <46088090+yzddmr6@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 06:50:39 +0800
+Subject: [PATCH] dt-bindings: media: qcom,sm8750-camss: describe performance
+ domains
+
+The CAMSS clocks depend on MMCX and MXC, and the CSI receiver clock also needs MX. Describe these separately from the IFE and top GDSCs, with required-opps indexed by the complete power-domain list.
+
+Assisted-by: LLM
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ .../bindings/media/qcom,sm8750-camss.yaml     | 38 ++++++++++++++++++-
+ 1 file changed, 36 insertions(+), 2 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/media/qcom,sm8750-camss.yaml b/Documentation/devicetree/bindings/media/qcom,sm8750-camss.yaml
+index 9bee1c25c..0ea6ae7c5 100644
+--- a/Documentation/devicetree/bindings/media/qcom,sm8750-camss.yaml
++++ b/Documentation/devicetree/bindings/media/qcom,sm8750-camss.yaml
+@@ -103,6 +103,9 @@ properties:
+           IFE2 GDSC - Global Distributed Switch Controller for IFE2.
+       - description:
+           Titan GDSC - Global Distributed Switch Controller for the entire camss.
++      - description: MMCX performance domain.
++      - description: MX performance domain for the CSI receiver clocks.
++      - description: MXC performance domain.
+ 
+   power-domain-names:
+     items:
+@@ -110,6 +113,26 @@ properties:
+       - const: ife1
+       - const: ife2
+       - const: top
++      - const: mmcx
++      - const: mx
++      - const: mxc
++
++  required-opps:
++    description:
++      Minimum performance states while CAMSS is active. The first four entries
++      are empty because the GDSCs do not have performance states.
++    items:
++      - items:
++          - const: 0
++      - items:
++          - const: 0
++      - items:
++          - const: 0
++      - items:
++          - const: 0
++      - description: MMCX performance state.
++      - description: MX performance state.
++      - description: MXC performance state.
+ 
+   ports:
+     $ref: /schemas/graph.yaml#/properties/ports
+@@ -159,6 +182,7 @@ required:
+   - iommus
+   - power-domains
+   - power-domain-names
++  - required-opps
+   - ports
+ 
+ additionalProperties: false
+@@ -292,11 +316,21 @@ examples:
+             power-domains = <&camcc CAM_CC_TFE_0_GDSC>,
+                             <&camcc CAM_CC_TFE_1_GDSC>,
+                             <&camcc CAM_CC_TFE_2_GDSC>,
+-                            <&camcc CAM_CC_TITAN_TOP_GDSC>;
++                            <&camcc CAM_CC_TITAN_TOP_GDSC>,
++                            <&rpmhpd RPMHPD_MMCX>,
++                            <&rpmhpd RPMHPD_MX>,
++                            <&rpmhpd RPMHPD_MXC>;
+             power-domain-names = "ife0",
+                                  "ife1",
+                                  "ife2",
+-                                 "top";
++                                 "top",
++                                 "mmcx",
++                                 "mx",
++                                 "mxc";
++            required-opps = <0>, <0>, <0>, <0>,
++                            <&rpmhpd_opp_nom>,
++                            <&rpmhpd_opp_svs>,
++                            <&rpmhpd_opp_nom>;
+ 
+             ports {
+                 #address-cells = <1>;

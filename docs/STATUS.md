@@ -5,10 +5,14 @@
 
 ## 唯一的下一步
 
-**M3.2b PPS 快充真机测试：等电量降到 75 % 以下（用户在拔线放电），然后插快充。** `7.2.15-4.opd2413`（SC8547A 电荷泵 + erhai PPS 引擎）已是默认内核，
-驱动加载、电荷泵探测、`pps_enable=Y` 已确认。测试时看：`erhai_pps` 日志进入 PPS、VBUS 升到约 8–10 V、电池电流明显大于 9 V 固定档时、电荷泵温度和电池温度、拔线回退到 5 V；
-同时补做：插电冷启动一次（initramfs 改过）、快充充电器上 9 V 固定档仍可用（PPS 退出后）。之后用户要求做 M3.4（传感器/摄像头/视频硬解）。
-测试新内核用 `tools/tablet-reboot.py --entry …`（重启前会用 `bootctl` 核对将启动的条目）；装新内核前先 `boot-select default <当前条目>`。
+**M3.4c 传感器（离线打包）。** erhai 的传感器栈是三个用户态组件：hexagonrpcd（6 个补丁）、libssc（11 个补丁）、带 SSC 支持的 iio-sensor-proxy 3.9（6 个补丁），
+外加 ROM 里的传感器配置和每台机器的 registry（Android persist 分区，只读复制，属本机数据，不进仓库）。Fedora 没有前两个，iio-sensor-proxy 没编 SSC。
+先在 aarch64 容器里把三个包打成 RPM 并离线验证，上机前问用户。
+并行等待：PPS 实测（电量 < 75 % 时插快充，同时补插电冷启动）；新发现的麦克风采集故障另立一项（用户定优先级）。
+测试新内核用 `tools/tablet-reboot.py --entry …`；装新内核前先 `boot-select default <当前条目>`。拔线调试时先起 `opd2413-debug-inhibit` 抑制空闲睡眠。
+
+M3.4b 摄像头 2026-11-12 真机通过：`7.2.15-5.opd2413`，前后摄预览、拍照、录像；无自动对焦、无调校。
+M3.2b PPS：`7.2.15-4` 起驱动加载、电荷泵探测、`pps_enable=Y`，快充本身待测。
 
 M3.3 2026-11-12 真机通过：s2idle 可用（设备包 0.1-9/0.1-10，`MemorySleepMode=s2idle`），用户在 KDE 里把电源键、合盖设为睡眠；
 启动参数去掉三个 `*_ignore_unused`、加 `fw_devlink.sync_state=timeout` 后，挂起时 CX 塌陷、DDR 自刷新约 98 %（插着 USB）。
@@ -45,16 +49,16 @@ M2 剩下的被动观察项：开机提示音毛刺再出现时当场取证；�
 3. 改了 `device/` 或任何 spec，按 [BUILD.md](BUILD.md) 重新构建、跑离线测试，再拷到平板用 `dnf install ./*.rpm` 装。
 4. 关机会自动重新开机（插着电时）。需要冷启动验证时可以直接经 SSH `systemctl poweroff`，约 40 秒后回来。
 
-## 设备状态（2026-11-12 10:50）
+## 设备状态（2026-11-12 12:06）
 
-- 10:49 运行：Fedora 45 KDE，内核 `7.2.15-4.opd2413`（默认，`fedora-*`），`running`。启动参数没有 `*_ignore_unused`、有 `fw_devlink.sync_state=timeout`。
+- 12:05 运行：Fedora 45 KDE，内核 `7.2.15-5.opd2413`（默认，`fedora-*`；摄像头可用），`running`。装了 `libcamera-tools`、`snapshot`。启动参数没有 `*_ignore_unused`、有 `fw_devlink.sync_state=timeout`。
   s2idle 可用，挂起时 CX 塌陷。PPS 引擎已开（`pps_enable=Y`）。用户拔线放电中（电量 97 %）。蓝牙打开，有一个用户配对的设备。
   `/etc/kernel/cmdline` 改前的备份在 `/var/tmp/opd2413/m3-sleep/cmdline-100831/`；删掉的 `opd2413-pps.conf` 备份在 `/var/tmp/opd2413/m3-pps-20261112/`。
-- systemd-boot：`loader.conf` 默认 `fedora-*`（选版本最高的）；条目 `fedora-7.2.15-4.opd2413`、`fedora-7.2.15-3.opd2413`（回退，参数相同）。
+- systemd-boot：`loader.conf` 默认 `fedora-*`（选版本最高的）；条目 `fedora-7.2.15-5.opd2413`、`fedora-7.2.15-4.opd2413`（回退，参数相同）。
   ESP 空闲约 268 MiB；固定路径 `/dtbs/qcom/sm8750-oneplus-pad2pro.dtb` 是 7.2.15 的（与内核 3 相同）。
 - `boot_b` = `07bf1b53…`（fedora1：菜单 ColorOS / Fedora / Fedora boot menu，倒计时 10 s，默认项仍是 ColorOS）；KSHIM.CHO 记住 Fedora。
   上一版 `492f2cdf…` 的整分区回读在主机 `private/bootflow-20261111/boot_b-readonly.img`。
-- 软件包：`kernel-opd2413-7.2.15-4`、`7.2.15-3`，`opd2413-device-0.1-10`、`opd2413-audio-0.1-5`。`installonly_limit=2`：再装一个内核会卸掉 7.2.15-3。
+- 软件包：`kernel-opd2413-7.2.15-5`、`7.2.15-4`，`opd2413-device-0.1-10`、`opd2413-audio-0.1-5`。`installonly_limit=2`：再装一个内核会卸掉 7.2.15-4。
   内核 3（`7.2.6-3`）08:45 经用户同意卸载，它的包仍在主机 `out/rpms/`。
 - 7.3 测试内核、"M3 test" 和 "Log capture" 两个条目、ESP 上的 `opd2413-bootlog/` 已于 11-11 23:29 删除（备份在 `/var/tmp/opd2413/m3k-install-*/`）。
 - `/etc/modprobe.d/opd2413-pps.conf` 已删除（11-12）。`/etc/kernel/tries` 已删除。
@@ -86,6 +90,8 @@ M2 剩下的被动观察项：开机提示音毛刺再出现时当场取证；�
 | `private/m3-batt-20261112/` | M3.2a 的安装、读数、拔插采样和冷启动证据 |
 | `out/rpmbuild/RPMS/aarch64/kernel-opd2413-7.2.15-4.opd2413.aarch64.rpm` | 平板上的默认内核（M3.2b PPS）；`out/m3k/rpms4/`、`pkg-test4/` 是它的离线测试 |
 | `private/m3-pps-20261112/` | M3.2b 的安装、挂起、冷启动证据 |
+| `out/rpmbuild/RPMS/aarch64/kernel-opd2413-7.2.15-5.opd2413.aarch64.rpm` | 平板上的默认内核（M3.4b 摄像头）；`out/m3k/rpms5/`、`pkg-test5/` 是它的离线测试 |
+| `private/m3-cam-20261112/` | M3.4b 的安装、相机抓帧统计、麦克风测试 |
 | `out/m3-rpm5/` | 诊断内核 `7.3.3-5.opd2413` 的构建脚本和日志（编译完成，19:50 在打包前中止，没有包） |
 | `out/rpmbuild/RPMS/noarch/opd2413-device-0.1-10.noarch.rpm` | 平板上现在装的设备包（0.1-9 起允许 s2idle，0.1-10 修 boot-select 的条目 id） |
 | `private/m3-sleep-20261112/` | M3.3 的 pm_test、s2idle、按键挂起证据 |
@@ -139,7 +145,7 @@ Armada 下的结论见 [HARDWARE.md](HARDWARE.md)。换了发行版后都要重�
 | Pogo 键盘、触控板 | 真机通过 | 用户确认打字和触控板正常（2026-11-10）；日志有 libinput "touch jump" 警告 |
 | Wi-Fi | 真机启动 | 开机自动连上家里的 Wi-Fi，SSH 可用（2026-11-10）；HE 160 MHz 2161 Mbit/s，省电模式开（默认），ping 丢包 0、4–22 ms（2026-11-11）；断线重连和长时间传输未测 |
 | 扬声器 | 真机通过 | 用户确认播放、音量调节、静音正常（2026-11-10）；左右与逐颗未单独验 |
-| 麦克风 | 待调研 | |
+| 麦克风 | 真机失败 | 2026-11-12 采集到的是满幅乱码（录像全是噪音），见 WORKLOG M3.4b |
 | 蓝牙 | 有源码线索 | erhai |
 | 休眠 | 有源码线索 | erhai；M1 期间禁用 |
 | 充电（9 V PD） | 有源码线索 | erhai |
