@@ -69,3 +69,8 @@
 
 # M3.6 keyboard
 2403-Input-oneplus-pogo-keyboard-report-the-Esc-key-as-KEY_ESC.patch
+2408-arm64-dts-qcom-sm8750-oneplus-pad2pro-add-pogo-keyboard-wake-IRQ.patch
+2409-Input-oneplus-pogo-keyboard-wake-from-suspend-on-key-press.patch
+
+# M3.3 / s2idle ISLAND1 PS_HOLD fix
+2410-soc-qcom-llcc-qcom-Reserve-ISLAND1-ways-on-SM8750.patch

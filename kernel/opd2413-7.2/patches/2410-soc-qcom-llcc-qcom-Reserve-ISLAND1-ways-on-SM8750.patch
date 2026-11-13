@@ -1,0 +1,39 @@
+From b30d759d375e69164b0da842250cb69c785ece5c Mon Sep 17 00:00:00 2001
+From: yzddmr6 <46088090+yzddmr6@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 10:02:14 +0800
+Subject: [PATCH] soc: qcom: llcc-qcom: Reserve ISLAND1 ways on SM8750
+
+SM8750 assigns the ISLAND1 slice's 31 ways to bonus_ways instead of
+res_ways. Restore the reserved mask used by the original SM8750 support
+posting before its conversion to designated initializers. The reservation
+is needed when LPASS core votes are released during system suspend.
+
+Apply this correction before allowing the LPASS macro codecs to release
+their prepare votes, since the unreserved slice can cause a PS_HOLD reset
+when entering low-power states.
+
+Fixes: 2c04e58e30ce ("soc: qcom: llcc-qcom: Add support for SM8750")
+Link: https://lore.kernel.org/r/20250113-sm8750_llcc_master-v1-3-5389b92e2d7a@quicinc.com
+
+Assisted-by: LLM
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ drivers/soc/qcom/llcc-qcom.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/soc/qcom/llcc-qcom.c b/drivers/soc/qcom/llcc-qcom.c
+index 8948b5fd4..9c670bf6e 100644
+--- a/drivers/soc/qcom/llcc-qcom.c
++++ b/drivers/soc/qcom/llcc-qcom.c
+@@ -3747,7 +3747,7 @@ static const struct llcc_slice_config sm8750_data[] = {
+ 		.max_cap = 7936,
+ 		.priority = 7,
+ 		.fixed_size = true,
+-		.bonus_ways = 0x7fffffff,
++		.res_ways = 0x7fffffff,
+ 	}, {
+ 		.usecase_id = LLCC_DISP_WB,
+ 		.slice_id = 23,
+-- 
+2.56.0
+

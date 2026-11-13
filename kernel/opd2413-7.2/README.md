@@ -56,3 +56,5 @@
 | `7.2.15-8` | M3.6 `2403`（Esc 键报 `KEY_ESC`）；还带过 `2402`（恢复 SoC 的 TX SoundWire 端口描述），后来证明不需要、已从 series 去掉 |
 | `7.2.15-9` | M3.5 候选：`2404`–`2406`（erhai 的 ADSP 消息修复：q6v5、GLINK、APR） |
 | `7.2.15-10` | M3.5 麦克风根因修复 `2407`（wcd939x 按声道报告/切换 SoundWire 开关）；去掉 `2402`，TX SoundWire 布局回到 erhai 的 |
+| `7.2.15-11` | M3.6 键盘休眠唤醒 `2408`、`2409`（共享 RX `gpio3` 休眠态 `input-enable + bias-pull-down` 与 `wakeup` 中断，4 簇脉冲过滤屏蔽 10 s 脉冲与 22.66 s 电池包拍频重合，仅真实按键唤醒） |
+| `7.2.15-12` | M3.3 s2idle 修复 `2410`（erhai `b30d759d3`：`LLCC_ISLAND1` 使用 `res_ways = 0x7fffffff` 替代 `bonus_ways`，修 `2401` 引入后冷启动早休眠在 `PM: suspend-to-idle` 后触发 `PS_HOLD` 复位的问题） |

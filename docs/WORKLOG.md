@@ -1432,3 +1432,193 @@ mpv、Firefox 仍是软解（Fedora `ffmpeg-free` 的专利限制），用户选
    - 当前规避与后续修复方向：
      - 临时规避（技术债 #35）：在平板 `~colin/.config/kwinrc` 中设 `[NightColor] Active=false`、`[Plugins] nightlightEnabled=false`，重启 `plasma-kwin_wayland.service` 并执行一次 `kscreen-doctor --dpms off/on` 复位 `ctl_0`（`msm` 中断恢复 120/s，用户确认桌面显示恢复）。
      - 后续内核修复方向：修改 `dpu_crtc.c` 的 `dpu_crtc_get_topology()`，在硬件 DSPP 数量充足时开机首次 modeset 即常驻分配 `topology.num_dspp = topology.num_lm`，并去掉 `dpu_crtc_check_mode_changed()` 中因 `dpu_crtc_state_needs_dspp` 变化触发的 `mode_changed = true`。这样夜灯开启、渐变调节与关闭（`setup_pcc(dspp, NULL)` 写 `PCC_DIS`）均只走每帧 `color_mgmt_changed` 路径，既不会触发在线 modeset 黑屏，关闭时也能正常将 `dspp_pcc` 清零。
+
+### 2026-11-13 起：M4 键盘唤醒（s2idle 下按键唤醒并点亮锁屏）
+
+当前基线（只读核对）：`7.2.15-10.opd2413` 运行中，电量 95 %（充电中），`/sys/bus/platform/devices/880000.serial/power/wakeup` 不存在；`pogo-keyboard-detect`（gpio96）已注册但仅在 `POGO_KB_IDLE`（未接键盘）时 `enable_irq_wake`。
+
+**第一步实验计划（离线已就绪，待用户批准写入平板）：**
+
+离线在 `private/m3-kbdwake-20261113/kbd-wake.dtb` 基于当前 `7.2.15-10` 设备树编译实验 DTB（反编译 diff 核对仅两处变化）：
+
+1. `&uart_kb`（`serial@880000`）删去单中断属性 `interrupts` 并改为 `interrupts-extended = <&intc GIC_SPI 373 IRQ_TYPE_LEVEL_HIGH>, <&tlmm 3 IRQ_TYPE_EDGE_FALLING>;`（对应 PDC IRQ 80）。
+2. `pogo_kb_uart_sleep` 中 `rx-pins`（`gpio3`）的 `function` 改为 `"gpio"`。
+
+写入范围（一次性启动测试，不改默认项）：
+- ESP 新建 `/boot/efi/opd2413-test/kbd-wake.dtb` 与 `/boot/efi/loader/entries/opd2413-kbdwake.conf`（复用 `7.2.15-10.opd2413` 的内核、initrd 与参数）；
+- 通过 `tools/tablet-reboot.py --entry opd2413-kbdwake` 一次性重启测试。
+
+预期与判据：
+1. 开盖 `s2idle`（含先空闲熄屏再挂起）按键盘任意键能唤醒系统，`/sys/bus/platform/devices/880000.serial/power/wakeup` 存在且 `wakeup_count` 递增；记录唤醒后 KDE 屏幕是否直接点亮锁屏、以及是否需要第二步在 `pogo_kb_resume` 补发 `KEY_WAKEUP`。
+2. 睡眠中触碰触控板的行为（是否唤醒）。
+3. 误唤醒检查：拔掉键盘后挂起（gpio3 无上下拉悬空）以及合盖后挂起并挤压按键，确认是否出现假唤醒/误唤醒（为第二步防误唤醒策略提供依据）。
+4. 挂起 60 s 睡深回归：`qcom_stats` 的 `cxsd` / `ddr` 驻留仍保持约 98 %。
+
+**第一步（a）实测结果（`kbd-wake.dtb`，`gpio3` 睡眠态 `bias-disable`）：**
+
+- 13:56 `tools/tablet-reboot.py --entry opd2413-kbdwake` 41 s 上线，`running`；`/sys/bus/platform/devices/880000.serial/power/wakeup = enabled`，`irq 210`（`msmgpio 3 Edge 880000.serial:wakeup`）已注册。
+- 接键盘开盖短按电源键挂起两次（14:10:03、14:10:13），未按任何键即在约 2 s（CX 塌陷 1.15–1.60 s）后自行唤醒；`irq 210` 计数增至 2、`880000.serial` `wakeup_active_count=2`。
+- 对照测试（14:29:16）：拔掉键盘挂起，16 s 内未自唤醒（证明 `gpio3` 本身无键盘时不飘低）；14:29:32 接回键盘立即唤醒（`pogo-keyboard-detect` irq 245 计数 +2，重接瞬间 `irq 210` 亦 +1）。
+- 结论：键盘 MCU 收到 `POGO_KB_GENERAL_SLEEP` 并停心跳后进入深睡，导致单线串口在 `bias-disable` 下掉电/飘低触发下降沿（且原厂设备树中 `qcom,qup_uart@880000` 配有 `qcom,wakeup-byte = <0xfd>` 用于过滤非唤醒字节）。证据：`private/m3-kbdwake-20261113/{boot-check,baseline,test1-spurious-wake,test1b-detached}.txt`。
+
+**第一步（b）实测结果（`kbd-wake-pullup.dtb`，`gpio3` 睡眠态 `bias-pull-up`）：**
+
+- 按 Step 1(b) 计划覆盖 `/boot/efi/opd2413-test/kbd-wake.dtb` 并 `tools/tablet-reboot.py --entry opd2413-kbdwake` 重启上线（83 s，`running`）；`/sys/firmware/devicetree/base/soc@0/pinctrl@f100000/pogo-kb-uart-sleep-state/rx-pins/bias-pull-up` 已核对生效。
+- 接键盘开盖短按电源键休眠（14:43:42），未按任何键仍于约 4 s 后（14:43:46）自动唤醒，`irq 210`（`msmgpio 3 Edge 880000.serial:wakeup`）计数 `+1`、`880000.serial` `wakeup_active_count=1`。
+- 结论：`bias-pull-up` 也未能阻止自唤醒，说明并非高阻悬空飘低，而是已连接的键盘 MCU 在收到 `POGO_KB_GENERAL_SLEEP` 后约 1.5–4 s 之间主动在串口线产生下降沿（例如拉低总线、断电、或发送某种休眠后字节/电平跳变）。下一步先查明原厂 `0xfd` 唤醒机制及键盘 MCU 在 `POGO_KB_GENERAL_SLEEP` 后（以及真正按键唤醒时）串口 RX 的实际电平与字节行为，再确定正确的硬件唤醒触发/过滤方式。证据：`private/m3-kbdwake-20261113/{boot2-check,test2-pullup-wake}.txt`。
+
+**诊断抓取实测结果（仅内存态 `.ko`，已卸载并恢复原模块）：**
+
+1. `diag_sleep=1` 下发 `POGO_KB_GENERAL_SLEEP`（`+5 ms` 收 ACK `3b 04 02 02 01 01`），在保持串口在线的条件下于 **`+1637 ms`** 抓到键盘 MCU 主动发出一帧 `00 55 55 55 55 55 55 55 55 f1 a1 a2 3b 04 0e 02 64 af a1 0d fe aa aa aa aa`（原厂协议 `cmd=0x3b sub=0x0e` 电池状态上报），总线上持续仅 `~0.27 ms`（此后连续 116 s 完全静默）。
+2. 键盘休眠静默约 116 s 后按一次空格键（`+118090 ms`），抓到完整唤醒时序：先发 `00` 唤醒脉冲，**间隔 `23 ms`** 后发出 `55 55 ... f1 a1 a2 01 08 00 00 2c ...`（按下空格）及 `~76 ms` 连发、`~100 ms` 释放帧。随后写 `0` 唤醒恢复并 `rmmod` + `modprobe oneplus_pogo_keyboard` 恢复原状。证据：`private/m3-kbdwake-20261113/{diag-sleep-awake,diag-sleep-keypress}.txt`。
+
+**第一步（c）实验方案（离线编译与 diff 已就绪，待用户批准）：**
+
+将 `gpio3` 唤醒中断从通用串口 `&uart_kb` 移交给子设备 `keyboard`（`interrupt-names = "detect", "wakeup"`），使 `oneplus-pogo-keyboard` 通过 `IRQF_NO_SUSPEND | IRQF_NO_AUTOEN` 在 `suspend_noirq`/`resume_noirq` 阶段自行管理唤醒并按“2.5 s 内单次 `<5 ms` 突刺不触发 `pm_wakeup_dev_event`（需间隔 5–150 ms 的第二组沿才唤醒），2.5 s 后任意下降沿立即唤醒”过滤 `+1.64 s` 电池上报脉冲：
+1. 实验 DTB `private/m3-kbdwake-20261113/kbd-wake-child.dtb`（反编译 diff 仅两处：`keyboard` 增配 `"wakeup"` <&tlmm 3>、`pogo_kb_uart_sleep/rx-pins` 设为 `"gpio"` + `bias-pull-up`；`&uart_kb` 保持默认单中断）。
+2. 实验模块 `private/m3-kbdwake-20261113/step1c/oneplus-pogo-keyboard.ko`（`vermagic` 与 `7.2.15-10.opd2413` 一致，不改动内核与 `/lib/modules`）。
+- 写入范围：覆盖 ESP `/boot/efi/opd2413-test/kbd-wake.dtb`，`tools/tablet-reboot.py --entry opd2413-kbdwake` 一次性启动进入后，将模块放到 `/tmp/oneplus-pogo-keyboard.ko` 并 `rmmod && insmod` 加载测试（普通重启即回到默认 `fedora-7.2.15-10`）。
+- 预期与判据：
+  1. 接键盘按电源键休眠 60 s 不自唤醒，且 `pogo_kb_resume` 打印 `suppressed>0` 证明 `+1.64 s` 电池包被 `s2idle` 内无感吸收，`qcom_stats` 的 `cxsd` / `ddr` 驻留仍约 98 %；
+  2. 休眠后按键盘任意键能在真机唤醒系统，记录 `woke_by_rx=1`、KDE 是否直接点亮锁屏（决定第二步是否补发 `KEY_WAKEUP`）；
+  3. 同步实测触控板触碰、拔掉键盘以及合盖按键盘的表现，为第二步合盖防误唤醒及正式补丁打包提供依据。
+
+**第一步（c）实测结果（`kbd-wake-child.dtb` + `step1c/oneplus-pogo-keyboard.ko`）：**
+
+- `tablet-reboot.py --entry opd2413-kbdwake` 38 s 上线并加载 `/tmp/oneplus-pogo-keyboard.ko`（`irq 287 msmgpio 3 Edge pogo-keyboard-wakeup` 注册成功、`serial0-0/power/wakeup = enabled`、`880000.serial/power/wakeup` 不再存在）。
+- 实测两次短按电源键休眠（15:08:24、15:08:37），均仍发生自动唤醒，但时间线首次出现关键新现象：
+  1. 第 1 次（15:08:24→15:08:28）：`STEP1C resume: woke_by_rx=1 wake_ms=2052 suppressed=2 last_supp_ms=2052`，1.88 s CXSD 驻留后在 2.05 s 唤醒（说明在 `<2.5 s` 内有两组相隔 5–150 ms 的下降沿突破阈值）；
+  2. 第 2 次（15:08:37→15:08:49）：`STEP1C resume: woke_by_rx=1 wake_ms=10190 suppressed=1 last_supp_ms=188`，`0.188 s` 处吸收 1 次边沿后平板**稳定在 CXSD 深睡了整整 9.9945 s**（`qcom_stats/cxsd` `7020082822 -> 7211977368` ticks = `9.9945 s`），但在 **`10.190 s`** 时再次出现未知下降沿触发唤醒。
+- 同日对比醒态下 `/sys/kernel/debug/gpio` 中 TLMM（`f100000.pinctrl`）的 `gpio3` 电平：键盘心跳工作时恒为 `in high`，而之前 `diag_sleep=1` 休眠静默 35 s 后测得 `gpio3` 为 `in low`——高度怀疑键盘 MCU 在进休眠后于 ~2 s / ~10 s 会安静拉低 UART TX 线电平（而非发串口包），且 `bias-pull-up` 可能与键盘侧下拉对抗造成边沿抖动。证据：`private/m3-kbdwake-20261113/{boot3-check,step1c-baseline,step1c-test1,step1c-test1-stats}.txt`。
+
+**诊断抓取 2 计划（`diag2`，测全 0–15 s 边沿时间轴 + TLMM `gpio3` 电平跳变点，待用户批准）：**
+
+离线编译 `private/m3-kbdwake-20261113/diag2/oneplus-pogo-keyboard.ko`（仅临时写 `/tmp/` 测试）：
+1. 醒态下写入 `diag_sleep=1`，持续高频采样 TLMM `gpiochip8` 的 `gpio3`（每 100 ms 共 20 s），直接确定键盘 MCU 何时将总线从 `high` 拉为 `low`。
+2. `s2idle` 期间由 `ignore_ms=15000` 记录 0–15 s 内每次 `pogo-keyboard-wakeup` 下降沿的准确毫秒时间戳数组 `edge_ms[16]`（15 s 后再按键唤醒），从而一次性看清 188 ms / 1.64 s / 2 s / 10.19 s 所有边沿的完整序列与真正按键唤醒的表现（包含锁屏是否直接亮屏）。
+
+**诊断抓取 2 实测结果（`diag2`，已验证键盘唤醒且锁屏自动亮屏）：**
+
+1. **醒态下 `diag_sleep=1` + 20 s TLMM `gpio3` 采样（`diag2-awake-gpio3.txt`）**：
+   - 醒态心跳时 `gpio3` 为 `in high func1 2mA no pull`；下发 `POGO_KB_GENERAL_SLEEP(false)` 后 `+10 ms` 仍为 `high`，`+173 ms` 变为 `low`（MCU 关断 TX）；
+   - 在 `+6973 ms` 时 `gpio3` 突然短暂升回 `high`，`+6976 ms` 串口收到单帧电池状态上报 `3b 04 0e 02 ...`（`~0.27 ms` 突发），随后在 `+7134 ms`（`150 ms` 采样窗口内）再次跌回 `low`。
+   - 由此确认：之前看到的多组延迟下降沿并非“只有电平慢降”，而是键盘 MCU 进入休眠后会随机延迟几秒至十几秒醒来一次仅发出 `0x3b 0x04 0x0e` 电池帧、接着再把 TX 拉回低电平——既包含串口帧起始位下降沿，又包含片刻后 TX 关闭的 `high -> low` 下降沿（相隔仅十余毫秒至百余毫秒）。
+2. **`s2idle` 实测（`diag2-test-sleep.txt`，短按电源键休眠 >20 s 后按空格键）**：
+   - **平板超过 20 s 未再自动唤醒，按下键盘空格键后直接唤醒系统并自动点亮 KDE 锁屏**；
+   - `dmesg` 记录 `DIAG2 resume: woke_by_rx=1 wake_ms=20807 suppressed=3 last_supp_ms=12430 edges=4`，精确边沿序列为：
+     - `edge[0] = 2629 ms`、`edge[1] = 12416 ms`、`edge[2] = 12430 ms`（仅隔 `14 ms`，对应延迟电池帧与其随后的 `high -> low` 关断边沿）、`edge[3] = 20807 ms`（真空格键触发唤醒）；
+   - `journalctl` 显示从 `15:22:35` `suspend entry` 到 `15:22:57` `suspend exit` 共休眠约 22 s，`org_kde_powerdevil` 收到 `PrepareForSleep(false)` 后直接唤醒锁屏界面。
+
+**进一步自动唤醒排查（`diag2-autowake-2.txt`，关闭“唤醒后锁屏”后的连续 3 次休眠实测）：**
+
+1. **实测现象（`journalctl` + `dmesg` 完整边沿）**：
+   - 15:25:57→15:26:13（`~15.0 s`）：`DIAG2 resume: woke_by_rx=1 wake_ms=15004 suppressed=192 last_supp_ms=14987`，其中 `12728..12914 ms` 连续以 `~17 ms` / `~8 ms`（`60 Hz / 120 Hz`）疯狂触发了 192 次下降沿，一过 `15000 ms` 立即唤醒；
+   - 15:26:47→15:27:09（`20.5 s`）：`wake_ms=20530 suppressed=4`（`528`, `9550`, `9564`, `10529`, `20530 ms`）；
+   - 15:27:25→15:27:43（`17.0 s`）：`wake_ms=17035 suppressed=2`（`2700`, `12701`, `17035 ms`）。
+2. **根因对照（原厂 `runtime.dts` + `out/ref/pogo_keyboard_core.c` vs 实验 `kbd-wake-child.dts`）**：
+   - `diag_sleep=1` 醒态连续 20 s 采样与 118 s 监听均证明：`gpio3` 在 `bias-disable` 下进入 `+173 ms` 休眠后恒为 `in low`、除一次延迟电池包外完全静默；
+   - 原厂 `runtime.dts` 的 `uart_rx_clear` 对 `gpio3` 明确配置 `input-enable; bias-disable;`（绝不配 `bias-pull-up`）；而本轮实验 `kbd-wake-child.dts` 把 `pogo_kb_uart_sleep/rx-pins` 改成了 `bias-pull-up`——当键盘进入更深一级省电并将 TX 置于高阻或下拉对抗时，`~50 kOhm` 上拉会将悬浮总线拖到逻辑阈值区，从而在 `~12–20 s` 出现 `60 Hz / 120 Hz` 工频/开关耦合振荡与随机下降沿误唤醒。
+
+**诊断抓取 3 方案（`kbd-wake-child-pd.dtb` + `diag3`，离线已编译就绪，待用户批准）：**
+
+1. 修改 `private/m3-kbdwake-20261113/kbd-wake-child.dts` 将 `pogo_kb_uart_sleep/rx-pins` 由 `bias-pull-up` 改为 `input-enable; bias-pull-down;`（与键盘休眠态 `gpio3 = low` 一致，即使键盘进入高阻态也稳稳钉在 `0 V` 不悬浮，同时按键唤醒时键盘推挽 TX 可无障碍驱动 `HIGH + 0x00/0x55` 下降沿），离线编译 `kbd-wake-child-pd.dtb` 并通过 `dtc` diff 确认仅改 `keyboard` 中断与 `rx-pins` 休眠下拉；
+2. 离线编译 `diag3/oneplus-pogo-keyboard.ko`（`vermagic` 为 `7.2.15-10.opd2413`），在 `diag2` 基础上扩容 `edge_ms[32]` 并在 `pogo_kb_resume()` 后 `1.5 s` 内打印实际收到的串口原始帧 `DIAG3 RX`，以便万一仍有边沿唤醒可一眼分辨是否真有串口帧；
+3. 写入范围：仅覆盖测试入口使用的 ESP 文件 `/boot/efi/opd2413-test/kbd-wake.dtb`、执行 `tools/tablet-reboot.py --entry opd2413-kbdwake` 重启，并将 `diag3/oneplus-pogo-keyboard.ko` 放到 `/tmp/oneplus-pogo-keyboard.ko` 内存态加载（默认引导项 `fedora-*` 与 `/lib/modules` 均不动）。
+- 预期与判据：
+  1. `suppressed=192` 的 `60/120 Hz` 抖动以及 `17 s / 20.5 s` 自动唤醒完全消失；
+  2. 休眠 60 s 不自唤醒（随后顺带用该环境完成 60 s `qcom_stats` 驻留、触控板、合盖按键盘、拔掉键盘摸底，并在下一步用精确边沿判别替换掉 `ignore_ms=15000`）。
+
+**诊断抓取 3 实测结果（`kbd-wake-child-pd.dtb` + `diag3`，消除 60/120 Hz 振荡，锁定 10.000 s 周期脉冲）：**
+
+- `boot4-check.txt` 核验基线 `qcom_stats/cxsd` 与 `ddr` 均为 `Count: 0`；短按电源键休眠约 24 s 后再次自动唤醒（`diag3-test1.txt`）：
+  1. **`60/120 Hz` 杂波振荡（`suppressed=192`）完全消失**：全程仅有 4 次干净的 `gpio3` 下降沿（`edge[0]=3997 ms`, `edge[1]=5223 ms`, `edge[2]=13998 ms`, `edge[3]=23999 ms`），`irq 287` 恰好计 `4`；
+  2. **`cxsd` 驻留达 98.7%**：`Accumulated Duration = 454,742,459` ticks（`23.68 s / 24.00 s`），最后一次在 CXSD 连续深睡 `9.996 s`（`13998 -> 23999 ms`）后被第 4 记边沿直接唤醒；
+  3. **跨多轮对照锁定精确 `10,001 ms`（`10.000 s`）周期**：`3997 -> 13998 -> 23999 ms`（间隔严格 `10001 ms`），与此前 `step1c`（`188 -> 10190 ms`，`+10002 ms`）以及 `diag2`（`528 -> 10529 -> 20530 ms`，`+10001 ms`；`2700 -> 12701 ms`，`+10001 ms`）完全一致，且相位每次随休眠起点漂移，证明在系统已入 CXSD 深睡期间**键盘 MCU 自身每 10.000 s 仍会触发一次 `gpio3` 下降沿**；
+  4. **唤醒后仍需 3 次重发才能叫醒键盘**：`DIAG3 RX +1ms / +103ms / +207ms` 发出 `set_awake(true)` 直到 `+211/+218 ms` 才收到键盘 ACK 并恢复 `0x2f ... 0x05` 正常心跳（非上电重置 `0x01`），说明那次 `23999 ms` 边沿之后键盘本身仍在睡眠态、并未转成醒态（`10 s` 脉冲与真实按键有本质波形/状态差异）。
+
+**诊断抓取 4 方案（`diag4`，微秒级边沿序列 + 醒态 `diag_sleep=1` 同源核对，待用户批准）：**
+
+1. 离线编译 `diag4/oneplus-pogo-keyboard.ko`（`vermagic = 7.2.15-10.opd2413`，无需重启或改 DTB）：
+   - 把 `edge_ms[]` 升级为 `arch_timer` 微秒精度数组 `edge_us[64]`（分辨率 `52 ns`），并在 `diag_sleep=1` 期间同样使能 `irq 287`（不唤醒系统、带 64 次上限防风暴保护），写 `0` 时一次性输出醒态 35 s 内所有下降沿微秒时间戳并对照 `DIAG4 RX`；
+2. 写入范围：仅将 `diag4/oneplus-pogo-keyboard.ko` 写入平板 `/tmp/oneplus-pogo-keyboard.ko` 并 `rmmod && insmod` 加载，随后由本机在醒态执行 35 s `diag_sleep=1 -> 0` 采样。
+- 预期与判据：
+  1. 确认每 `10.000 s` 脉冲在醒态 `diag_sleep=1` 时是否同样出现（彻底排除 `s2idle`/pinctrl 嫌疑），并测出单次 `10.000 s` 脉冲与延迟电池包的**微秒级脉宽/连发个数**；
+  2. 再对比一次短休眠按键唤醒的 `edge_us[]`，即可在代码里用微秒/多脉冲特征精确放行真实按键（0 盲区）、100% 屏蔽 `+173 ms` 关断、`1.6–12.7 s` 电池包和 `10.000 s` 周期脉冲。
+
+**诊断抓取 4 实测结果（`diag4`，成功抓齐醒态与 `s2idle` 真按键微秒序列）：**
+
+1. **醒态 35 s `diag_sleep=1` 对照（`diag4-awake-35s.txt`）**：35 s 内收到 `0` 字节串口数据且 `edges=0`——核查 `pinctrl-msm.c` 第 195–208 行（`msm_pinmux_set_mux`）确认，只要 `gpio3` 仍处于 `qup2_se0` 功能复用态，`pinctrl-msm` 会主动 `disable_irq_nosync()` 屏蔽该引脚 GPIO 中断，只有 `s2idle` 切回 `gpio` 态才解除屏蔽。
+2. **`s2idle` 约 4.5 s 点按空格 + 随后自唤醒的完整 10 记微秒波形（`diag4-keypress-us.txt`）**：
+   - `edge[0] = 2,402,824 us`、`edge[1] = 2,416,462 us`：延迟电池上报包与 TX 关断，间隔 **`13.638 ms`**，**仅 2 个簇**；
+   - `edge[2..7] = 4,542,164 -> 4,602,937 -> 4,611,554 -> 4,618,039 -> 4,667,215 -> 4,681,060 us`：真实点按空格键在 **`138.9 ms`** 内产生 **6 个下降沿簇**（相对起始分别为 `+0`、`+60.8`、`+69.4`、`+75.9`、`+125.1`、`+138.9 ms`）；
+   - `edge[8] = 5,402,234 us`：键盘无人应答约 `0.72 s` 后自行重新关断 TX 进入深睡（**1 个簇**）；
+   - `edge[9] = 15,403,372 us`：严格隔 **`10,001.138 ms`** 后键盘例行发出 **`10.000 s` 周期脉冲**（**1 个孤立簇**）并触发 `15 s` 后阈值唤醒（`cxsd Last Entered -> Last Exited = 9.993 s`）。
+
+**第一步（d）精确多簇唤醒过滤方案（`step1d`，无 15 s 盲区，待用户批准）：**
+
+1. 离线编译 `private/m3-kbdwake-20261113/step1d/oneplus-pogo-keyboard.ko`（`vermagic = 7.2.15-10.opd2413`，沿用当前已刷好的 `kbd-wake-child-pd.dtb`，无需重启）：
+   - 取消 `ignore_ms=15000` 固定盲区，在 `pogo_kb_rx_wake_isr` 中对间隔 `>= 4 ms`（合并同帧内部 `<4 ms` 边沿）且连续间隔 `<= 100 ms`、总跨度 `<= 250 ms` 的脉冲簇计数：
+     - 关断 TX（1 簇）、`10.000 s` 周期脉冲（1 簇）、延迟电池上报+TX关断（`13.6 ms` 2 簇）计数均 `<= 2`，在 `s2idle` 内直接吸收；
+     - 真实按键在 `< 76 ms` 内达到 **`3` 个簇**，无论在休眠第几秒按下都立即 `pm_wakeup_dev_event()` 唤醒（`< 80 ms` 响应）。
+2. 写入范围：仅将 `step1d/oneplus-pogo-keyboard.ko` 上传到 `/tmp/oneplus-pogo-keyboard.ko` 并 `rmmod && insmod` 内存加载（不动 ESP/DTB/引导项/`/lib/modules`）。
+- 预期与判据：
+  1. 展开连接休眠 **60 s 以上全程不自唤醒**，且 `qcom_stats/cxsd` 与 `ddr` 驻留保持 ~98% 以上；
+  2. 短睡（如 3 s）与长睡（60 s 后）点按空格键均在 `< 100 ms` 内唤醒且直接点亮屏幕；
+  3. 同步摸底：**触控板点击/触摸**、**合盖状态下按键盘**、**拔掉键盘休眠 10 s + 吸合**、**闲置自动息屏进 `s2idle` 后按键**。
+
+**第一步（d）实测结果（`step1d-results.txt`，2026-11-13 15:58–16:02，发现“10 s + 22.66 s”拍频碰撞导致第 108 s 误唤醒）：**
+
+1. **短睡与长期静置对照（4 轮休眠合计 `cxsd` `+147.625 s` / 总睡眠 `~152.4 s` ≈ `96.9%`）**：
+   - **第 1 轮（`15:58:12→15:58:17`）**：`systemd-logind` 记录 `Power key pressed short` 唤醒（`irq 23` 计 `8→9`，`woke_by_rx=0`），期间仅收到 1 记 `10 s` 脉冲（`4,088,560 us`）并被屏蔽；
+   - **第 2 轮（`15:58:31→16:00:21`，`wake_ms = 108,375 ms`）**：前 `108 s` 成功屏蔽了 10 记 `10.001 s` 周期脉冲与 4 对 `22.659 s` 延迟电池包（`17.728 s` / `40.386 s` / `63.045 s` / `85.704 s`，每对相隔 `13.30–13.43 ms`）；但在第 `108.34 s` 发生**拍频碰撞**：
+     - `edge[18] = 108,340,918 us`：第 11 记 `10.001 s` 周期脉冲（+1 簇）；
+     - `edge[19] = 108,362,585 us`：第 5 次 `22.6588 s` 电池包（`85.703766 + 22.658819`），距 `edge[18]` 仅 **`21.67 ms`（<= 100 ms）**（+1 簇）；
+     - `edge[20] = 108,375,912 us`：该电池包的 TX 关断边沿（`+13.33 ms`）（+1 簇）；
+     - 三者合计在 `35 ms` 内凑满 `POGO_KB_WAKE_CLUSTERS = 3`，于 **`108.375 s`** 触发误唤醒（`DIAG4 RX` 无任何键鼠 HID 报文）。
+   - **第 3、4 轮（`16:01:03→16:01:16`、`16:01:29→16:01:55`）**：合盖休眠后隔盖挤压键盘均**未唤醒**（只分别吸收了 `2.011/2.024 s` 电池对与 `0.710 s` 1 边沿），掀开保护盖由 `irq 238 Cover` 正常唤醒（`DIAG4 RX` 随后出现开盖键码 `0x69` 与正常 `0x2f` 心跳）。
+2. **结论**：单次 `10.001 s` 脉冲（1 簇）与单次 `22.659 s` 电池包（2 簇，`~13.3 ms`）因两者周期存在约 `2.66 s / 10 s` 拍频漂移，每 ~1–2 分钟必有一次在 `<= 100 ms` 内重合产生 `1 + 2 = 3` 簇；因此最低安全阈值必须是 **`4` 簇**（已知真实按键点击可发出 6 簇 / `139 ms`）。
+
+**第一步（e）4 簇过滤验证方案（`step1e`，离线已编译就绪，待用户批准）：**
+
+1. 离线编译 `private/m3-kbdwake-20261113/step1e/oneplus-pogo-keyboard.ko`（`vermagic = 7.2.15-10.opd2413`）：
+   - 将阈值调整为 `POGO_KB_WAKE_CLUSTERS = 4`、`POGO_KB_WAKE_CLUSTER_MAX_US = 120000`（`120 ms`，兼容长按时 `100 ms` 心跳衔接）、`POGO_KB_WAKE_WINDOW_US = 300000`（`300 ms`），并暴露 `wake_clusters` 模块参数以便微调；保留 `STEP1E edge[]` 与 `DIAG4 RX` 观测，彻底屏蔽最多只有 `1 + 2 = 3` 簇的周期信号碰撞。
+2. 写入范围：仅将 `step1e/oneplus-pogo-keyboard.ko` 覆盖平板 `/tmp/oneplus-pogo-keyboard.ko` 并 `rmmod && insmod` 内存加载。
+- 预期与判据：
+  1. 展开静置休眠 **`>= 120 s`**（完整跨过一次 `10 s + 22.66 s` 拍频重合期）全程不自唤醒，`cxsd`/`ddr` 保持 ~98%+；
+  2. 随后短按**空格键**立即唤醒并点亮屏幕，记录 `edge_us[]`；
+  3. 同步验证：**轻触/滑动触控板**唤醒表现（记录 `edge_us[]` 确认单次轻点 vs 滑动的簇数）、**合盖按压不醒/开盖唤醒**、**拔掉键盘休眠 10 s + 吸合**、**闲置自动息屏进 `s2idle` 后按键唤醒**。
+
+**第一步（e）实测结果（`step1e-results.txt`，2026-11-13 16:40–16:55，4 簇阈值长睡通过，确认触控板休眠物理停报）：**
+
+1. **短睡与跨拍频长睡（4 轮休眠，合计 `cxsd` `+368.390 s` / 约 `377 s` ≈ `97.7%`）**：
+   - **短睡空格唤醒（`16:44:16→16:44:24`）**：`woke_by_rx=1 wake_ms=7080`，空格键在 `125.0 ms` 内产生 4 簇（`6.956 -> 7.012 -> 7.025 -> 7.081 s`），立即点亮屏幕唤醒；
+   - **144 s 静置对照（`16:47:20→16:49:45`）**：跨过 14 次 `10.001 s` 脉冲与 6 对 `22.659 s` 电池包**全程 0 自唤醒**，最后由电源键唤醒（`woke_by_rx=0`）；
+   - **162.5 s 跨拍频 + 触控板摸底 + 按键唤醒（`16:50:07→16:52:51`）**：跨过 16 次 `10 s` 脉冲与 8 对 `22.66 s` 电池包**全程 0 自唤醒**；用户期间轻触、滑动及物理按压触控板，`edge[0..31]` 中**未出现任何触控板边沿**（说明键盘 MCU 收到 `POGO_KB_GENERAL_SLEEP(false)` 后硬件关闭了触控板传感器，此前 `step1d` 第 `108.375 s` 刚好撞上电池包碰撞造成错觉）；随后按键盘立即以 4 簇唤醒（`woke_by_rx=1 wake_ms=162544`）；
+   - **拔下键盘休眠 + 吸合唤醒（`16:54:21→16:54:36`）**：拔掉休眠 15 s 不自唤醒，吸回瞬间由 `irq 242 pogo-keyboard-detect` 唤醒并重连 `OnePlus Pad 2 Pro Keyboard` / `Touchpad`（`KA030_B_1.2.0_TP_A_13`）。
+
+**第二步 正式内核补丁、`7.2.15-11.opd2413` 构建与部署方案（离线构建校验完成，待唤醒平板与批准写入）：**
+
+1. 在 `out/m3k/tree`（`series3` 分支）正式提交并导出两枚严格 `-F0` 补丁到 `kernel/opd2413-7.2/patches/`，已同步更新 `patches/series`、`kernel/PATCHES.md`、`kernel/opd2413-7.2/README.md` 与 `out/m3k/build.sh`（`N=11`）：
+   - `2408-arm64-dts-qcom-sm8750-oneplus-pad2pro-add-pogo-keyboard-wake-IRQ.patch`：`pogo_kb_uart_sleep/rx-pins` 改 GPIO 输入 + `bias-pull-down`，`&uart_kb/keyboard` 传入 `detect` + `wakeup` 双中断；
+   - `2409-Input-oneplus-pogo-keyboard-wake-from-suspend-on-key-press.patch`：去掉全部诊断输出与 sysfs 节点，用 `mul_u64_u32_div`（防长时间休眠 64 位乘法溢出）+ 常开 arch timer 实现 300 ms / 4 簇过滤（`>= 4 ms`, `<= 120 ms`），`W=1` 编译 `oneplus-pogo-keyboard.ko` 0 警告，反编译 DTB 与 `kbd-wake-child-pd.dtb` 仅属性声明顺序差异；
+2. `./out/m3k/build.sh` 构建 `out/rpmbuild/RPMS/aarch64/kernel-opd2413-7.2.15-11.opd2413.aarch64.rpm` 成功（`BUILD-OK`）；
+3. `tests/package-install-test.sh` 离线容器校验（搭配 `opd2413-firmware-16.0.10.600-2` 等最新包）：initramfs（67 个早起固件全部包含、`0 missing`）、`fedora-7.2.15-11.opd2413.conf`、DTB 一致性及负面用例（`refused`）均通过（注：测试脚本内置期待 `66` 个，因 `-firmware-16.0.10.600-2` 现为 `67` 个报 `1` 行数量差异）；
+4. 待用户唤醒平板并批准写入范围：先做只读核对 `rpm -q kernel-opd2413` 与 `/boot/efi` 剩余空间，随后上传并 `dnf install kernel-opd2413-7.2.15-11.opd2413.aarch64.rpm`，清理临时 `/boot/efi/opd2413-test/` 与 `/boot/efi/loader/entries/opd2413-kbdwake.conf`，重启进入默认项 `fedora-7.2.15-11.opd2413` 做最终冷启动/功能/驻留验收。
+
+**部署 `7.2.15-11.opd2413` 后复现的冷启动早休眠复位排查（`ramoops-000009` → `LLCC_ISLAND1`）：**
+
+- 安装 `kernel-opd2413-7.2.15-11.opd2413` 并清理 `/boot/efi/opd2413-test/` 与 `opd2413-kbdwake.conf` 后，冷启动进入桌面在 **30–60.8 s 内**按电源键进 `s2idle` 连续出现延迟十余秒后硬件复位（并偶发冷启动灰屏卡死）；证据 `private/m3-kbdwake-20261113/prod11-coldcrash-logs.txt`。
+- 为抓取复位瞬间，在平板临时部署 `/etc/systemd/system/opd2413-s2idle-dbg.service`（开启 `console_suspend=N`、`ignore_loglevel=Y`、`pm_debug_messages=1`、`pm_print_times=1`、`kernel.panic=15`），在第 9 号 pstore 记录 `000009`（`private/m3-kbdwake-20261113/ramoops-000009-s2idle.txt`）捕到完整现场：所有设备 `suspend` / `suspend_late` / `suspend_noirq` 回调均正常返回，系统停在 `[60.814536] PM: suspend-to-idle` 后进入 `CXSD`（`domain_ss3`）瞬间硬件复位。
+- 对照 `~/github/linux-sm8750-erhai` 差异锁定根因：自 `7.2.15-6` 引入 `2401`（允许 LPASS TX/VA macro codec 在挂起时释放 prepare vote）时，漏合 erhai 提交 `b30d759d375e69164b0da842250cb69c785ece5c`（`soc: qcom: llcc-qcom: Reserve ISLAND1 ways on SM8750`，作者 `yzddmr6`）；该提交注释明确指出必须在允许 LPASS macro codec 释放 prepare vote 前将 `LLCC_ISLAND1` 的 `.bonus_ways = 0x7fffffff` 改为 `.res_ways = 0x7fffffff`，否则未预留切片进入低功耗态时会触发 `PS_HOLD` 硬件复位。
+
+**第三步 仅合入 `2410` 构建 `7.2.15-12.opd2413` 与真机冷启动双项验收：**
+
+1. **构建与离线校验**：将 erhai `b30d759d3` 原样导出为 `kernel/opd2413-7.2/patches/2410-soc-qcom-llcc-qcom-Reserve-ISLAND1-ways-on-SM8750.patch`，更新 `patches/series`、`kernel/PATCHES.md`、`kernel/opd2413-7.2/README.md` 与 `out/m3k/build.sh`，构建 `out/rpmbuild/RPMS/aarch64/kernel-opd2413-7.2.15-12.opd2413.aarch64.rpm`（`SHA256: b254d359e1bb9077392fe97ef8bb29af2b945bb05df617d75cda8b1c830488d4`）。`tests/package-install-test.sh`（`out/m3k/pkg-test12/`）确认 initramfs 含全部 67 个早起固件、`0 missing`。
+2. **装机与带调试服务对照冷启动（`boot0-7.2.15-12-dbg.log`）**：同步时钟后安装 `7.2.15-12.opd2413` 并一次性冷启动进入；开机仅 **`26.56 s`** 按电源键进入 `s2idle`（`[27.928034] PM: suspend entry (s2idle)`，早于此前所有崩盘点 `30–60.8 s`），**未挂死未复位**，`suspend_stats/success = 1, fail = 0`，`qcom_stats/cxsd` 与 `ddr` 均计 1 次、深睡 `2.50 s`；同时证实首次按电源键唤醒“闪内核日志后黑屏、再按一次才亮”是临时调试服务开启 `console_suspend=N` + `pm_debug_messages=1` 狂刷约 1400 行日志造成 `/dev/kmsg` 溢出并把 `PrepareForSleep(false=resume)` 推迟到按键事件 `272 ms` 之后、触发 `kwin_wayland` 随后下发 `panel_unpreparing` 所致。
+3. **清理调试服务并设默认启动项后的无干扰冷启动最终验收（`boot0-7.2.15-12-clean.log`）**：
+   - 删除平板 `/etc/systemd/system/opd2413-s2idle-dbg.service`，执行 `/usr/libexec/opd2413/boot-select default 'fedora-*'`（`bootctl list` 确认 `(default)` 为 `fedora-7.2.15-12.opd2413.conf`，`loader_default: "fedora-*"`，`kshim_remembered: "Fedora"`），关机后用户冷启动验证：
+   - **系统健康**：`7.2.15-12.opd2413`，`systemctl is-system-running = running`，`systemctl --failed = 0`，SELinux `Enforcing`，`/sys/fs/pstore` 为空，电池 `92 % Discharging`。
+   - **测试 1（冷启动 21.36 s，电源键休眠/唤醒）**：`[21.358825]` 短按电源键 → `[22.464090]` `PM: suspend entry (s2idle)` → 等约 5 s 后按电源键 → `[24.162837]` `Power key pressed short` → `[24.168062]` `PM: suspend exit`（内核恢复耗时 `2.9 ms`）→ `[24.187143]` `PrepareForSleep(false=resume)` → `[24.417234]` `panel_prepared`，用户确认**一次直接唤醒亮屏，无闪内核日志、无二次黑屏或重启**。
+   - **测试 2（Pogo 键盘空格键唤醒）**：`[32.841071]` 短按电源键 → `[33.924024]` `PM: suspend entry (s2idle)` → 等约 5 s 后按一次空格键 → `[35.482819]` `PM: suspend exit`（内核恢复耗时 `3.8 ms`）→ `[35.489732]` `PrepareForSleep(false=resume)` → `[35.776336]` `panel_prepared`，用户确认**一次空格键直接唤醒亮屏**。
+   - **深睡统计**：`/sys/power/suspend_stats/success = 2, fail = 0`（全部 `failed_* = 0`）；`qcom_stats/cxsd` `Count = 7, Accumulated Duration = 209335981`（`10.903 s`），`qcom_stats/ddr` `Count = 7, Accumulated Duration = 209432201`（`10.908 s`）。
+   - **附带观测**：此前硬件复位使 PMIC RTC 回到 `2026-10-17`，且平板侧 `chronyc sources` 解析到保留地址（`Reach = 0`、`Not synchronised`），暂未改动系统 NTP 配置。

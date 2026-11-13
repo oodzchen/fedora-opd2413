@@ -1,0 +1,51 @@
+From a609bfa9c3c24d4860f52f88fc3d61e934a5b430 Mon Sep 17 00:00:00 2001
+From: Kholin <oodzchen@gmail.com>
+Date: Fri, 13 Nov 2026 17:03:56 +0800
+Subject: [PATCH] arm64: dts: qcom: sm8750-oneplus-pad2pro: add pogo keyboard
+ wake IRQ
+
+During s2idle the pogo keyboard MCU notifies the host of a key press by toggling its shared UART TX (host RX, gpio3) line, while its detect line (gpio96) remains low the entire time the keyboard is attached.
+
+Configure the sleep pinctrl state of rx-pins (gpio3) as input with bias-pull-down so it matches the keyboard MCU idle-low TX level instead of floating at 60/120 Hz when the keyboard enters deep sleep, and pass gpio3 as the second interrupt ("wakeup") on &uart_kb/keyboard.
+
+Co-Authored-By: Antigravity <noreply@deepmind.google>
+---
+ .../arm64/boot/dts/qcom/sm8750-oneplus-pad2pro.dts | 14 +++++++++++---
+ 1 file changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/qcom/sm8750-oneplus-pad2pro.dts b/arch/arm64/boot/dts/qcom/sm8750-oneplus-pad2pro.dts
+index 7ee1c20f2..b1c419b2a 100644
+--- a/arch/arm64/boot/dts/qcom/sm8750-oneplus-pad2pro.dts
++++ b/arch/arm64/boot/dts/qcom/sm8750-oneplus-pad2pro.dts
+@@ -2178,9 +2178,15 @@ tx-pins {
+ 
+ 		rx-pins {
+ 			pins = "gpio3";
+-			function = "qup2_se0";
++			/*
++			 * Switch RX to input + pull-down in sleep so it matches
++			 * the keyboard MCU idle-low TX state and acts as a GPIO
++			 * wake IRQ without floating at 60/120 Hz.
++			 */
++			function = "gpio";
+ 			drive-strength = <2>;
+-			bias-disable;
++			input-enable;
++			bias-pull-down;
+ 		};
+ 	};
+ 	camera_front_reset_default: camera-front-reset-state {
+@@ -2262,7 +2268,9 @@ keyboard {
+ 		vdd-supply = <&pogo_kb_pwr>;
+ 		tx-enable-gpios = <&tlmm 83 GPIO_ACTIVE_HIGH>;
+ 		detect-gpios = <&tlmm 96 GPIO_ACTIVE_LOW>;
+-		interrupts-extended = <&tlmm 96 IRQ_TYPE_EDGE_FALLING>;
++		interrupts-extended = <&tlmm 96 IRQ_TYPE_EDGE_FALLING>,
++				      <&tlmm 3 IRQ_TYPE_EDGE_FALLING>;
++		interrupt-names = "detect", "wakeup";
+ 		current-speed = <921600>;
+ 		wakeup-source;
+ 
+-- 
+2.56.0
+
