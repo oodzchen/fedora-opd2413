@@ -1,0 +1,48 @@
+From 02c381131d79a37f2f2f1ae3eee8ea48c4db9f52 Mon Sep 17 00:00:00 2001
+From: build <build@localhost>
+Date: Sat, 14 Nov 2026 19:51:00 +0800
+Subject: [PATCH 2415/2417] backlight: ktz8866: turn off bootloader-active
+ KTZ8868 on first disable
+
+The bootloader leaves KTZ8868 active (BL_CTRL=0x01, BL_EN=0x77) across EFI handoff while ktz->led_on starts false at probe. When led-backlight or backlight_disable() writes brightness=0, ktz8868_update_brightness() previously skipped clearing KTZ8868_BL_CTRL and BL_EN, leaving the LED boost active. Check hardware BL_CTRL/BL_EN when !ktz->led_on so first disable cleanly powers down the backlight.
+---
+ drivers/video/backlight/ktz8866.c | 19 +++++++++++++++++--
+ 1 file changed, 17 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/video/backlight/ktz8866.c b/drivers/video/backlight/ktz8866.c
+index 6ee15c716..5349597d4 100644
+--- a/drivers/video/backlight/ktz8866.c
++++ b/drivers/video/backlight/ktz8866.c
+@@ -118,12 +118,27 @@ static int ktz8868_update_brightness(struct ktz8866 *ktz,
+ 				     unsigned int brightness)
+ {
+ 	if (brightness == 0) {
+-		if (ktz->led_on) {
++		unsigned int ctrl = 0, en = 0;
++		bool hw_on;
++
++		/*
++		 * The bootloader leaves KTZ8868 active across EFI handoff while
++		 * ktz->led_on starts false; check hardware state on first off.
++		 */
++		if (!ktz->led_on) {
++			regmap_read(ktz->regmap, KTZ8868_BL_CTRL, &ctrl);
++			regmap_read(ktz->regmap, BL_EN, &en);
++			hw_on = (ctrl & 1) || (en != 0);
++		} else {
++			hw_on = true;
++		}
++
++		if (hw_on) {
+ 			ktz8866_write(ktz, KTZ8868_BL_CTRL, 0);
+ 			msleep(9);
+ 		}
+ 		ktz8866_set_brightness(ktz, 0);
+-		if (ktz->led_on) {
++		if (hw_on) {
+ 			ktz8866_write(ktz, BL_EN, 0);
+ 			ktz->led_on = false;
+ 		}
+-- 
+2.56.0
+

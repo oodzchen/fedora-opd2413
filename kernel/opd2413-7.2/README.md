@@ -60,3 +60,4 @@
 | `7.2.15-12` | M3.3 s2idle 修复 `2410`（erhai `b30d759d3`：`LLCC_ISLAND1` 使用 `res_ways = 0x7fffffff` 替代 `bonus_ways`，修 `2401` 引入后冷启动早休眠在 `PM: suspend-to-idle` 后触发 `PS_HOLD` 复位的问题） |
 | `7.2.15-18` | 显示与夜览：`2411`（按共享 `hw_ctl` 延后一次 `phys_cleanup`，保持 `phys_0 -> phys_1` 停用顺序）、`2412`（预分配 DSPP 且不因 `ctm` 强制 `mode_changed`）、`2413`（恢复 `60/30 Hz`） |
 | `7.2.15-22` | 显示 `2414`（`dpu_encoder_virt_atomic_disable()` 按 `new_state && new_state->active` 仅对在线 modeset 跳过 `INTF_MODE_VIDEO` 的 `trigger_flush`/`trigger_start`，解决 `-18` 手动 60 Hz 切换卡死与 `-20`/`-21` DPMS 超时互斥；技术债记为 `#36`/`#37`） |
+| `7.2.15-23` | 开机灰闪 `2415`–`2417`（`ktz8866`/`led_bl` 同步真实关断 bootloader 遗留背光，`dispcc-sm8750` 延迟到 `led-backlight` 就绪并关断背光后再注册/停泊 `mdp_clk_src`；TECH-DEBT `#9`） |

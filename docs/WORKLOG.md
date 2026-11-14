@@ -1665,3 +1665,194 @@ mpv、Firefox 仍是软解（Fedora `ffmpeg-free` 的专利限制），用户选
       5. **用户手动测试**：用户确认桌面手动操作（切换刷新率、夜览、息屏亮屏、触控等）没有问题。
     - **诚实记录技术债**：在 [TECH-DEBT.md](TECH-DEBT.md) 正式登记 `#36`（`2414` 为基于 `new_state->active` 的状态规避而非寄存器级根修，且仍走非无缝 disable/enable）与 `#37`（快速切换时 `nt36536` 偶发 `nvt_ts_resume 2139: -112` 竞争日志）。
     - **切换默认项、清理旧内核与默认重启复核**：经用户确认后执行 `/usr/libexec/opd2413/boot-select default fedora-7.2.15-22.opd2413.conf` 并 `rpm -e kernel-opd2413-7.2.15-18.opd2413`（保留 `7.2.15-12.opd2413` 回退，ESP `/dev/sda16` 已用 `247M` / 剩余 `266M`、`49%`）；随后执行无参默认重启，设备 `49 s` 自动拉起 `7.2.15-22.opd2413`（`systemctl is-system-running = running`，`systemctl --failed = 0`，SELinux `Enforcing`）。
+
+---
+
+## 2026-11-14 开机灰闪（TECH-DEBT #9）根因与 `2415`
+
+**只读取证（13:55，`7.2.15-22` 本次开机的 dmesg）：** `0.237 s` efifb 注册（`quiet`，fbcon 推迟接管，不画字）→ `0.294/0.308 s` 两颗 KTZ8868 探测 → `0.439 s` `1407` 停 ABL 扫描输出（此时 INTF 仍在出帧：`line 2448/2450 frame 2149/2149`）→ `0.859 s` 面板 prepare → `1.114 s` fbcon 接管 msm 帧缓冲，屏幕第一次出字。用户说的"内核日志出现之前"就是内核 0–1.1 s 这一段。`/var/lib/opd2413-pstore/` 的 20 条记录都是正常 `reboot: Restarting system` 的尾巴，没有灰屏卡死那几次的现场。
+
+**根因候选（源码）：** `drivers/clk/qcom/dispcc-sm8750.c` 里 `disp_cc_mdss_mdp_clk_src` 用的是 `clk_rcg2_shared_ops`，它的 `.init`（`clk_rcg2_shared_init`）在 dispcc **注册时**调 `clk_rcg2_shared_disable()`，把 RCG 停到 XO（19.2 MHz）。dispcc 是内建的（`CONFIG_SM_DISPCC_8750=y`），在内核早期就探测。这时 ABL 的 3392×2400@120 Hz 双 DSI 扫描输出仍由这个 RCG 供时钟（来自 `disp_cc_pll0`；`clk_taycan_elu_pll_configure` 发现 PLL 已开会跳过，不是问题），MDP 核心时钟被骤降，DPU 取不到帧，液晶显示灰色，直到 msm 接管、面板重新初始化。
+
+佐证：
+- 上游 `dispcc-sc8280xp`、`dispcc-x1e80100`、`dispcc-eliza` 对同一个 `mdss_mdp_clk_src` 都已改用 `clk_rcg2_shared_no_init_park_ops`；SM8750（本树和 erhai `70b572544`）没改。
+- 11-11 M3a 第 4 次（`initcall_blacklist=msm_drm_register`，不加载 msm）照样灰屏而且一直不恢复；第 11 次 earlycon 打完日志后同样变灰白。说明触发点在 msm 之外、更早的地方。
+- 以前在 msm/背光侧的 `1409`（停输出前先关背光）和 armada `grey1`（`1410`，探测时关灯）都没改善灰闪。
+
+**改动（单变量）：** `2415-clk-qcom-dispcc-sm8750-don-t-park-mdp_clk_src-at-reg.patch`，只把这一个 RCG 的 ops 换成 `clk_rcg2_shared_no_init_park_ops`（注册时只读回 CFG，RCG 保持 ABL 配置，直到 msm 接管或 `clk_disable_unused()` 时才停）。`HEAD~1` 上 `patch -F0` 无模糊合入。构建 `7.2.15-23.opd2413`（`out/m3k/build-23.log`）。
+
+**上机前写好的预期和判据：**
+- 安装方式：`dnf install` 新内核，默认项保持 `fedora-7.2.15-22.opd2413.conf`，`tools/tablet-reboot.py --entry fedora-7.2.15-23.opd2413` 一次性引导。
+- 通过：选完 kShimC 的 Fedora 后，进度条走完到出字/出桌面之间**不再出现灰屏**，只应看到进度条画面 → 黑（`1409` 关背光、`1407` 停输出）→ 字/桌面。用户肉眼观察，冷启动（`systemctl poweroff` 插电自动开机）和重启各至少 3 次，全部无灰闪；dmesg 没有新增 clk/dispcc/mdss 报错，`bootloader scanout:` 行仍正常；进桌面后显示、刷新率切换、DPMS、s2idle 回归正常。
+- 失败：灰闪照旧 → 否定这个根因，回到 `-22`，下一步用 `initcall_debug` 对时间轴定位 dispcc、gpucc、interconnect 各自的探测点。
+- 偶发的"灰屏卡住后自动重启"出现频率低，这批测试次数不够证明它也消失了，单独长期观察，不拿它当本次的通过判据。
+
+**离线结果（14:08）：** `7.2.15-23` `BUILD-OK`，`kernel-opd2413-7.2.15-23.opd2413.aarch64.rpm` SHA256 `e4482d81b687f1ace8aba6e43dc533ed5ff61719d1f4574114b41727b83d22e4`。`nm dispcc-sm8750.o` 同时引用 `clk_rcg2_shared_no_init_park_ops`（mdp）和 `clk_rcg2_shared_ops`（ahb/esc0/esc1，未动）。`tests/package-install-test.sh out/m3k/rpms23 out/m3k/pkg-test23`：条目、ESP、DTB 一致、缺固件拒绝都通过，initramfs 67 个早期固件 0 缺失；唯一的 FAIL 是脚本第 78 行写死 66（固件 600-2 起是 67，和 11-13 的情况一样，测试常量没更新）。
+
+**真机结果（14:25）：真机失败。** 安装 `7.2.15-23.opd2413` 并选择启动后，仍出现灰屏，且在灰屏处卡死数秒后黑屏自动重启；因尚未挂载根文件系统，`opd2413-boot-restore.service` 未能执行，导致“重启 -> 自动选 -23 -> 灰屏卡死 -> 黑屏重启”循环，直至用户通过 kShimC `"Fedora boot menu"` 手动选择 `7.2.15-12.opd2413` 才打断循环并恢复 `loader_default` 为 `fedora-7.2.15-22.opd2413.conf`。因带 `quiet loglevel=3` 且未进用户态，pstore 无控制台日志。**证伪：** 在 `sm8750` 上仅把 `disp_cc_mdss_mdp_clk_src` 改为 `clk_rcg2_shared_no_init_park_ops` 不能消除灰屏，且会引发早于挂载根的卡死重启。
+
+### 灰屏边界定位诊断入口 `opd2413-graydbg` 上机前登记（2026-11-14）
+
+- **目标：** 用只改命令行参数的 `-22` 诊断项 + 自动化引导切换，精确确认灰屏发生在 `earlycon=efifb` 黑底白字内核日志出现之前、滚动之中还是之后，并抓取完整 `dmesg`。
+- **设备写入范围（已获用户确认）：**
+  1. 卸载故障包：`rpm -e kernel-opd2413-7.2.15-23.opd2413`。
+  2. 新增非默认条目 `/boot/efi/loader/entries/opd2413-graydbg.conf`，复用 `7.2.15-22.opd2413` 的内核/DTB/initrd，仅把 `quiet loglevel=3` 改为 `ignore_loglevel earlycon=efifb keep_bootcon`。
+  3. 执行 `/usr/libexec/opd2413/boot-select kshim Fedora` 与 `/usr/libexec/opd2413/boot-select next opd2413-graydbg`（回读校验后 `systemctl reboot`）。
+- **预期与判据：**
+  1. 无需人工点击菜单，平板自动经 kShimC `"Fedora"` 与 `systemd-boot` 进入 `opd2413-graydbg.conf` 并顺利进入系统；`opd2413-boot-restore.service` 自动把 `loader_default` 恢复回 `fedora-7.2.15-22.opd2413.conf`。
+  2. `boot-select status` 确认 `kshim_remembered == "Fedora"`、`booted_entry == "opd2413-graydbg.conf"`、`loader_default == "fedora-7.2.15-22.opd2413.conf"`。
+  3. 结合用户肉眼观察结果与完整 `dmesg`，确定下一变量隔离方向。
+
+**真机结果（15:24–15:29）：自动切入口通过，但 `opd2413-graydbg` 卡死未进系统（`真机失败`）。**
+- 平板无人值守自动跳过菜单进入 `opd2413-graydbg`，`earlycon=efifb` 正常输出**黑底白字内核日志滚动数秒，随后整屏文字瞬间被灰屏盖掉（期间并未卡住），再过几秒转为有背光但黑屏，最后变成物理黑屏**并失去网络响应（`15:19:52`、`15:21:02`、`15:24:21` `ping <平板 IP>` 均 100% 丢包）。
+- 用户长按电源键 ~10 秒强制重启后从 kShimC `"Fedora boot menu"` 选回正常的 `7.2.15-22.opd2413`，`opd2413-boot-restore.service` 立即将 `loader_default` 复位回 `fedora-7.2.15-22.opd2413.conf`。`journalctl --list-boots` 无 `graydbg` 记录，`/var/lib/opd2413-pstore/` 最新只到 `000032`（冷断电丢 RAM）。
+- **结论：** ① kShimC/EFI 交接给内核时画面正常，灰屏确定发生于**内核启动数秒、早期日志滚动期间之后、`msm_dpu` 接管黑屏之前**的瞬间全屏失步/断流阶段；② `7.2.15-22` 在追加 `earlycon=efifb keep_bootcon ignore_loglevel` 后于显示接管之后卡死/关屏（与 [TECH-DEBT.md](TECH-DEBT.md) `#26`、`WORKLOG` 第 793 行 `memremap(MEMREMAP_WC)` 在未保留 `0xfc800000` 帧缓冲/CMA 区域失败且 `keep_bootcon` 未注销相符），后续测试不再使用 `earlycon=efifb keep_bootcon`。
+- 另只读取回 `-22` 正常开机日志保存到 `private/boot22-dmesg.txt`（1681 行）：`0.231 s` `efifb` → `0.287/0.301 s` 两颗 `ktz8866` → `0.461 s` `msm-mdss bootloader scanout`（`intf 0x3 line 1196/1197 stopped in 8408 us`）→ `0.470–0.488 s` `dsi_phy` 告警刷屏约 478 行 → `0.593 s` `fb0: msmdrmfb` → `0.853 s` `panel_prepared` → `1.128 s` `fbcon` 接管；其前两段行数比例（629 行 vs 509 行）与用户目视“滚动几秒 → 灰屏 → 几秒后有背光黑屏”完全吻合。
+
+### 单变量黑名单隔离 `opd2413-nodispcc` 上机前登记（2026-11-14）
+
+- **目标：** 保持正常 `quiet loglevel=3`、不加 `earlycon=efifb keep_bootcon`，仅在 `-22` 上追加 `initcall_blacklist=disp_cc_sm8750_driver_init`，直接判定“既跳过 `disp_cc_sm8750` 又通过依赖跳过下游 `msm_drm`”后是否还会闪现灰屏。
+- **设备写入范围（已获用户确认）：**
+  1. 删除临时故障条目 `/boot/efi/loader/entries/opd2413-graydbg.conf`。
+  2. 新增非默认条目 `/boot/efi/loader/entries/opd2413-nodispcc.conf`，复用 `7.2.15-22.opd2413` 全部路径与参数，仅追加 `initcall_blacklist=disp_cc_sm8750_driver_init`。
+  3. 执行 `/usr/libexec/opd2413/boot-select kshim Fedora` 与 `/usr/libexec/opd2413/boot-select next opd2413-nodispcc`，回读校验后 `systemctl reboot`。
+- **预期与判据：**
+  1. 平板自动进入 `opd2413-nodispcc.conf`，因非显示设备不依赖 `&dispcc`，系统正常挂载根并拉起 `opd2413-boot-restore.service`（恢复 `loader_default = fedora-7.2.15-22.opd2413.conf`）、NetworkManager 与 SSH；核对 `boot-select status` 与 `cat /proc/cmdline` 确认黑名单生效。
+  2. 用户目视无灰屏 → 100% 排除 U-Boot/`efifb`/`0xfc800000` 内存/`ktz8866`/`clk_disable_unused`/`genpd`，锁定触发源在 `disp_cc_sm8750` 或 `msm_drm`；仍出现灰屏 → 排除两者，转查 `clk_disable_unused`/`genpd` 或 `0xfc800000` 内存重叠。
+- **实机结果（2026-11-14）：`真机失败`（作为变量隔离测试：成功证伪）。**
+  - 现象：平板按 `boot-select next opd2413-nodispcc` 自动进入后，**选择引导后直接灰屏，没有任何其他内容，随后到时重启进入灰屏死循环**（因未挂载 rootfs，`opd2413-boot-restore.service` 无法执行；`journalctl --list-boots` 无该次启动记录）。用户已于 `Fedora boot menu` 手动切回 `7.2.15-22.opd2413` 正常开机。
+  - 结论：**100% 排除 `disp_cc_sm8750` 与 `msm_drm`（`msm-mdss` / `msm_dpu` / `dsi`）作为最初灰屏触发源**（两者均未探测即已出现整屏灰屏）。死循环本身推测为跳过 `dispcc`/`msm` 后后续 `clk_disable_unused` 或 `genpd` 关断仍在扫描输出的显示时钟/电源域引发未挂根前卡死复位。下一步转查 `0.0 s–0.46 s` 期间非 `dispcc`/`msm` 候选：`15000000.iommu`（`arm-smmu` 于 `0.280 s` 复位与 `USFCFG` 拦截）、`0xfc800000–0xfe70dfff` 未保留内存重叠、以及早期 regulator/clock/PM 状态。
+
+### 单变量隔离 `opd2413-smmubypass` 上机前登记（2026-11-14）
+
+- **依据（只读取证）：**
+  1. `opd2413-graydbg` 中 `earlycon=efifb` 在 `0xfc800000` 正常输出约几秒（~490 行以内），在 `0.277–0.280 s` `arm-smmu 15000000.iommu` 执行 `arm_smmu_device_reset()`（`preserved 0 boot mappings`、`CLIENTPD=0` 且 `CONFIG_ARM_SMMU_DISABLE_BYPASS_BY_DEFAULT=y` 置位 `USFCFG=1` 并清零全部 128 组 SMR/S2CR 为 FAULT），直到 ~2.8 ms 后（`0.283 s`）`ae00000.display-subsystem` 才加入 `iommu group 10`（`IDENTITY` / `0x800 0x2`）；另有 `/sys/module/arm_smmu/parameters/disable_bypass = Y`。
+  2. 另只读查核 `/proc/iomem` 与 `/sys/kernel/debug/memblock/{memory,reserved}` 确认 `0xfc800000–0xff7fffff` 整段 48 MiB 在 Linux 中为 `System RAM`（`0xfcc00000–0xff7fffff` 为 44 MiB CMA `RSV_KERN`，`0xfc800000–0xfcbfffff` 4 MiB 为完全未保留 RAM），作为第二候选保留在案。
+- **拟执行设备写入范围（待用户确认）：**
+  1. 删除失效且易循环的临时条目 `/boot/efi/loader/entries/opd2413-nodispcc.conf`。
+  2. 新增临时非默认条目 `/boot/efi/loader/entries/opd2413-smmubypass.conf`，复用 `fedora-7.2.15-22.opd2413.conf` 全部路径与参数，**仅追加 `arm_smmu.disable_bypass=0`**。
+  3. 执行 `/usr/libexec/opd2413/boot-select kshim Fedora` 与 `/usr/libexec/opd2413/boot-select next opd2413-smmubypass`，回读校验后 `systemctl reboot`（无人值守自动启动；`-22` 内核正常启动至桌面后 `opd2413-boot-restore.service` 自动把 `loader_default` 恢复回 `fedora-7.2.15-22.opd2413.conf`）。
+- **预期与判据：**
+  1. 无人值守自动进入桌面与 SSH，`boot-select status` 确认 `kshim_remembered == "Fedora"`、`booted_entry == "opd2413-smmubypass.conf"`、`loader_default == "fedora-7.2.15-22.opd2413.conf"`，且 `/sys/module/arm_smmu/parameters/disable_bypass == N`。
+  2. 用户目视**灰屏消失**（仅保留正常交接黑屏或直接亮面进桌面）→ 100% 锁定根因是 `15000000.iommu` 复位开启 `USFCFG` 拦截/错失 MDSS 固件流 ID；**仍有灰屏** → 排除 `arm-smmu` `disable_bypass`（`USFCFG`），下一步排查 `0xfc800000–0xfe70dfff` 内存未保留重叠及 `0.28–0.42 s` 其他设备（`vreg`、`ktz8866`、`efifb`）。
+- **结果（真机失败 — 作为修复无效；成功证伪 `arm-smmu` bypass 假设）：**
+  - SSH 自动连通后核对：`booted_entry == "opd2413-smmubypass.conf"`、`loader_default == "fedora-7.2.15-22.opd2413.conf"`（已自动恢复）、`pending_next == null`、`kshim_remembered == "Fedora"`，`/proc/cmdline` 末尾含 `arm_smmu.disable_bypass=0`，且 `/sys/module/arm_smmu/parameters/disable_bypass == N`。
+  - 用户目视：**默认入口仍为“短暂灰屏后进入内核日志，然后正常进入桌面”**。
+  - **结论：** 彻底排除 `15000000.iommu` 复位设置 `USFCFG` / 放行固件 Stream ID 失败是灰屏主因；加上此前已证伪 `disp_cc_sm8750`、`msm_drm`（`opd2413-nodispcc`）及 `clk_disable_unused`（Armada `grey1` 已设三项 `*_ignore_unused`），焦点收敛至 `0xfc800000` 帧缓冲内存重叠（未作 `reserved-memory`，`simple-framebuffer.0` 与 `efifb` 均未能保留且 `44 MiB` 被划作 `CMA`、`4 MiB` 落入自由 RAM）、`efifb`/`fbcon` 早期初始化与 `0.00–0.45 s` 内核早期 `initcall`（含无 `1410` 时的 `ktz8866`、RPMh/GCC 显示电源总线时钟）。
+
+### 单变量隔离 `opd2413-splashmem` 上机前登记（2026-11-14）
+
+- **依据（只读取证）：**
+  1. `-22` 实际反编译 DTB 的 `/reserved-memory` 中，`oem-vm@f7c00000`（长 `0x4c00000`）正好结束于 `0xfc800000`，`llcc-lpi@ff800000` 起始于 `0xff800000`，中间留下 `0xfc800000..0xff7fffff`（`48 MiB` / `0x3000000`）未保留空洞；`/sys/kernel/debug/memblock/{memory,reserved}` 确认该段暴露为 `System RAM`（前 `4 MiB` 自由 RAM + 后 `44 MiB` `RSV_KERN` CMA）。
+  2. 同平台 `sm8750-konkr-pf-elite.dts` 及 SM8550/8650 设备均在此地址放置 `splash-region`（`no-map`）；因缺失该保留区，`-22` 在 `0.229 s` 报错 `platform simple-framebuffer.0: failed to claim resource 0: [mem 0xfc800000-0xfe70dfff]` 并退回 `efifb: cannot reserve video memory at 0xfc800000`。
+  3. 宿主机反编译—修改—重编—二次反编译 `diff -u` 验证 `opd2413-splashmem.dtb` 仅新增上述 `splash-region@fc800000` 节点（`no-map`），且 `msm_kms.c:272` 已调用 `aperture_remove_all_conflicting_devices()` 清理 `simpledrm`。
+- **拟执行设备写入范围（待用户确认）：**
+  1. 删除上一轮临时条目 `/boot/efi/loader/entries/opd2413-smmubypass.conf`。
+  2. 写入临时 DTB `/boot/efi/fedora/7.2.15-22.opd2413/opd2413-splashmem.dtb`（基于 `-22` 原 DTB 仅增加 `/reserved-memory/splash-region@fc800000`）。
+  3. 新增临时非默认条目 `/boot/efi/loader/entries/opd2413-splashmem.conf`，内核/initrd/启动参数与 `fedora-7.2.15-22.opd2413.conf` **完全一致**，仅将 `devicetree` 指向 `/fedora/7.2.15-22.opd2413/opd2413-splashmem.dtb`。
+  4. 执行 `/usr/libexec/opd2413/boot-select kshim Fedora` 与 `/usr/libexec/opd2413/boot-select next opd2413-splashmem`，回读校验后 `systemctl reboot`（无人值守自动启动，`opd2413-boot-restore.service` 会将 `loader_default` 恢复回 `fedora-7.2.15-22.opd2413.conf`）。
+- **预期与判据：**
+  1. 无人值守自动进入桌面与 SSH，`boot-select status` 确认 `booted_entry == "opd2413-splashmem.conf"`、`loader_default == "fedora-7.2.15-22.opd2413.conf"`、`/sys/kernel/debug/memblock/memory` 显示 `0xfc800000..0xff7fffff` 为 `NOMAP` 且不再与 `CMA`/`System RAM` 重叠、`dmesg` 中 `simple-framebuffer.0` 认领成功（由 `simpledrm` 接管而非 `efifb`）。
+  2. 用户目视**灰屏消失** → 根因锁定为 `0xfc800000` 固件帧缓冲缺少 `reserved-memory`（`no-map`）导致与 `System RAM`/CMA 冲突及退回 `efifb`；**仍有灰屏** → 彻底排除 `0xfc800000` 内存冲突与 `efifb`，下一步检查 `0.15–0.46 s` 内其他 `initcall` / `vreg` / `ktz8866` / `gcc`。
+- **结果（真机失败，2026-11-14）：** 两次无人值守重启（首次 91s、重试 39s）均自动进入桌面与 SSH。`boot-select status` 确认 `booted_entry == "opd2413-splashmem.conf"`、`loader_default == "fedora-7.2.15-22.opd2413.conf"`、`pending_next == null`、`kshim_remembered == "Fedora"`；`/sys/kernel/debug/memblock/memory` 显示 `25: 0x00000000f3800000..0x00000000ffffffff 0 NOMAP`；`dmesg` 显示 `[0.233372] [drm] Initialized simpledrm 1.0.0 for simple-framebuffer.0 on minor 0`（`fb0: simpledrmdrmfb`）、`[0.594976] msm_dpu ... fb0: msmdrmfb`、`[0.857478] [nt36536] panel_prepared`、`[1.116574] fbcon: Taking over console`。但用户目视两次均有**“依旧有短暂灰屏”**，彻底证伪 `0xfc800000` 内存重叠与 `efifb` 假设。
+
+### 单变量隔离 `opd2413-l3gon` 上机前登记（2026-11-14）
+
+- **依据（只读与代码核对）：**
+  1. 设备树中 `vreg_l3g_1p2`（`0xa9`）同时供电给 `mdss_dsi0` / `mdss_dsi1` 的 `vdda-supply`（1.2 V）与 `phy@1c06000`（PCIe QMP PHY）、`phy@1d80000`（UFS QMP PHY）、`phy@88e3000`/`88e8000`（USB PHY），且在 `-22` DTB 中未设置 `regulator-boot-on` / `regulator-always-on`。
+  2. 实机 `dmesg` 与源码（`pcie-qcom.c:2034,2211,2228`、`phy-qcom-qmp-pcie.c:4886,4947`、`regulator/core.c:3278`）核对确认：UFS（`0.4806 s`）与 USB（`>0.62 s`）在 `0.318 s` 时均尚未使能 `vreg_l3g_1p2`（`use_count == 0`）；而 `1c00000.pcie` 于 **`0.3184 s`** 调用 `phy_init()`（`use_count: 0 -> 1`），进入 `dw_pcie_host_init()` 后因 `pci_pwrctrl_power_on_devices()` 返回 `-EPROBE_DEFER`，回滚执行 `phy_exit()` → `regulator_bulk_disable(vreg_l3g_1p2)`（`use_count: 1 -> 0`），**在 `msm-mdss`（`0.449 s`）接管和 UFS 持锁之前物理切断了正在工作的 DSI 1.2 V 模拟供电**。
+  3. 补丁 `1409` 己证实“失去 DSI 视频流而背光仍在时，本机 `nt36536` LCD 直接呈现纯灰屏”；DSI 1.2 V 在 `0.318 s` 被误关与用户观察到 `opd2413-graydbg` 黑底白字滚动后瞬间纯灰、且 `msm-mdss` `0.449 s` 仍见 MDP `intf 0x3` 内部扫屏（下游 DSI PHY 已断流）的物理时序一致。
+  4. 宿主机已在临时 `opd2413-splashmem.dtb` 上仅对 `vreg_l3g_1p2` 新增 `regulator-boot-on;` 与 `regulator-always-on;` 编译生成 `opd2413-l3gon.dtb`（`sha256: 2c7afc701ef5eec14b915dff48ddc922b6b85da9dd661993caafa18b1682e18b`），二次反编译 `diff -u` 确认仅此两行差异；`regulators-3` 父供电 `vreg_s7i_1p2` 已于 `0.163 s` 就绪，Wi-Fi/PCIe/UFS/SSH 均保留。
+- **拟执行设备写入范围（待用户确认）：**
+  1. 写入临时 DTB `/boot/efi/fedora/7.2.15-22.opd2413/opd2413-l3gon.dtb`（并校验远端 `sha256sum`）。
+  2. 新增临时非默认条目 `/boot/efi/loader/entries/opd2413-l3gon.conf`（与 `opd2413-splashmem.conf` / `-22` 参数完全一致，仅将 `devicetree` 改为 `/fedora/7.2.15-22.opd2413/opd2413-l3gon.dtb`）。
+  3. 删除上一轮临时条目 `/boot/efi/loader/entries/opd2413-splashmem.conf` 与 `/boot/efi/fedora/7.2.15-22.opd2413/opd2413-splashmem.dtb`。
+  4. 执行 `/usr/libexec/opd2413/boot-select kshim Fedora` 与 `/usr/libexec/opd2413/boot-select next opd2413-l3gon`，回读校验后无人值守重启（用户观察开机画面；`opd2413-boot-restore.service` 自动把 `loader_default` 维持在 `fedora-7.2.15-22.opd2413.conf`）。
+- **预期与判据：**
+  1. 无人值守进入桌面与 SSH，`boot-select status` 确认 `booted_entry == "opd2413-l3gon.conf"`、`loader_default == "fedora-7.2.15-22.opd2413.conf"`、`pending_next == null`、`kshim_remembered == "Fedora"`。
+  2. 用户目视**灰屏消失** → 根因锁定为 `0.318 s` `1c00000.pcie` 等非显示早期驱动在 `-EPROBE_DEFER` 时误关共享显示供电 `vreg_l3g_1p2`；**仍有灰屏** → 彻底排除 `vreg_l3g_1p2` 断电假设，下一步用安全隔离排除剩余 3 个早期点（`sysfb_init` / `arm-smmu` `15000000.iommu` / `-22` 无 `1410` 的 `ktz8866`）。
+- **结果（真机失败，2026-11-14）：** 无人值守重启后 38 s 自动进入桌面与 SSH（`tools/tablet-reboot.py --wait 120` 退出 0）。`boot-select status` 确认 `booted_entry == "opd2413-l3gon.conf"`、`loader_default == "fedora-7.2.15-22.opd2413.conf"`、`pending_next == null`、`kshim_remembered == "Fedora"`；`dmesg` 显示 `[0.276719] vreg_l3g_1p2: Setting 1200000-1256000uV`、`/sys/kernel/debug/regulator/regulator_summary` 显示 `vreg_l3g_1p2` 启用计数 `7 / 8`（`normal 1200mV`），同时实测核实 `iommu_groups/10`（`ae00000.display-subsystem`）为 `type=identity` 且 `/proc/interrupts` 中 `arm-smmu` 全局/上下文故障计数均为 `0`。但用户目视**“有短暂灰屏”**，正式证伪 `0.318 s` `vreg_l3g_1p2` 被提前切断的假设。
+
+### 单变量隔离 `opd2413-nosysfb` 上机前登记（2026-11-14）
+
+- **依据（交叉排除与源码/符号核对）：**
+  1. 此前 `opd2413-nodispcc`（跳过 `disp_cc_sm8750_driver_init`，`msm-mdss`/`msm_dpu`/`msm_dsi`/`nt36536` 全未探测）仍直接变灰，Armada `grey1`（含 `1410` 探测关灯与三项 `*_ignore_unused` 参数）亦未改善灰闪，`opd2413-smmubypass`、`opd2413-splashmem` 与 `opd2413-l3gon` 也全部证伪。
+  2. 上述所有复现场景（含使用 `efifb` 的 `grey1` 与使用 `simpledrm` 的 Fedora `-22` / `splashmem` / `l3gon`）在 `0.431 s` `msm-mdss` 介入前均执行了 `sysfb_init`（已由 `out/m3k/tree/drivers/firmware/sysfb.c`、`init/main.c` `initcall_blacklisted()` 及 `/proc/kallsyms` 核实：`__initcall__kmod_sysfb__665_225_sysfb_init6` 可由 `initcall_blacklist=sysfb_init` 精确匹配拦截）。
+  3. 跳过 `sysfb_init` 可在不改动内核源码与 `-22` 原设备树的前提下，一次性隔离 `simple-framebuffer.0`、`simpledrm`（`0.226895 s`–`0.234322 s`）、`efifb` 与早期 `fbcon` 路径；即使未注册 `simple-framebuffer.0`，`0.574953 s` `msm_dpu` 仍会正常注册 `fb0: msmdrmfb` 并进入桌面。
+- **拟执行设备写入范围（待用户确认）：**
+  1. 复制 `/boot/efi/loader/entries/fedora-7.2.15-22.opd2413.conf` 为临时非默认条目 `/boot/efi/loader/entries/opd2413-nosysfb.conf`，仅修改 `title` 并在 `options` 末尾追加 `initcall_blacklist=sysfb_init`（继续沿用 `-22` 原 DTB `/fedora/7.2.15-22.opd2413/sm8750-oneplus-pad2pro.dtb`）。
+  2. 清理上一轮临时文件 `/boot/efi/loader/entries/opd2413-l3gon.conf` 与 `/boot/efi/fedora/7.2.15-22.opd2413/opd2413-l3gon.dtb`。
+  3. 执行 `/usr/libexec/opd2413/boot-select kshim Fedora` 与 `/usr/libexec/opd2413/boot-select next opd2413-nosysfb`，校验配置后调用 `tools/tablet-reboot.py --wait 120` 无人值守重启测试。
+- **预期与判据：**
+  1. 无人值守进入桌面与 SSH，`boot-select status` 确认 `booted_entry == "opd2413-nosysfb.conf"`、`loader_default == "fedora-7.2.15-22.opd2413.conf"`、`pending_next == null`、`kshim_remembered == "Fedora"`；`dmesg` 中不出现 `simple-framebuffer` / `simpledrm` / `efifb`，`msm_dpu` 仍注册 `msmdrmfb`。
+  2. 用户目视**灰屏消失** → 根因锁定在 `sysfb_init` / `simple-framebuffer`（`simpledrm` 或 `efifb`）接管阶段；**仍有灰屏** → 彻底排除 `sysfb_init`、`simpledrm`、`efifb` 与早期 `fbcon` 交互，后续聚焦 `0.15 s–0.43 s` 仍未直接隔离的剩余驱动（`15000000.iommu` `arm_smmu_device_reset()` 瞬间复位、`-22` 无 `1410` 的 `ktz8866` 探测写寄存器及 `qcom-rpmh-regulator` 初始化）。
+- **结果（真机失败，2026-11-14）：**
+  - 通过 `tools/tablet-reboot.py --wait 120` 无人值守重启（38 s 恢复 SSH，`boot-select status` 验证 `booted_entry == "opd2413-nosysfb.conf"`、`loader_default == "fedora-7.2.15-22.opd2413.conf"`、`pending_next == null`、`kshim_remembered == "Fedora"`）。
+  - `dmesg` 确认 `[0.228730] initcall sysfb_init blacklisted`、`simple-framebuffer`/`simpledrm`/`efifb` 为零、`[0.441651] msm-mdss ... bootloader scanout: intf 0x3 ...`、`[0.588132] msm_dpu ... fb0: msmdrmfb`、`[0.857600] [nt36536] panel_prepared`、`[1.132544] fbcon: Taking over console`。
+  - 用户目视确认**“有短暂灰屏”**，彻底证伪 `sysfb_init`、`simple-framebuffer`、`simpledrm`、`efifb` 与早期 `fbcon` 假说；另核对 `-22`（`out/m3k/tree`）已含 `1409`（`d18384851`）但无 `1410`，而 `PATCHES.md` 记录 Armada `fast3` / `grey1`（含 `1409`/`1410` 与 `*_ignore_unused`）同样闪灰。
+
+#### 2026-11-14 验证启动条目 `opd2413-nodispcc-safe`（禁用 `disp_cc` + 禁用未用时钟/电源域/稳压器/sync_state 回收）
+
+- **依据：**
+  - 此前 `opd2413-nodispcc` 在未保活 `gcc_disp_*` 时卡死在 `0.602 s` `clk_disable_unused`，无法进入 SSH 采样也无法区分灰屏是发生在 `< 0.44 s` 还是 `0.602 s` 以后。
+  - 已源码核对：`opd2413-22.dts` 中 `dispcc` 无非显示消费者，`opd2413-boot-restore.service`、`NetworkManager.service`、`sshd.service` 不依赖 DRM；`/proc/kallsyms` 中精确符号为 `__initcall__kmod_dispcc_sm8750__517_1958_disp_cc_sm8750_driver_init6`（`initcall_blacklist=disp_cc_sm8750_driver_init` 可匹配）。
+  - 已核对 `drivers/pmdomain/core.c:3695-3712`（`of_genpd_sync_state()` 会绕过 `pd_ignore_unused` 强制下电）、`drivers/base/core.c:1750-1768`（`fw_devlink.sync_state=strict` 可禁用超时强制触发）与 `drivers/interconnect/core.c:1218`，因此同时将 `fw_devlink.sync_state=timeout` 替换为 `fw_devlink.sync_state=strict` 并加 `clk_ignore_unused pd_ignore_unused regulator_ignore_unused`，保证不因 `disp_cc`/`msm_dpu` 未探测而关闭 `mmcx`、`icc` 或 `gcc_disp_*`。
+- **设备写入范围：**
+  1. 在 `/boot/efi/loader/entries/` 复制 `fedora-7.2.15-22.opd2413.conf` 为临时条目 `opd2413-nodispcc-safe.conf`（将 `fw_devlink.sync_state=timeout` 替换为 `fw_devlink.sync_state=strict`，并在 `options` 末尾追加 `initcall_blacklist=disp_cc_sm8750_driver_init clk_ignore_unused pd_ignore_unused regulator_ignore_unused`，`linux`/`devicetree`/`initrd` 保持 `-22` 不变）。
+  2. 删除临时条目 `/boot/efi/loader/entries/opd2413-nosysfb.conf`。
+  3. 执行 `boot-select kshim Fedora` 与 `boot-select next opd2413-nodispcc-safe` 一次性重启（默认条目仍为 `fedora-7.2.15-22.opd2413.conf`）。
+- **预期与判据：**
+  1. 无人值守恢复 SSH（无桌面属正常，因跳过 `disp_cc`/`msm_drm`），`boot-select status` 确认 `booted_entry == "opd2413-nodispcc-safe.conf"`、`loader_default == "fedora-7.2.15-22.opd2413.conf"`、`pending_next == null`；`dmesg` 中 `disp_cc_sm8750_driver_init blacklisted` 且无 `msm_dpu`。
+  2. **分支 A（全程保持干净启动画面无灰屏直至 SSH 可达）** → 彻底证明 `0.00 s–0.44 s`（`15000000.iommu`、`ktz8866`、`led-backlight`、`rpmh` 等）完全无问题，问题严格位于 `0.602 s` 未使用资源清理或 `disp_cc` / `msm_dpu` / `nt36536` / `1409`；下一步单变量对比仅保留 `*_ignore_unused` 与 `1409`/`nt36536` 时序。
+  3. **分支 B（仍出现灰屏并保持灰屏进入 SSH）** → 彻底排除 `disp_cc`、`msm_dpu`、`nt36536` 及 `clk`/`pd`/`regulator` 未使用回收；当即通过 SSH 在屏幕保持灰屏状态下读取 `regmap/0-0011`、`regmap/6-0011`、`regulator_summary`、`clk_summary`、`pm_genpd_summary` 与完整 `dmesg`，随后在此无显示器驱动的稳态基线上二分 `< 0.44 s` 内建驱动（如 `ktz8866`、`15000000.iommu` 等）。
+- **结果（真机失败，2026-11-14）：**
+  - 平板从 `-22` 重启进入 `opd2413-nodispcc-safe.conf` 后，用户目视**“变灰后卡死，然后进入死循环”**，120s 内 SSH 未恢复；用户通过 kShimC `"Fedora boot menu"` 选回 `7.2.15-22.opd2413` 正常进入桌面后，`opd2413-boot-restore.service` 已将 `loader_default` 恢复回 `fedora-7.2.15-22.opd2413.conf`（`booted_entry == "fedora-7.2.15-22.opd2413.conf"`、`pending_next == null`）。
+  - SSH 只读核查确认：`journalctl --list-boots` 无该次启动记录（卡死/复位发生在挂载根文件系统与 `journald` 启动之前），`opd2413-pstore-keep.service` 因 `ConditionDirectoryNotEmpty=/sys/fs/pstore` 未满足而跳过（未保留该次测试的 `console-ramoops`；历史 `/var/lib/opd2413-pstore/` 仅到上次 `-22` 重启的 `000038-3564318a...`）。
+  - **结论：** 即使加上 `clk_ignore_unused pd_ignore_unused regulator_ignore_unused` 与 `fw_devlink.sync_state=strict`，跳过 `disp_cc` / `msm-mdss` 仍会导致早期硬件死锁/复位循环，无法作为跳过显示子系统的稳态基线。
+
+#### 2026-11-14 验证启动条目 `opd2413-graytime`（方案 A：`earlycon=efifb loglevel=7` 无 `keep_bootcon` + 相机实拍观测时间戳）
+
+- **依据：**
+  - 本机实测确认 `/proc/config.gz` 启用了 `CONFIG_EFI_EARLYCON=y` 与 `CONFIG_PRINTK_TIME=y`（无 `CONFIG_BOOT_PRINTK_DELAY`），[private/boot22-dmesg.txt](../private/boot22-dmesg.txt) 在 `0.63 s` 前共 1159 行；此前 `opd2413-graydbg` 因附带 `ignore_loglevel` 与 `keep_bootcon` 刷屏过久并在接管阶段卡死。
+  - 改为仅用 `earlycon=efifb loglevel=7` 替换 `quiet loglevel=3`（不加 `ignore_loglevel` 与 `keep_bootcon`），可在控制台自动交回 `tty0` 的前提下在启动初期直接打屏输出 `[0.XXXXXX]` 驱动与时间戳，并配合前置摄像头（`phone-camera`）实拍判断灰屏精确时间窗口与是否恢复进入桌面。
+- **设备写入范围：**
+  1. 删除遗留临时条目 `/boot/efi/loader/entries/opd2413-nodispcc-safe.conf`。
+  2. 在 `/boot/efi/loader/entries/` 复制 `fedora-7.2.15-22.opd2413.conf` 为临时条目 `opd2413-graytime.conf`，仅将 `title` 改为 `Fedora Linux 45 (opd2413-graytime)`、将 `options` 中的 `quiet loglevel=3` 替换为 `earlycon=efifb loglevel=7`（其余参数、内核、DTB、initrd 与 `-22` 完全一致）。
+  3. 执行 `boot-select kshim Fedora` 与 `boot-select next opd2413-graytime` 一次性重启（默认条目保持 `fedora-7.2.15-22.opd2413.conf`）。
+- **预期与判据：**
+  1. 无人值守重启并在 120 s 内恢复桌面与 SSH，`boot-select status` 确认 `booted_entry == "opd2413-graytime.conf"`、`loader_default == "fedora-7.2.15-22.opd2413.conf"`、`pending_next == null`。
+  2. 通过相机抓取开机画面定位灰屏发生于 `earlycon` 滚动的哪一段时间戳之前/之中/之后，为下一轮精确根因隔离提供直接时序依据。
+- **结果（真机失败，2026-11-14）：**
+  - 前置相机实拍过程：`17:09:30` ABL OnePlus 画面 → `17:09:40` kShimC 菜单（`Fedora` 选中，倒计时 8 s）→ `17:09:48` 倒计时归零 → `17:09:58` `earlycon=efifb` 正常输出 `[0.000000]` 早期内存/PSCI 日志 → `17:10:06` 屏幕变为**背光亮着的黑屏**（用户校准说明：相机过曝把带背光的黑屏拍成深灰，真正的灰屏呈偏白色；在 `17:10:06`、`17:10:16`、`17:10:27` 与 `17:11:32` 抓帧均停留在背光亮着的黑屏），`task-889` 120 s 超时，只读 SSH 探测返回 `No route to host`。
+  - **结论：** 即使去掉 `keep_bootcon` 与 `ignore_loglevel`，`-22` 上启用 `earlycon=efifb loglevel=7` 仍会在打印 `[0.000000]` 后约 8 秒转入背光亮着的黑屏并卡死未进系统。后续不再使用 `earlycon=efifb` 启动参数，改用正常启动内核直接定位。
+
+#### 2026-11-14 验证诊断内核 `opd2413-bisect1`（纯 `-22` + `mdss_boot_handoff_end` 后 `msleep(6000)` 二分断点）
+
+- **依据：**
+  - 基于纯 `-22`（`out/m3k/tree` `504a0e5cf`，不含 `2415`，`LOCALVERSION=-22.opd2413` 复用 `-22` 同版 `initrd`、`DTB` 与内核模块），仅在 `drivers/gpu/drm/msm/msm_mdss.c` 的 `msm_mdss_reset()` 完成 `mdss_boot_handoff_end(dev, &handoff)`（即 `1409` 关背光 + `1407` 停 `intf 0x3` 与 MDSS reset 完成）之后插入 `msleep(6000)`，把 `0.435 s` 的交接点拉长为 6 秒稳态供前置相机清晰捕捉，同时避免 `earlycon` 卡死。
+- **设备写入范围（仅限临时诊断文件与一次性启动，默认条目 `-22` 不变）：**
+  1. 上传临时内核镜像 `/boot/efi/fedora/7.2.15-22.opd2413/linux-bisect1`（基于 `-22` 单变量加 `msleep(6000)`）。
+  2. 新增临时条目 `/boot/efi/loader/entries/opd2413-bisect1.conf`（复制 `fedora-7.2.15-22.opd2413.conf`，仅修改 `title` 为 `Fedora Linux 45 (opd2413-bisect1)` 与 `linux` 为 `/fedora/7.2.15-22.opd2413/linux-bisect1`）。
+  3. 执行 `boot-select kshim Fedora` 与 `boot-select next opd2413-bisect1`，并通过 `tools/tablet-reboot.py --wait 120` 无人值守重启，用 `phone-camera` 在 `0.4s..6.4s` 断点窗口连续抓拍。
+- **预期与判据：**
+  1. 约 40–50 s 内无人值守恢复桌面与 SSH，`boot-select status` 确认 `booted_entry == "opd2413-bisect1.conf"`、`loader_default == "fedora-7.2.15-22.opd2413.conf"`、`dmesg` 出现 `opd2413-bisect1: post-retire sleep 6000ms start/end`。
+  2. **分支 A（6 秒断点期间屏幕呈纯偏白灰屏）：** 立即实证 `1409` 在 `0.435 s` 未能真正熄灭 `ktz8866` 背光（或 `intf 0x3` 停扫时背光仍有渐变延时）。
+  3. **分支 B（6 秒断点期间屏幕保持纯黑熄屏，直到 6 秒后进入内核日志前才闪灰，或仍先闪再 6 秒黑）：** 先通过相机确认 6 秒断点期间背光确实熄灭（真黑 vs 亮屏暗灰），再将断点二分为 `panel_prepared -> panel_enable` 或 `msm_mdss_reset` 之前，进一步缩圈至毫秒级原因。
+- **6 秒试跑结果（2026-11-14）：** 46 s 成功无人值守进入桌面与 SSH，`booted_entry == "opd2413-bisect1.conf"`、`loader_default == "fedora-7.2.15-22.opd2413.conf"`、`dmesg` 实证 `[0.466864] opd2413-bisect1: post-retire sleep 6000ms start` → `[6.623010] opd2413-bisect1: post-retire sleep 6000ms end`；因相机读取+抓拍间隔约 16 s 恰好跨过 6 s 断点，将断点延长至 `msleep(12000)`（12 秒）重测以确保抓拍直接命中窗口内部。
+
+#### 2026-11-14 灰闪根因定位、修复补丁 `2415`–`2417` 与 `7.2.15-23.opd2413` 真机验收
+
+- **根因闭环定位：**
+  1. 12 s 断点实拍与 `dmesg` 时序对照确认：`disp_cc_sm8750_probe()` 在约 `0.14 s` 注册时钟时即把 `disp_cc_mdss_mdp_clk_src` 停泊到 BI_TCXO（`19.2 MHz`），比 `ktz8866`（`0.28 s`/`0.29 s`）与 `led-backlight`（`~0.30 s`）早约 `160 ms` 切断了 ABL 正在扫屏的 DSI 时钟，而引导态 KTZ8868 背光（`BL_CTRL=0x01`、`BL_EN=0x77`）仍处于点亮状态，导致面板无信号下呈现短暂偏白灰屏。
+  2. 在 `dispcc-sm8750` 延后至 `led-backlight` 就绪后进一步发现两处软件状态不同步缺陷，使得按理应先熄灭的 KTZ8868 背光仍未关闭：
+     - `drivers/video/backlight/led_bl.c` 的 `led_bl_power_off()` 因 `if (!priv->enabled) return;`（启动初值 `false`）直接早退，且阻塞型 I2C LED 调用 `led_set_brightness(..., LED_OFF)` 会排入异步工作队列而非同步写寄存器。
+     - `drivers/video/backlight/ktz8866.c` 的 `ktz8868_update_brightness(ktz, 0)` 因 `if (ktz->led_on)`（启动初值 `false`）跳过写 `KTZ8868_BL_CTRL=0` 与 `BL_EN=0`。
+- **正式补丁（`2415`–`2417`）与离线构建/安装检查：**
+  1. `2415`（`drivers/video/backlight/ktz8866.c`）：`!ktz->led_on` 且目标亮度为 `0` 时读取硬件 `KTZ8868_BL_CTRL`/`BL_EN`，若仍在点亮则执行关灯。
+  2. `2416`（`drivers/video/backlight/led_bl.c`）：去掉 `led_bl_power_off()` 的 `!priv->enabled` 早退，改用 `led_set_brightness_sync(..., LED_OFF)`（`-ENOTSUPP` 时回退 `led_set_brightness()`）。
+  3. `2417`（`drivers/clk/qcom/dispcc-sm8750.c`）：在 `oneplus,erhai` 上由 `disp_cc_sm8750_wait_boot_backlight()` 最长 `10 s` 延迟至 `led-backlight` 注册并完成 `backlight_disable()` 后再继续探针。
+  4. `patch -p1 -F0` 无模糊合入验证通过，正式 RPM `kernel-opd2413-7.2.15-23.opd2413.aarch64.rpm`（`SHA256: cbfdd4108e0278b2ea426fc158a994587716e1e17ade72bda77dfc2c2c67deb8`，无临时调试输出，关闭 `CONFIG_MODULE_ALLOW_BTF_MISMATCH`）构建完成。
+- **装机与真机多轮验收（2026-11-14）：**
+  1. **装机**：因离线启动系统时钟停在 `clock-epoch`（`2026-10-17`）导致 `rpm-sequoia` 拒签 10-18 后构建的 `systemd-udev`/`dracut` 且 `/etc/dnf/protected.d/opd2413.conf` 拦截 `installonly_limit=2` 自动淘汰 `-12`，同步时钟并使用 `dnf install --disablerepo='*' --setopt=protected_packages=''` 装入 `-23`（淘汰 `-12`、保留 `-22` 回退入口），`loader.conf` 默认入口设为 `fedora-7.2.15-23.opd2413.conf`（`/boot/efi` 已用 `247M / 512M`）。
+  2. **3 次热重启与功能回归**：3 次热重启均稳定进入 `7.2.15-23.opd2413 #51`（`systemctl is-system-running = running`、`0 failed`、`SELinux = Enforcing`、零 `BTF` 警告，`ktz8866` `0.28 s`/`0.29 s` → `msm-mdss bootloader scanout` `0.46 s`–`0.47 s` → `fbcon` `1.11 s`–`1.14 s`）；用户肉眼确认全程无偏白灰屏；复测 `3392x2400` 下的 `120 / 60 / 30 Hz` 在线切换（并恢复 `60 Hz`）、`DPMS off -> on`（`bl_power=4 <-> 0`）、Night Light（`available/enabled/running=true`）与 4 s `s2idle` 唤醒均通过。
+  3. **3 次冷启动**：3 次冷启动均未再出现偏白灰屏（[TECH-DEBT.md](TECH-DEBT.md) `#9` 与 `#38` 解除）；其中第 2 次冷启动在引导菜单选择入口后出现一次黑屏并短暂等待后自动重启（`journalctl --list-boots` 与 `/sys/fs/pstore` 未保留该次失败启动记录，第 1/3 次冷启动均一次正常进入桌面与 SSH），已记为 [TECH-DEBT.md](TECH-DEBT.md) `#39` 留待后续专项排查。

@@ -80,3 +80,8 @@
 2412-drm-msm-dpu-allocate-DSPP-upfront-so-CTM-changes-avo.patch
 2413-drm-panel-nt36536-re-enable-60-Hz-and-30-Hz-modes.patch
 2414-drm-msm-dpu-skip-video-mode-CTL-flush-start-in-phys-.patch
+
+# Boot flash fix (turn off bootloader-active backlight before parking mdp_clk_src)
+2415-backlight-ktz8866-turn-off-bootloader-active-KTZ8868.patch
+2416-backlight-led_bl-turn-off-LEDs-synchronously-without.patch
+2417-clk-qcom-dispcc-sm8750-wait-for-panel-backlight-befo.patch

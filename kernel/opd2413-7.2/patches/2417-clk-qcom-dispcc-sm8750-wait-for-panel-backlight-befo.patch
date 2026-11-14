@@ -1,0 +1,87 @@
+From b0ba23e3d780d180fe595391f51e95686bfe948e Mon Sep 17 00:00:00 2001
+From: build <build@localhost>
+Date: Sat, 14 Nov 2026 19:51:00 +0800
+Subject: [PATCH 2417/2417] clk: qcom: dispcc-sm8750: wait for panel backlight
+ before parking mdp_clk_src
+
+On OnePlus Pad 2 Pro (oneplus,erhai), dispcc-sm8750 probes ~160 ms before ktz8866 and led-backlight. Parking disp_cc_mdss_mdp_clk_src onto BI_TCXO during registration drops bootloader DSI scanout while KTZ8868 is still powered on, causing a bright grey/white boot flash. Defer disp_cc_sm8750_probe() (capped at 10s boottime) until led-backlight registers and call backlight_disable() so the panel backlight is off before parking mdp_clk_src.
+---
+ drivers/clk/qcom/dispcc-sm8750.c | 46 ++++++++++++++++++++++++++++++++
+ 1 file changed, 46 insertions(+)
+
+diff --git a/drivers/clk/qcom/dispcc-sm8750.c b/drivers/clk/qcom/dispcc-sm8750.c
+index 63b2b3b17..9a0bfbb67 100644
+--- a/drivers/clk/qcom/dispcc-sm8750.c
++++ b/drivers/clk/qcom/dispcc-sm8750.c
+@@ -4,10 +4,13 @@
+  * Copyright (c) 2023-2024, Linaro Ltd.
+  */
+ 
++#include <linux/backlight.h>
+ #include <linux/clk-provider.h>
+ #include <linux/err.h>
+ #include <linux/kernel.h>
++#include <linux/ktime.h>
+ #include <linux/module.h>
++#include <linux/of.h>
+ #include <linux/platform_device.h>
+ #include <linux/regmap.h>
+ #include <linux/pm_runtime.h>
+@@ -1901,11 +1904,54 @@ static const struct of_device_id disp_cc_sm8750_match_table[] = {
+ };
+ MODULE_DEVICE_TABLE(of, disp_cc_sm8750_match_table);
+ 
++/*
++ * Parking disp_cc_mdss_mdp_clk_src drops bootloader DSI scanout while the
++ * bootloader backlight is still lit, flashing the nt36536 panel white until
++ * the backlight driver probes ~160 ms later. Wait for the panel backlight and
++ * ensure it is off before registering and parking the display clocks.
++ */
++static int disp_cc_sm8750_wait_boot_backlight(struct device *dev)
++{
++#if IS_REACHABLE(CONFIG_BACKLIGHT_CLASS_DEVICE)
++	struct device_node *bl_np;
++	struct backlight_device *bl;
++
++	if (!of_machine_is_compatible("oneplus,erhai"))
++		return 0;
++
++	bl_np = of_find_compatible_node(NULL, NULL, "led-backlight");
++	if (!bl_np)
++		return 0;
++	if (!of_device_is_available(bl_np)) {
++		of_node_put(bl_np);
++		return 0;
++	}
++
++	bl = of_find_backlight_by_node(bl_np);
++	of_node_put(bl_np);
++	if (!bl) {
++		if (ktime_get_boottime_seconds() < 10)
++			return dev_err_probe(dev, -EPROBE_DEFER,
++					     "waiting for panel backlight before parking mdp_clk_src\n");
++		dev_warn(dev, "panel backlight missing after 10s, continuing dispcc probe\n");
++		return 0;
++	}
++
++	backlight_disable(bl);
++	put_device(&bl->dev);
++#endif
++	return 0;
++}
++
+ static int disp_cc_sm8750_probe(struct platform_device *pdev)
+ {
+ 	struct regmap *regmap;
+ 	int ret;
+ 
++	ret = disp_cc_sm8750_wait_boot_backlight(&pdev->dev);
++	if (ret)
++		return ret;
++
+ 	ret = devm_pm_runtime_enable(&pdev->dev);
+ 	if (ret)
+ 		return ret;
+-- 
+2.56.0
+

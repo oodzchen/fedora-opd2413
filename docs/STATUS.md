@@ -5,11 +5,11 @@
 
 ## 唯一的下一步
 
-**`7.2.15-22.opd2413`（`2411`–`2414`，解决在线 `120/60/30 Hz` 切换 `CTL_0` 卡死、夜览 DSPP/modeset 与 DPMS 息屏唤醒互斥）已设为主启动项并通过无参默认重启复核；`2414` 的硬件级深层根因与触控 `-112` 竞争已记入 [TECH-DEBT.md](TECH-DEBT.md) `#36`/`#37`；下一步继续 M4 外设与长尾项（或由用户决定是否向 erhai 回馈修复）。**
-- 2026-11-14 调查、`-19`..`-22` 控制变量对照与实机验收见 [WORKLOG.md](WORKLOG.md) 与 [DISPLAY-60HZ-MODESET.md](DISPLAY-60HZ-MODESET.md)；补丁 `2411`–`2414` 已导出至 `kernel/opd2413-7.2/patches/` 并验证 `-F0` 无模糊合入。
+**`7.2.15-23.opd2413`（`2415`–`2417`，解除 [TECH-DEBT.md](TECH-DEBT.md) `#9` 开机灰闪）已设为主启动项并通过 3 次热重启、`120/60/30 Hz` 切换、DPMS、Night Light、`s2idle` 与 3 次冷启动的无灰闪验证（`7.2.15-22` 保留为回退项）；下一步排查第 2 次冷启动选引导入口后偶发黑屏并自动重启问题（[TECH-DEBT.md](TECH-DEBT.md) `#39`），其余 `2414` 深层根因、`#37`、`#19`、M4 外设与回馈 erhai 按需接续。**
+- 2026-11-14 开机灰闪（`#9`）调查与 `2415`–`2417` 补丁已写入 `kernel/opd2413-7.2/patches/`（`-F0` 严格合入）与 [WORKLOG.md](WORKLOG.md)。
 - 2026-11-13 `7.2.15-12.opd2413`（含 `2408`–`2410`）：先经 `2408`+`2409` 实现 Pogo 键盘在 `s2idle` 下通过 `gpio3` 4 簇脉冲过滤按任意键唤醒并屏蔽 10.001 s 脉冲与 22.659 s 电池上报拍频碰撞；再通过 erhai `b30d759d3`（`2410`：`LLCC_ISLAND1` 改用 `res_ways = 0x7fffffff`）修复自 `7.2.15-6`（`2401`）引入的冷启动 30–60 s 内进 `s2idle` 在 `PM: suspend-to-idle` 后触发 `PS_HOLD` 硬件复位的问题。
 - 待续与长尾候选（详见下面 `M4` 与 [TECH-DEBT.md](TECH-DEBT.md)）：
-  - **显示**：#20（60/30 Hz）与 #35（Night Light DSPP）已于 `7.2.15-18.opd2413` 解除；余下 #9 开机灰闪（用户观察主要出现在选完 kShimC 引导后、内核日志输出前）与 #19 熄屏断电。
+  - **显示**：#20（60/30 Hz）、#35（Night Light DSPP）与 #9（开机灰闪）已相继解除；余下 `#39`（冷启动选入口后偶发黑屏自动重启）、`#36`（`2414` 寄存器级根因与无缝 VFP 切换）、`#37`（快速切换触控 `-112`）与 `#19`（熄屏断电）。
   - **系统/电源**：#34 合入 erhai GMU 绑定（`6f237b23c` 等）消除 `fw_devlink.sync_state=timeout`；M3.2b PPS 快充缺 PPS 充电器搁置；PMIC RTC 在早先硬件复位后停在 `2026-10-17` 且平板 `chronyc` 解析到代理保留地址未同步（`Not synchronised`）。
   - **外设与回馈**：USB 3 双向、DP 外接与音频；向 erhai 回馈修复前先问用户。
 - 测试新内核用 `tools/tablet-reboot.py --entry …`；装新内核前先 `boot-select default <当前条目>`。拔线调试时每次重启后都要重新起 `opd2413-debug-inhibit`。
@@ -35,7 +35,7 @@ M2 剩下的被动观察项：开机提示音毛刺再出现时当场取证；�
 
 ## 当前阻塞
 
-没有阻塞。默认内核 `7.2.15-22.opd2413`（`loader_default: fedora-7.2.15-22.opd2413.conf`），Fedora 45 KDE 正常运行；`7.2.15-12.opd2413` 为保留的上一稳定版回退条目。
+没有全局阻塞（第 2 次冷启动偶发选入口后黑屏自动重启已另立为 `#39` 后续排查）。默认内核 `7.2.15-23.opd2413`（`loader_default: fedora-7.2.15-23.opd2413.conf`），Fedora 45 KDE 正常运行；`7.2.15-22.opd2413` 为保留的上一稳定版回退条目（`-12` 已随 `installonly_limit=2` 卸载）。
 
 已知的坑：
 
@@ -53,14 +53,14 @@ M2 剩下的被动观察项：开机提示音毛刺再出现时当场取证；�
 3. 改了 `device/` 或任何 spec，按 [BUILD.md](BUILD.md) 重新构建、跑离线测试，再拷到平板用 `dnf install ./*.rpm` 装。
 4. 关机会自动重新开机（插着电时）。需要冷启动验证时可以直接经 SSH `systemctl poweroff`，约 40 秒后回来。
 
-## 设备状态（2026-11-14 13:47）
+## 设备状态（2026-11-14 20:17）
 
-- 13:47 运行：Fedora 45 KDE，默认启动内核 `7.2.15-22.opd2413`（含 `2411`–`2414`），无参默认重启 `49 s` 回到桌面，`systemctl is-system-running = running`，`systemctl --failed = 0`，SELinux `Enforcing`。`7.2.15-22` 上已通过自动化与用户手动实测：`120 <-> 60 <-> 30 Hz` 在线反复切换、`120/60/30 Hz` 下多轮 `DPMS off -> 3s -> on`（`mdss_gdsc off-0 -> on`，零 DRM/DPU/DSI/vblank/LUTDMA 报错）、Night Light（`preview 3500`/`stopPreview` 零 modeset 零内核报错）与 `s2idle` 休眠唤醒及唤醒后模式/DPMS 回归；剩余寄存器级根因、非无缝切换及触控偶发 `-112` 竞争日志已登记为 [TECH-DEBT.md](TECH-DEBT.md) `#36`/`#37`。
-- systemd-boot：`loader.conf` 默认 `fedora-7.2.15-22.opd2413.conf`（`pending_next: null`）；平板已装条目包含 `fedora-7.2.15-22.opd2413`、`fedora-7.2.15-12.opd2413`（`-18`..`-21` 均已卸载）。
+- 20:17 运行：Fedora 45 KDE，默认启动内核 `7.2.15-23.opd2413`（`#51`，含 `2415`–`2417`），`systemctl is-system-running = running`，`systemctl --failed = 0`，SELinux `Enforcing`，无 `BTF` 警告。`7.2.15-23` 上已完成 3 次热重启与 3 次冷启动测试（全程无开机灰闪；仅第 2 次冷启动在引导菜单选入口后出现一次黑屏随后自动重启，第 1/3 次冷启动及全部热重启正常，记为 `#39`），并通过 `3392x2400` 下的 `120 / 60 / 30 Hz` 切换（并恢复 `60 Hz`）、DPMS 熄/亮屏（`bl_power=4 <-> 0`）、Night Light（`available/enabled/running=true`）与 4 s `s2idle` 唤醒复核。
+- systemd-boot：`loader.conf` 默认 `fedora-7.2.15-23.opd2413.conf`；平板已装条目包含 `fedora-7.2.15-23.opd2413.conf`、`fedora-7.2.15-22.opd2413.conf`（`-12` 已随 `installonly_limit=2` 卸载，所有临时 `bisect1`/`nodispcc` 条目已清理）。
   ESP `/dev/sda16` 总计 512M、已用 247M、空闲 266M（49 %）。固定路径 `/dtbs/qcom/sm8750-oneplus-pad2pro.dtb` 是 7.2.15 的（与内核 3 相同）。
 - `boot_b` = `07bf1b53…`（fedora1：菜单 ColorOS / Fedora / Fedora boot menu，倒计时 10 s，默认项仍是 ColorOS）；KSHIM.CHO 记住 Fedora。
   上一版 `492f2cdf…` 的整分区回读在主机 `private/bootflow-20261111/boot_b-readonly.img`。
-- 软件包：内核 `kernel-opd2413-7.2.15-22.opd2413`、`kernel-opd2413-7.2.15-12.opd2413`，以及 `opd2413-device-0.1-14`、`opd2413-audio-0.1-12`、`opd2413-sensors-0.1-1`、`opd2413-firmware-16.0.10.600-2`、`showtime`（registry 在 `/var/lib/opd2413/sensors`）。`rpm -ivh --nosignature` 不受 `installonly_limit=2` 自动淘汰。
+- 软件包：内核 `kernel-opd2413-7.2.15-23.opd2413`、`kernel-opd2413-7.2.15-22.opd2413`（因 offline 时钟回到 `2026-10-17` 触发 `rpm-sequoia` 拒签 10-18 后构建的系统包且 `/etc/dnf/protected.d/opd2413.conf` 阻止 `installonly_limit=2` 自动淘汰 `-12`，校时并传 `--setopt=protected_packages=''` 后干净安装），以及 `opd2413-device-0.1-14`、`opd2413-audio-0.1-12`、`opd2413-sensors-0.1-1`、`opd2413-firmware-16.0.10.600-2`、`showtime`（registry 在 `/var/lib/opd2413/sensors`）。`rpm -ivh --nosignature` 不受 `installonly_limit=2` 自动淘汰。
   内核 3（`7.2.6-3`）08:45 经用户同意卸载，它的包仍在主机 `out/rpms/`。
 - 7.3 测试内核、"M3 test" 和 "Log capture" 两个条目、ESP 上的 `opd2413-bootlog/` 已于 11-11 23:29 删除。
 - `/etc/modprobe.d/opd2413-pps.conf` 已删除（11-12）。`/etc/kernel/tries` 已删除。
@@ -100,7 +100,8 @@ M2 剩下的被动观察项：开机提示音毛刺再出现时当场取证；�
 | `out/rpmbuild/RPMS/aarch64/kernel-opd2413-7.2.15-11.opd2413.aarch64.rpm` | M3.6 键盘唤醒内核（`2408`–`2409`，不含 `2410`） |
 | `out/rpmbuild/RPMS/aarch64/kernel-opd2413-7.2.15-12.opd2413.aarch64.rpm` | 当前默认内核（合入 `2410` 修复冷启动早休眠 `PS_HOLD` 复位）；`out/m3k/pkg-test12/` 是它的容器安装校验 |
 | `out/rpmbuild/RPMS/aarch64/kernel-opd2413-7.2.15-18.opd2413.aarch64.rpm` | 旧测试内核（`2411`–`2413`，手动切 60 Hz 时复现 `CTL_0` 卡死，已从平板卸载） |
-| `out/rpmbuild/RPMS/aarch64/kernel-opd2413-7.2.15-22.opd2413.aarch64.rpm` | 当前默认内核（`2411`–`2414`，`SHA256: 139a520f...`，实机/手动与默认重启复核通过） |
+| `out/rpmbuild/RPMS/aarch64/kernel-opd2413-7.2.15-22.opd2413.aarch64.rpm` | 上一版内核，现保留为平板回退条目（`2411`–`2414`，`SHA256: 139a520f...`） |
+| `out/rpmbuild/RPMS/aarch64/kernel-opd2413-7.2.15-23.opd2413.aarch64.rpm` | 当前默认内核（合入 `2415`–`2417` 解除开机灰闪，`SHA256: cbfdd4108e0278b2ea426fc158a994587716e1e17ade72bda77dfc2c2c67deb8`） |
 | `private/m3-kbdwake-20261113/` | 2026-11-13 Pogo 键盘唤醒排查、4 簇过滤验证、`ramoops-000009-s2idle.txt` 及 `7.2.15-12` 两次冷启动验收日志 |
 | `out/rpmbuild/RPMS/aarch64/opd2413-sensors-0.1-1.aarch64.rpm`、`out/sensors/` | 传感器包及其源码包、构建日志 |
 | `private/sensors-persist-20261102/` | 从 persist 备份导出的传感器 registry（本机数据） |
@@ -122,7 +123,7 @@ M2 剩下的被动观察项：开机提示音毛刺再出现时当场取证；�
 | M1 | Fedora 45 KDE 用现有 7.2.6 内核从机内启动，功能与 Armada 持平，然后取代 Armada | 完成（2026-11-11） |
 | M2 | 运行中面板重新打开黑屏（已修）；标准化：SELinux、防火墙、每条目 DTB、内核升级和回滚流程（[KERNEL-UPDATE.md](KERNEL-UPDATE.md)）都已完成；开机提示音毛刺待再现 | 基本完成 |
 | M3 | 在 7.2 内核（基线 7.2.15）上逐项合入 erhai 的功能：蓝牙、电池与充电、休眠与按键、传感器、摄像头、视频硬解（[M3-FEATURES.md](M3-FEATURES.md)） | 完成（2026-11-12）：基线 7.2.15、蓝牙、电池与 9 V 充电、休眠与按键（含睡深）、摄像头、麦克风、键盘、传感器、视频硬解都真机通过；PPS 快充（M3.2b）驱动就绪、缺 PPS 充电器未实测 |
-| M4 | 外设逐项验收和长尾问题（灰闪、USB 3 方向、DP 音频等） | 未开始 |
+| M4 | 外设逐项验收和长尾问题（灰闪、USB 3 方向、DP 音频等） | 进行中：#9 开机灰闪已在 `7.2.15-23` 解除；#39 冷启动选入口偶发黑屏重启等长尾待继续 |
 | M5 | 维护：软件包自动重建、ColorOS OTA 后恢复流程、对外文档 | 未开始 |
 | M6 | 内核基线跟到 Fedora 45 的当前内核（7.3.x 或更新），原 M3（[M3-KERNEL.md](M3-KERNEL.md)） | 暂停（2026-11-11）：跳过 GPU 时真机启动；带 GPU 时真机失败（GMU 启动时复位） |
 
@@ -155,7 +156,7 @@ Armada 下的结论见 [HARDWARE.md](HARDWARE.md)。换了发行版后都要重�
 |---|---|---|
 | 启动链（kShimC → U-Boot → systemd-boot） | 真机通过 | Fedora 的 ESP 布局 + systemd-boot 262；多次关机重启均正常 |
 | 机内启动 Fedora | 真机通过 | 2026-11-10/11，首次启动和 6 次关机重启均 `running`、失败单元 0 |
-| 显示、背光 | 真机通过 | `7.2.15-22.opd2413`（`2411`–`2414`）：`120/60/30 Hz` 在线切换、三档刷新率下 `DPMS off -> on`、Night Light（无 modeset）及 `s2idle` 唤醒均自动化与手动确认通过；`2414` 规避机制与无缝切换留待后期根修见 [TECH-DEBT.md](TECH-DEBT.md) `#36` |
+| 显示、背光 | 真机通过 | `7.2.15-23.opd2413`（`2415`–`2417`）：3 次热重启 + 3 次冷启动解除开机灰闪（`#9`），且复核 `120/60/30 Hz` 切换、`DPMS off -> on`、Night Light 与 `s2idle`；第 2 次冷启动偶发选入口后黑屏自动重启见 [TECH-DEBT.md](TECH-DEBT.md) `#39`，`2414` 规避机制与无缝切换见 `#36` |
 | 触控 | 真机通过 | 用户确认触屏正常（2026-11-10）；面板重新 prepare 后触控固件也能重新下载 |
 | GPU 硬件渲染 | 真机通过 | Fedora 原版 Mesa 26.2.6：KWin 用 OpenGL ES 3.2 / Adreno 830（freedreno），Vulkan 为 turnip；不需要带补丁的 Mesa |
 | Pogo 键盘、触控板 | 真机通过 | 用户确认打字和触控板正常（2026-11-10）；日志有 libinput "touch jump" 警告；2026-11-13 `7.2.15-12`（`2408`–`2409`）支持 `s2idle` 下按键盘按键直接唤醒并点亮屏幕（休眠时 MCU 硬件关闭触控板） |

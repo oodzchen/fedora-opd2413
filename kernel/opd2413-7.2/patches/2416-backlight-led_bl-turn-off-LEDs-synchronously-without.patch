@@ -1,0 +1,35 @@
+From dfe65c9957838bf0e46b6d22532a0210637e067f Mon Sep 17 00:00:00 2001
+From: build <build@localhost>
+Date: Sat, 14 Nov 2026 19:51:00 +0800
+Subject: [PATCH 2416/2417] backlight: led_bl: turn off LEDs synchronously
+ without skipping boot state
+
+led_bl_probe() allocates led_bl_data with enabled=false, so led_bl_power_off() returned early during initial probe and left bootloader-enabled LEDs lit. Also led_set_brightness(..., LED_OFF) queues work asynchronously for blocking I2C LED drivers. Remove the early return and use led_set_brightness_sync() (falling back to led_set_brightness() on -ENOTSUPP) so callers wait for hardware off before proceeding.
+---
+ drivers/video/backlight/led_bl.c | 10 +++++-----
+ 1 file changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/video/backlight/led_bl.c b/drivers/video/backlight/led_bl.c
+index f7ab9b360..cc7bf6ab7 100644
+--- a/drivers/video/backlight/led_bl.c
++++ b/drivers/video/backlight/led_bl.c
+@@ -43,11 +43,11 @@ static void led_bl_power_off(struct led_bl_data *priv)
+ {
+ 	int i;
+ 
+-	if (!priv->enabled)
+-		return;
+-
+-	for (i = 0; i < priv->nb_leds; i++)
+-		led_set_brightness(priv->leds[i], LED_OFF);
++	for (i = 0; i < priv->nb_leds; i++) {
++		/* Turn off synchronously so callers see hardware off before return */
++		if (led_set_brightness_sync(priv->leds[i], LED_OFF) == -ENOTSUPP)
++			led_set_brightness(priv->leds[i], LED_OFF);
++	}
+ 
+ 	priv->enabled = false;
+ }
+-- 
+2.56.0
+
