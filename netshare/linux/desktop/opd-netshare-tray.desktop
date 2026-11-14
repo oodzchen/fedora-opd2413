@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=OPD NetShare Tray
+Name[zh_CN]=OPD 跨设备网络共享托盘
+Comment=System tray monitor for OPD2413 cross-device network sharing
+Exec=/usr/bin/opd-netshare-tray
+Icon=network-wireless
+Terminal=false
+OnlyShowIn=KDE;
+X-KDE-autostart-after=panel
+StartupNotify=false

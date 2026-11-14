@@ -1,0 +1,139 @@
+#!/usr/bin/python3
+"""CLI frontend for local.opd2413.NetShare."""
+
+from __future__ import annotations
+
+import json
+import sys
+import gi
+
+gi.require_version("GLib", "2.0")
+gi.require_version("Gio", "2.0")
+from gi.repository import Gio, GLib  # noqa: E402
+
+BUS_NAME = "local.opd2413.NetShare"
+OBJ_PATH = "/local/opd2413/NetShare"
+
+
+def call(method: str, params: GLib.Variant | None, rtype: str) -> tuple:
+    bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+    res = bus.call_sync(
+        BUS_NAME,
+        OBJ_PATH,
+        BUS_NAME,
+        method,
+        params,
+        GLib.VariantType(rtype),
+        Gio.DBusCallFlags.NONE,
+        5000,
+        None,
+    )
+    return res.unpack()
+
+
+def list_paired_bluez() -> list[tuple[str, str, bool]]:
+    bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+    res = bus.call_sync(
+        "org.bluez",
+        "/",
+        "org.freedesktop.DBus.ObjectManager",
+        "GetManagedObjects",
+        None,
+        GLib.VariantType("(a{oa{sa{sv}}})"),
+        Gio.DBusCallFlags.NONE,
+        3000,
+        None,
+    )
+    objs = res.unpack()[0]
+    out: list[tuple[str, str, bool]] = []
+    for ifaces in objs.values():
+        dev = ifaces.get("org.bluez.Device1")
+        if not dev:
+            continue
+        if not dev.get("Paired", False):
+            continue
+        out.append((str(dev.get("Address", "")), str(dev.get("Name", "")), bool(dev.get("Trusted", False))))
+    return out
+
+
+def usage() -> int:
+    print(
+        "Usage:\n"
+        "  opd-netshare status [--json]\n"
+        "  opd-netshare mode <auto|force|off>\n"
+        "  opd-netshare disconnect\n"
+        "  opd-netshare peers\n"
+        "  opd-netshare allow <BT_MAC>\n"
+        "  opd-netshare remove <BT_MAC>"
+    )
+    return 2
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 2:
+        cmd = "status"
+    else:
+        cmd = argv[1]
+
+    if cmd == "status":
+        st = call("GetStatus", None, "(a{sv})")[0]
+        if "--json" in argv:
+            print(json.dumps(st, ensure_ascii=False, indent=2))
+            return 0
+        print(f"Mode:          {st['mode']}")
+        print(f"State:         {st['state']}")
+        print(f"BT Powered:    {st['bt_powered']}")
+        print(f"Peer MAC:      {st['peer_mac'] or '-'}")
+        print(f"Peer IP:       {st['peer_ip'] or '-'}")
+        print(f"AP SSID/Freq:  {st['ssid'] or '-'} ({st['freq']} MHz)")
+        print(f"TX Bitrate:    {st['tx_bitrate'] or '-'}")
+        print(f"RX / TX Bytes: {st['rx_bytes']} / {st['tx_bytes']}")
+        print(f"Allowed Peers: {', '.join(st['allowed_peers']) or '(none)'}")
+        if st["last_error"]:
+            print(f"Last Error:    {st['last_error']}")
+        return 0
+
+    if cmd == "mode" and len(argv) == 3:
+        ok, msg = call("SetMode", GLib.Variant("(s)", (argv[2],)), "(bs)")
+        print(msg)
+        return 0 if ok else 1
+
+    if cmd in ("auto", "force", "off") and len(argv) == 2:
+        ok, msg = call("SetMode", GLib.Variant("(s)", (cmd,)), "(bs)")
+        print(msg)
+        return 0 if ok else 1
+
+    if cmd == "disconnect":
+        (ok,) = call("DisconnectNow", None, "(b)")
+        return 0 if ok else 1
+
+    if cmd == "peers":
+        st = call("GetStatus", None, "(a{sv})")[0]
+        allowed = set(st["allowed_peers"])
+        paired = list_paired_bluez()
+        if not paired:
+            print("(no paired Bluetooth devices found)")
+        for addr, name, trusted in paired:
+            flags = []
+            if addr.upper() in allowed:
+                flags.append("ALLOWED")
+            if trusted:
+                flags.append("TRUSTED")
+            print(f"{addr}\t{name}\t[{', '.join(flags) or 'PAIRED'}]")
+        return 0
+
+    if cmd == "allow" and len(argv) == 3:
+        ok, msg = call("AllowPeer", GLib.Variant("(s)", (argv[2],)), "(bs)")
+        print(msg)
+        return 0 if ok else 1
+
+    if cmd == "remove" and len(argv) == 3:
+        ok, msg = call("RemovePeer", GLib.Variant("(s)", (argv[2],)), "(bs)")
+        print(msg)
+        return 0 if ok else 1
+
+    return usage()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

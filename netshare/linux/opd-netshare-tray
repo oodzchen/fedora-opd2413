@@ -1,0 +1,365 @@
+#!/usr/bin/python3
+"""KDE Plasma system tray UI for OPD2413 cross-device network sharing."""
+
+from __future__ import annotations
+
+import signal
+import sys
+import threading
+import gi
+
+gi.require_version("GLib", "2.0")
+gi.require_version("Gio", "2.0")
+from gi.repository import Gio, GLib  # noqa: E402
+
+from PySide6.QtCore import QObject, Qt, Signal  # noqa: E402
+from PySide6.QtGui import QAction, QActionGroup, QColor, QIcon, QPainter, QPixmap  # noqa: E402
+from PySide6.QtWidgets import (  # noqa: E402
+    QApplication,
+    QDialog,
+    QHBoxLayout,
+    QLabel,
+    QListWidget,
+    QListWidgetItem,
+    QMenu,
+    QMessageBox,
+    QPushButton,
+    QSystemTrayIcon,
+    QVBoxLayout,
+)
+
+BUS_NAME = "local.opd2413.NetShare"
+OBJ_PATH = "/local/opd2413/NetShare"
+
+
+def fmt_bytes(n: int) -> str:
+    val = float(n)
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if val < 1024.0 or unit == "GiB":
+            return f"{val:.1f} {unit}" if unit != "B" else f"{int(val)} B"
+        val /= 1024.0
+    return f"{val:.1f} GiB"
+
+
+def make_badge_icon(color_hex: str, ring_hex: str = "#ffffff") -> QIcon:
+    pix = QPixmap(64, 64)
+    pix.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pix)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor(ring_hex))
+    p.drawEllipse(6, 6, 52, 52)
+    p.setBrush(QColor(color_hex))
+    p.drawEllipse(11, 11, 42, 42)
+    p.setBrush(QColor("#ffffff"))
+    p.drawEllipse(25, 25, 14, 14)
+    p.end()
+    return QIcon(pix)
+
+
+class DbusBridge(QObject):
+    status_updated = Signal(dict)
+    dbus_error = Signal(str)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+        self._loop = GLib.MainLoop()
+        self.bus.signal_subscribe(
+            BUS_NAME,
+            BUS_NAME,
+            "StatusChanged",
+            OBJ_PATH,
+            None,
+            Gio.DBusSignalFlags.NONE,
+            self._on_signal,
+        )
+        threading.Thread(target=self._loop.run, daemon=True).start()
+
+    def _on_signal(self, _conn, _sender, _path, _iface, _sig, params: GLib.Variant) -> None:
+        st = params.unpack()[0]
+        self.status_updated.emit(st)
+
+    def refresh(self) -> dict | None:
+        try:
+            res = self.bus.call_sync(
+                BUS_NAME,
+                OBJ_PATH,
+                BUS_NAME,
+                "GetStatus",
+                None,
+                GLib.VariantType("(a{sv})"),
+                Gio.DBusCallFlags.NONE,
+                3000,
+                None,
+            )
+            st = res.unpack()[0]
+            self.status_updated.emit(st)
+            return st
+        except Exception as exc:
+            self.dbus_error.emit(str(exc))
+            return None
+
+    def set_mode(self, mode: str) -> tuple[bool, str]:
+        res = self.bus.call_sync(
+            BUS_NAME,
+            OBJ_PATH,
+            BUS_NAME,
+            "SetMode",
+            GLib.Variant("(s)", (mode,)),
+            GLib.VariantType("(bs)"),
+            Gio.DBusCallFlags.NONE,
+            5000,
+            None,
+        )
+        return res.unpack()
+
+    def allow_peer(self, mac: str) -> tuple[bool, str]:
+        res = self.bus.call_sync(
+            BUS_NAME,
+            OBJ_PATH,
+            BUS_NAME,
+            "AllowPeer",
+            GLib.Variant("(s)", (mac,)),
+            GLib.VariantType("(bs)"),
+            Gio.DBusCallFlags.NONE,
+            5000,
+            None,
+        )
+        return res.unpack()
+
+    def remove_peer(self, mac: str) -> tuple[bool, str]:
+        res = self.bus.call_sync(
+            BUS_NAME,
+            OBJ_PATH,
+            BUS_NAME,
+            "RemovePeer",
+            GLib.Variant("(s)", (mac,)),
+            GLib.VariantType("(bs)"),
+            Gio.DBusCallFlags.NONE,
+            5000,
+            None,
+        )
+        return res.unpack()
+
+    def paired_bluez_devices(self) -> list[tuple[str, str]]:
+        res = self.bus.call_sync(
+            "org.bluez",
+            "/",
+            "org.freedesktop.DBus.ObjectManager",
+            "GetManagedObjects",
+            None,
+            GLib.VariantType("(a{oa{sa{sv}}})"),
+            Gio.DBusCallFlags.NONE,
+            3000,
+            None,
+        )
+        objs = res.unpack()[0]
+        devices: list[tuple[str, str]] = []
+        for ifaces in objs.values():
+            dev = ifaces.get("org.bluez.Device1")
+            if dev and dev.get("Paired", False):
+                devices.append((str(dev.get("Address", "")), str(dev.get("Name", ""))))
+        return devices
+
+
+class StatusDialog(QDialog):
+    def __init__(self, bridge: DbusBridge) -> None:
+        super().__init__()
+        self.bridge = bridge
+        self.setWindowTitle("OPD2413 设备网络共享")
+        self.resize(440, 360)
+
+        layout = QVBoxLayout(self)
+        self.info_label = QLabel("正在读取状态...")
+        self.info_label.setWordWrap(True)
+        layout.addWidget(self.info_label)
+
+        btn_row = QHBoxLayout()
+        self.btn_auto = QPushButton("自动模式")
+        self.btn_force = QPushButton("立即互联")
+        self.btn_off = QPushButton("关闭")
+        self.btn_auto.clicked.connect(lambda: self._switch("auto"))
+        self.btn_force.clicked.connect(lambda: self._switch("force"))
+        self.btn_off.clicked.connect(lambda: self._switch("off"))
+        btn_row.addWidget(self.btn_auto)
+        btn_row.addWidget(self.btn_force)
+        btn_row.addWidget(self.btn_off)
+        layout.addLayout(btn_row)
+
+        layout.addWidget(QLabel("已配对蓝牙设备（勾选即授权自动共享网络）:"))
+        self.peer_list = QListWidget()
+        self.peer_list.itemChanged.connect(self._on_peer_toggled)
+        layout.addWidget(self.peer_list)
+
+        bottom = QHBoxLayout()
+        btn_reload = QPushButton("刷新列表")
+        btn_close = QPushButton("隐藏窗口")
+        btn_reload.clicked.connect(self.reload_peers)
+        btn_close.clicked.connect(self.hide)
+        bottom.addWidget(btn_reload)
+        bottom.addStretch()
+        bottom.addWidget(btn_close)
+        layout.addLayout(bottom)
+
+        self._updating_peers = False
+        self._last_status: dict = {}
+
+    def _switch(self, mode: str) -> None:
+        try:
+            ok, msg = self.bridge.set_mode(mode)
+            if not ok:
+                QMessageBox.warning(self, "切换失败", msg)
+        except Exception as exc:
+            QMessageBox.critical(self, "D-Bus 错误", str(exc))
+
+    def update_status(self, st: dict) -> None:
+        self._last_status = st
+        lines = [
+            f"模式: {st.get('mode', '-')}",
+            f"状态: {st.get('state', '-')}",
+            f"手机 MAC / IP: {st.get('peer_mac') or '-'} / {st.get('peer_ip') or '-'}",
+            f"P2P SSID / 信道: {st.get('ssid') or '-'} ({st.get('freq', 0)} MHz)",
+            f"速率: {st.get('tx_bitrate') or '-'}",
+            f"流量: 下行 {fmt_bytes(int(st.get('rx_bytes', 0)))} / 上行 {fmt_bytes(int(st.get('tx_bytes', 0)))}",
+        ]
+        if st.get("last_error"):
+            lines.append(f"提示: {st['last_error']}")
+        self.info_label.setText("\n".join(lines))
+
+    def reload_peers(self) -> None:
+        self._updating_peers = True
+        try:
+            self.peer_list.clear()
+            allowed = set(m.upper() for m in self._last_status.get("allowed_peers", []))
+            for addr, name in self.bridge.paired_bluez_devices():
+                item = QListWidgetItem(f"{name or addr} ({addr})")
+                item.setData(Qt.ItemDataRole.UserRole, addr)
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                item.setCheckState(Qt.CheckState.Checked if addr.upper() in allowed else Qt.CheckState.Unchecked)
+                self.peer_list.addItem(item)
+        except Exception as exc:
+            QMessageBox.warning(self, "蓝牙读取失败", str(exc))
+        finally:
+            self._updating_peers = False
+
+    def _on_peer_toggled(self, item: QListWidgetItem) -> None:
+        if self._updating_peers:
+            return
+        mac = str(item.data(Qt.ItemDataRole.UserRole))
+        try:
+            if item.checkState() == Qt.CheckState.Checked:
+                ok, msg = self.bridge.allow_peer(mac)
+            else:
+                ok, msg = self.bridge.remove_peer(mac)
+            if not ok:
+                QMessageBox.warning(self, "授权修改失败", msg)
+        except Exception as exc:
+            QMessageBox.critical(self, "D-Bus 错误", str(exc))
+
+
+class TrayController:
+    def __init__(self, app: QApplication) -> None:
+        self.app = app
+        self.bridge = DbusBridge()
+        self.dialog = StatusDialog(self.bridge)
+        self.last_state = ""
+
+        self.icons = {
+            "connected": make_badge_icon("#22c55e"),
+            "advertising": make_badge_icon("#f59e0b"),
+            "idle": make_badge_icon("#3b82f6"),
+            "off": make_badge_icon("#6b7280"),
+        }
+
+        self.tray = QSystemTrayIcon(self.icons["idle"], self.app)
+        self.menu = QMenu()
+        self.group = QActionGroup(self.menu)
+        self.group.setExclusive(True)
+
+        self.act_auto = QAction("自动模式 (无 Wi-Fi 时自动互联)", self.menu, checkable=True)
+        self.act_force = QAction("立即使用手机网络共享", self.menu, checkable=True)
+        self.act_off = QAction("关闭网络共享", self.menu, checkable=True)
+        for act, mode in ((self.act_auto, "auto"), (self.act_force, "force"), (self.act_off, "off")):
+            self.group.addAction(act)
+            self.menu.addAction(act)
+            act.triggered.connect(lambda _checked=False, m=mode: self.bridge.set_mode(m))
+
+        self.menu.addSeparator()
+        act_open = QAction("状态与设备授权...", self.menu)
+        act_open.triggered.connect(self._show_dialog)
+        self.menu.addAction(act_open)
+
+        act_quit = QAction("退出托盘", self.menu)
+        act_quit.triggered.connect(self.app.quit)
+        self.menu.addAction(act_quit)
+
+        self.tray.setContextMenu(self.menu)
+        self.tray.activated.connect(self._on_activated)
+        self.tray.show()
+
+        self.bridge.status_updated.connect(self._on_status)
+        self.bridge.dbus_error.connect(self._on_error)
+        st = self.bridge.refresh()
+        if st:
+            self.dialog.reload_peers()
+
+    def _show_dialog(self) -> None:
+        self.bridge.refresh()
+        self.dialog.reload_peers()
+        self.dialog.show()
+        self.dialog.raise_()
+        self.dialog.activateWindow()
+
+    def _on_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        if reason in (QSystemTrayIcon.ActivationReason.Trigger, QSystemTrayIcon.ActivationReason.DoubleClick):
+            if self.dialog.isVisible():
+                self.dialog.hide()
+            else:
+                self._show_dialog()
+
+    def _on_error(self, msg: str) -> None:
+        self.tray.setIcon(self.icons["off"])
+        self.tray.setToolTip(f"OPD 网络共享 (服务未连接: {msg})")
+
+    def _on_status(self, st: dict) -> None:
+        mode = str(st.get("mode", "auto"))
+        state = str(st.get("state", "idle"))
+        self.dialog.update_status(st)
+
+        self.act_auto.setChecked(mode == "auto")
+        self.act_force.setChecked(mode == "force")
+        self.act_off.setChecked(mode == "off")
+
+        if mode == "off":
+            self.tray.setIcon(self.icons["off"])
+            self.tray.setToolTip("OPD 网络共享：已关闭")
+        elif state == "connected":
+            self.tray.setIcon(self.icons["connected"])
+            rate = st.get("tx_bitrate") or ""
+            self.tray.setToolTip(f"OPD 网络共享：已连接 ({st.get('peer_ip')}) {rate}")
+        elif state == "advertising":
+            self.tray.setIcon(self.icons["advertising"])
+            self.tray.setToolTip("OPD 网络共享：正在通过蓝牙请求手机...")
+        else:
+            self.tray.setIcon(self.icons["idle"])
+            self.tray.setToolTip("OPD 网络共享：自动待命")
+
+        if self.last_state and state != self.last_state:
+            if state == "connected":
+                self.tray.showMessage("手机网络共享已连接", f"经由 {st.get('peer_mac')} ({st.get('peer_ip')}) 接入", QSystemTrayIcon.MessageIcon.Information, 3000)
+            elif self.last_state == "connected" and state == "idle":
+                self.tray.showMessage("手机网络共享已断开", "已切回本地网络或关闭", QSystemTrayIcon.MessageIcon.Information, 3000)
+        self.last_state = state
+
+
+def main() -> int:
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
+    _ctrl = TrayController(app)
+    return app.exec()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

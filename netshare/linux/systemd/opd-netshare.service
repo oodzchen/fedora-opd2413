@@ -1,0 +1,21 @@
+[Unit]
+Description=OPD2413 Cross-Device Network Sharing Daemon
+After=bluetooth.service NetworkManager.service firewalld.service systemd-resolved.service dbus.service
+Wants=bluetooth.service NetworkManager.service firewalld.service systemd-resolved.service
+
+[Service]
+Type=simple
+ExecStart=/usr/libexec/opd2413/opd-netshare-daemon
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=10
+ExecStopPost=-/usr/bin/pkill -f "^/usr/sbin/wpa_supplicant .*/run/opd-netshare/wpa_supplicant.conf"
+ExecStopPost=-/usr/bin/pkill -f "^(/usr/sbin/|/usr/bin/)?dnsmasq .*--interface=p2p0 "
+ExecStopPost=-/usr/bin/resolvectl revert p2p0
+ExecStopPost=-/usr/bin/env ip route del default dev p2p0
+ExecStopPost=-/usr/bin/firewall-cmd --zone=trusted --remove-interface=p2p0
+ExecStopPost=-/usr/bin/env iw dev p2p0 del
+ExecStopPost=-/usr/bin/rm -rf /run/opd-netshare
+
+[Install]
+WantedBy=multi-user.target

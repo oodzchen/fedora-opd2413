@@ -1,0 +1,1107 @@
+#!/usr/bin/python3
+"""OPD2413 cross-device network share daemon (BlueZ BLE/RFCOMM + private p2p0 AP)."""
+
+from __future__ import annotations
+
+from concurrent.futures import ThreadPoolExecutor
+import configparser
+import json
+import os
+import re
+import secrets
+import shutil
+import signal
+import socket
+import string
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+from typing import Any
+
+import gi
+
+gi.require_version("GLib", "2.0")
+gi.require_version("Gio", "2.0")
+from gi.repository import Gio, GLib  # noqa: E402
+
+BUS_NAME = "local.opd2413.NetShare"
+OBJ_PATH = "/local/opd2413/NetShare"
+ADV_PATH = "/local/opd2413/NetShare/adv0"
+PROFILE_PATH = "/local/opd2413/NetShare/rfcomm"
+
+BLUEZ_SERVICE = "org.bluez"
+ADAPTER_PATH = "/org/bluez/hci0"
+ADV_UUID = "e4a10001-6f2d-4c8a-9b1e-4f8a2d000001"
+RFCOMM_UUID = "e4a10002-6f2d-4c8a-9b1e-4f8a2d000001"
+
+RUN_DIR = Path("/run/opd-netshare")
+WPAS_CTRL_DIR = RUN_DIR / "wpas"
+WPAS_CONF = RUN_DIR / "wpa_supplicant.conf"
+CONFIG_PATH = Path("/etc/opd2413/netshare.conf")
+
+AP_IFACE = "p2p0"
+AP_GW_IP = "192.168.49.1"
+AP_CIDR = "192.168.49.1/24"
+DHCP_START = "192.168.49.100"
+DHCP_END = "192.168.49.150"
+DNS_SERVERS = ["223.5.5.5", "119.29.29.29"]
+
+METRIC_AUTO_FALLBACK = 700
+METRIC_OVERRIDE_WIFI = 550
+
+INTROSPECTION_XML = """
+<node>
+  <interface name="local.opd2413.NetShare">
+    <method name="SetMode">
+      <arg name="mode" type="s" direction="in"/>
+      <arg name="ok" type="b" direction="out"/>
+      <arg name="message" type="s" direction="out"/>
+    </method>
+    <method name="GetStatus">
+      <arg name="status" type="a{sv}" direction="out"/>
+    </method>
+    <method name="AllowPeer">
+      <arg name="mac" type="s" direction="in"/>
+      <arg name="ok" type="b" direction="out"/>
+      <arg name="message" type="s" direction="out"/>
+    </method>
+    <method name="RemovePeer">
+      <arg name="mac" type="s" direction="in"/>
+      <arg name="ok" type="b" direction="out"/>
+      <arg name="message" type="s" direction="out"/>
+    </method>
+    <method name="DisconnectNow">
+      <arg name="ok" type="b" direction="out"/>
+    </method>
+    <signal name="StatusChanged">
+      <arg name="status" type="a{sv}"/>
+    </signal>
+  </interface>
+</node>
+"""
+
+ADV_XML = """
+<node>
+  <interface name="org.bluez.LEAdvertisement1">
+    <method name="Release"/>
+    <property name="Type" type="s" access="read"/>
+    <property name="ServiceUUIDs" type="as" access="read"/>
+    <property name="LocalName" type="s" access="read"/>
+  </interface>
+</node>
+"""
+
+PROFILE_XML = """
+<node>
+  <interface name="org.bluez.Profile1">
+    <method name="Release"/>
+    <method name="NewConnection">
+      <arg name="device" type="o" direction="in"/>
+      <arg name="fd" type="h" direction="in"/>
+      <arg name="fd_properties" type="a{sv}" direction="in"/>
+    </method>
+    <method name="RequestDisconnection">
+      <arg name="device" type="o" direction="in"/>
+    </method>
+  </interface>
+</node>
+"""
+
+
+def run_cmd(cmd: list[str], check: bool = False, timeout: float = 10.0) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(cmd, text=True, capture_output=True, check=check, timeout=timeout)
+
+
+def log(msg: str) -> None:
+    print(f"[opd-netshare] {msg}", flush=True)
+
+
+def normalize_mac(mac: str) -> str:
+    clean = mac.strip().upper()
+    if not re.fullmatch(r"([0-9A-F]{2}:){5}[0-9A-F]{2}", clean):
+        raise ValueError(f"Invalid Bluetooth MAC: {mac!r}")
+    return clean
+
+
+def random_credentials() -> tuple[str, str]:
+    suffix = secrets.token_hex(3)
+    alphabet = string.ascii_letters + string.digits
+    psk = "".join(secrets.choice(alphabet) for _ in range(24))
+    return f"DIRECT-op-{suffix}", psk
+
+
+def probe_wlp1s0_internet() -> tuple[bool, bool]:
+    """Return (wlp1s0_has_default_route, wlp1s0_internet_ok) bound directly to wlp1s0."""
+    res = run_cmd(["ip", "-4", "route", "show", "dev", "wlp1s0"])
+    has_default = any(line.startswith("default ") for line in res.stdout.splitlines())
+    if not has_default:
+        return False, False
+
+    so_bindtodevice = getattr(socket, "SO_BINDTODEVICE", 25)
+    for host, port in (("223.5.5.5", 53), ("119.29.29.29", 53)):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.settimeout(2.0)
+            sock.setsockopt(socket.SOL_SOCKET, so_bindtodevice, b"wlp1s0\x00")
+            sock.connect((host, port))
+            return True, True
+        except OSError:
+            continue
+        finally:
+            sock.close()
+    return True, False
+
+
+def pick_ap_frequency() -> int:
+    """Stay on wlp1s0's 2.4 GHz frequency if associated there (#channels <= 1); else Ch11."""
+    res = run_cmd(["iw", "dev", "wlp1s0", "info"])
+    m = re.search(r"channel\s+\d+\s+\((\d+)\s+MHz\)", res.stdout)
+    if m:
+        freq = int(m.group(1))
+        if 2412 <= freq <= 2462:
+            return freq
+    return 2462
+
+
+def query_station_stats() -> tuple[str, int, int]:
+    res = run_cmd(["iw", "dev", AP_IFACE, "station", "dump"])
+    if res.returncode != 0 or "Station " not in res.stdout:
+        return "", 0, 0
+    bitrate = ""
+    rx_b = 0
+    tx_b = 0
+    for line in res.stdout.splitlines():
+        s = line.strip()
+        if s.startswith("tx bitrate:"):
+            bitrate = s.split(":", 1)[1].strip()
+        elif s.startswith("rx bytes:"):
+            rx_b = int(s.split(":", 1)[1].strip())
+        elif s.startswith("tx bytes:"):
+            tx_b = int(s.split(":", 1)[1].strip())
+    return bitrate, rx_b, tx_b
+
+
+class NetShareDaemon:
+    def __init__(self, loop: GLib.MainLoop, bus: Gio.DBusConnection) -> None:
+        self.loop = loop
+        self.bus = bus
+        self.lock = threading.RLock()
+
+        self.mode = "auto"  # auto | force | off
+        self.state = "idle"  # idle | advertising | connected
+        self.auto_power_bt = True
+        self.we_powered_bt = False
+        self.allowed_peers: list[str] = []
+        self.last_error = ""
+
+        self.ssid = ""
+        self.psk = ""
+        self.freq = 2462
+        self.peer_mac = ""
+        self.peer_ip = ""
+        self.active_metric = METRIC_AUTO_FALLBACK
+
+        self.wpas_proc: subprocess.Popen[str] | None = None
+        self.dnsmasq_proc: subprocess.Popen[str] | None = None
+        self.rfcomm_sock: socket.socket | None = None
+        self.rfcomm_thread: threading.Thread | None = None
+        self.adv_registered = False
+        self.profile_registered = False
+
+        self.wlp_ok_streak = 0
+        self.wlp_down_streak = 0
+        self.wlp_has_def = False
+        self.wlp_net_ok = True
+        self.station_missing_ticks = 0
+        self.last_keepalive = 0.0
+        self.suspended = False
+        self.shutting_down = False
+        self.eval_pending = False
+        self.tick_pending = False
+        self.worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="netshare-op")
+
+        self.load_config()
+        self.cleanup_stale_system_state()
+        self._register_dbus_objects()
+        self._subscribe_logind_sleep()
+
+        threading.Thread(target=self._wlp_probe_loop, daemon=True).start()
+        GLib.timeout_add_seconds(3, self._tick)
+        self._schedule_eval()
+
+    def load_config(self) -> None:
+        cp = configparser.ConfigParser()
+        if CONFIG_PATH.exists():
+            cp.read(CONFIG_PATH, encoding="utf-8")
+        sec = cp["netshare"] if cp.has_section("netshare") else {}
+        mode = str(sec.get("mode", "auto")).strip().lower()
+        if mode in ("auto", "force", "off"):
+            self.mode = mode
+        self.auto_power_bt = str(sec.get("auto_power_bt", "true")).strip().lower() in ("1", "true", "yes")
+        peers_raw = str(sec.get("allowed_peers", "")).strip()
+        self.allowed_peers = []
+        for item in peers_raw.split(","):
+            if item.strip():
+                try:
+                    mac = normalize_mac(item)
+                    if mac not in self.allowed_peers:
+                        self.allowed_peers.append(mac)
+                except ValueError:
+                    pass
+
+    def save_config(self) -> None:
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        cp = configparser.ConfigParser()
+        cp["netshare"] = {
+            "mode": self.mode,
+            "auto_power_bt": "true" if self.auto_power_bt else "false",
+            "allowed_peers": ",".join(self.allowed_peers),
+        }
+        tmp = CONFIG_PATH.with_suffix(".tmp")
+        with tmp.open("w", encoding="utf-8") as fh:
+            cp.write(fh)
+        os.chmod(tmp, 0o600)
+        tmp.replace(CONFIG_PATH)
+
+    def cleanup_stale_system_state(self) -> None:
+        run_cmd(["ip", "route", "del", "default", "dev", AP_IFACE])
+        run_cmd(["firewall-cmd", "--zone=trusted", f"--remove-interface={AP_IFACE}"])
+        run_cmd(["pkill", "-f", rf"^/usr/sbin/wpa_supplicant .*{WPAS_CONF}"])
+        run_cmd(["pkill", "-f", rf"^(/usr/sbin/|/usr/bin/)?dnsmasq .*--interface={AP_IFACE} "])
+        run_cmd(["iw", "dev", AP_IFACE, "del"])
+        shutil.rmtree(RUN_DIR, ignore_errors=True)
+
+    # ---------------- BlueZ helpers ----------------
+
+    def _bluez_prop_get(self, path: str, iface: str, prop: str) -> Any:
+        res = self.bus.call_sync(
+            BLUEZ_SERVICE,
+            path,
+            "org.freedesktop.DBus.Properties",
+            "Get",
+            GLib.Variant("(ss)", (iface, prop)),
+            GLib.VariantType("(v)"),
+            Gio.DBusCallFlags.NONE,
+            3000,
+            None,
+        )
+        return res.unpack()[0]
+
+    def _bluez_prop_set(self, path: str, iface: str, prop: str, val: GLib.Variant) -> None:
+        self.bus.call_sync(
+            BLUEZ_SERVICE,
+            path,
+            "org.freedesktop.DBus.Properties",
+            "Set",
+            GLib.Variant("(ssv)", (iface, prop, val)),
+            None,
+            Gio.DBusCallFlags.NONE,
+            5000,
+            None,
+        )
+
+    def _is_bt_powered(self) -> bool:
+        try:
+            return bool(self._bluez_prop_get(ADAPTER_PATH, "org.bluez.Adapter1", "Powered"))
+        except Exception:
+            return False
+
+    def _ensure_bt_powered(self, want_on: bool) -> bool:
+        powered = self._is_bt_powered()
+        if want_on and not powered:
+            if not self.auto_power_bt:
+                return False
+            try:
+                self._bluez_prop_set(ADAPTER_PATH, "org.bluez.Adapter1", "Powered", GLib.Variant("b", True))
+                self.we_powered_bt = True
+                log("Powered on hci0 for sharing")
+                return True
+            except Exception as exc:
+                self.last_error = f"BT power on failed: {exc}"
+                return False
+        if not want_on and self.we_powered_bt:
+            try:
+                self._bluez_prop_set(ADAPTER_PATH, "org.bluez.Adapter1", "Powered", GLib.Variant("b", False))
+                log("Restored hci0 Powered=False")
+            except Exception:
+                pass
+            self.we_powered_bt = False
+        return powered
+
+    def _is_device_paired(self, device_path: str) -> tuple[bool, str]:
+        try:
+            paired = bool(self._bluez_prop_get(device_path, "org.bluez.Device1", "Paired"))
+            addr = str(self._bluez_prop_get(device_path, "org.bluez.Device1", "Address")).upper()
+            return paired, addr
+        except Exception:
+            return False, ""
+
+    def _register_profile(self) -> None:
+        if self.profile_registered:
+            return
+        opts = {
+            "Name": GLib.Variant("s", "OPD NetShare"),
+            "Role": GLib.Variant("s", "server"),
+            "Channel": GLib.Variant("q", 22),
+            "RequireAuthentication": GLib.Variant("b", True),
+            "RequireAuthorization": GLib.Variant("b", False),
+        }
+        self.bus.call_sync(
+            BLUEZ_SERVICE,
+            "/org/bluez",
+            "org.bluez.ProfileManager1",
+            "RegisterProfile",
+            GLib.Variant("(osa{sv})", (PROFILE_PATH, RFCOMM_UUID, opts)),
+            None,
+            Gio.DBusCallFlags.NONE,
+            5000,
+            None,
+        )
+        self.profile_registered = True
+        log("Registered BlueZ RFCOMM Profile1")
+
+    def _unregister_profile(self) -> None:
+        if not self.profile_registered:
+            return
+        try:
+            self.bus.call_sync(
+                BLUEZ_SERVICE,
+                "/org/bluez",
+                "org.bluez.ProfileManager1",
+                "UnregisterProfile",
+                GLib.Variant("(o)", (PROFILE_PATH,)),
+                None,
+                Gio.DBusCallFlags.NONE,
+                3000,
+                None,
+            )
+        except Exception:
+            pass
+        self.profile_registered = False
+
+    def _force_unregister_adv(self) -> None:
+        try:
+            self.bus.call_sync(
+                BLUEZ_SERVICE,
+                ADAPTER_PATH,
+                "org.bluez.LEAdvertisingManager1",
+                "UnregisterAdvertisement",
+                GLib.Variant("(o)", (ADV_PATH,)),
+                None,
+                Gio.DBusCallFlags.NONE,
+                3000,
+                None,
+            )
+            log("Unregistered BlueZ LEAdvertisement1")
+        except Exception:
+            pass
+        self.adv_registered = False
+
+    def _register_adv(self) -> None:
+        if self.adv_registered:
+            return
+        try:
+            self.bus.call_sync(
+                BLUEZ_SERVICE,
+                ADAPTER_PATH,
+                "org.bluez.LEAdvertisingManager1",
+                "RegisterAdvertisement",
+                GLib.Variant("(oa{sv})", (ADV_PATH, {})),
+                None,
+                Gio.DBusCallFlags.NONE,
+                5000,
+                None,
+            )
+        except Exception as exc:
+            if "AlreadyExists" in str(exc):
+                self._force_unregister_adv()
+                self.bus.call_sync(
+                    BLUEZ_SERVICE,
+                    ADAPTER_PATH,
+                    "org.bluez.LEAdvertisingManager1",
+                    "RegisterAdvertisement",
+                    GLib.Variant("(oa{sv})", (ADV_PATH, {})),
+                    None,
+                    Gio.DBusCallFlags.NONE,
+                    5000,
+                    None,
+                )
+            else:
+                self._force_unregister_adv()
+                raise
+        self.adv_registered = True
+        log("Registered BlueZ LEAdvertisement1")
+
+    def _unregister_adv(self) -> None:
+        if not self.adv_registered:
+            return
+        self._force_unregister_adv()
+
+    # ---------------- AP + DHCP + Route lifecycle ----------------
+
+    def _start_ap(self) -> None:
+        if self.wpas_proc is not None:
+            return
+        RUN_DIR.mkdir(parents=True, exist_ok=True)
+        WPAS_CTRL_DIR.mkdir(parents=True, exist_ok=True)
+        os.chmod(RUN_DIR, 0o700)
+        os.chmod(WPAS_CTRL_DIR, 0o700)
+
+        self.ssid, self.psk = random_credentials()
+        self.freq = pick_ap_frequency()
+
+        run_cmd(["iw", "dev", AP_IFACE, "del"])
+        res = run_cmd(["iw", "phy", "phy0", "interface", "add", AP_IFACE, "type", "__ap"])
+        if res.returncode != 0:
+            raise RuntimeError(f"iw interface add failed: {res.stderr.strip()}")
+        run_cmd(["ip", "link", "set", AP_IFACE, "up"], check=True)
+
+        conf = (
+            f"ctrl_interface={WPAS_CTRL_DIR}\n"
+            "ap_scan=2\n"
+            "p2p_disabled=1\n"
+            "country=CN\n"
+            "network={\n"
+            f'    ssid="{self.ssid}"\n'
+            "    mode=2\n"
+            f"    frequency={self.freq}\n"
+            "    key_mgmt=WPA-PSK\n"
+            "    proto=RSN\n"
+            "    pairwise=CCMP\n"
+            "    group=CCMP\n"
+            f'    psk="{self.psk}"\n'
+            "}\n"
+        )
+        WPAS_CONF.write_text(conf, encoding="utf-8")
+        os.chmod(WPAS_CONF, 0o600)
+
+        # Do NOT pass -B/-f/-P: wpa_supplicant 2.11 on F45 segfaults with -B/-f/-P.
+        self.wpas_proc = subprocess.Popen(
+            ["/usr/sbin/wpa_supplicant", "-i", AP_IFACE, "-D", "nl80211", "-c", str(WPAS_CONF)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        threading.Thread(target=self._drain_proc_log, args=("wpa_supplicant", self.wpas_proc), daemon=True).start()
+
+        deadline = time.monotonic() + 8.0
+        ap_up = False
+        while time.monotonic() < deadline:
+            if self.wpas_proc.poll() is not None:
+                raise RuntimeError("wpa_supplicant exited unexpectedly")
+            info = run_cmd(["iw", "dev", AP_IFACE, "info"])
+            if "type AP" in info.stdout and "channel " in info.stdout:
+                ap_up = True
+                break
+            time.sleep(0.25)
+        if not ap_up:
+            raise RuntimeError("Timed out waiting for p2p0 AP enable")
+
+        run_cmd(["ip", "addr", "replace", AP_CIDR, "dev", AP_IFACE], check=True)
+        run_cmd(["firewall-cmd", "--zone=trusted", f"--add-interface={AP_IFACE}"], check=True)
+
+        # Bind strictly to p2p0 / 192.168.49.1, no DNS port, no default gateway/DNS option to phone.
+        self.dnsmasq_proc = subprocess.Popen(
+            [
+                "/usr/sbin/dnsmasq",
+                "-k",
+                f"--interface={AP_IFACE}",
+                "--bind-interfaces",
+                f"--listen-address={AP_GW_IP}",
+                f"--dhcp-range={DHCP_START},{DHCP_END},255.255.255.0,12h",
+                "--dhcp-option=3",
+                "--dhcp-option=6",
+                "--no-resolv",
+                "--port=0",
+                "--leasefile-ro",
+                "--log-dhcp",
+                "--log-facility=-",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        threading.Thread(target=self._watch_dnsmasq, args=(self.dnsmasq_proc,), daemon=True).start()
+        log(f"Started AP {self.ssid} on {AP_IFACE} freq={self.freq} MHz")
+
+    def _drain_proc_log(self, tag: str, proc: subprocess.Popen[str]) -> None:
+        if not proc.stdout:
+            return
+        for line in proc.stdout:
+            s = line.rstrip()
+            if s:
+                log(f"{tag}: {s}")
+
+    def _watch_dnsmasq(self, proc: subprocess.Popen[str]) -> None:
+        if not proc.stdout:
+            return
+        pat = re.compile(r"DHCPACK\(" + re.escape(AP_IFACE) + r"\)\s+(192\.168\.49\.\d+)")
+        for line in proc.stdout:
+            s = line.rstrip()
+            if s:
+                log(f"dnsmasq: {s}")
+            m = pat.search(s)
+            if m:
+                ip = m.group(1)
+                GLib.idle_add(self._on_dhcp_lease_cb, ip)
+
+    def _submit_worker(self, fn, *args) -> None:
+        with self.lock:
+            if self.shutting_down:
+                return
+        self.worker.submit(fn, *args)
+
+    def _schedule_eval(self) -> None:
+        with self.lock:
+            if self.shutting_down or self.eval_pending:
+                return
+            self.eval_pending = True
+        self.worker.submit(self._eval_work)
+
+    def _eval_work(self) -> None:
+        with self.lock:
+            self.eval_pending = False
+            if self.shutting_down:
+                return
+        self._evaluate_state()
+
+    def _on_dhcp_lease_cb(self, peer_ip: str) -> bool:
+        self._submit_worker(self._apply_peer_route_if_active, peer_ip)
+        return False
+
+    def _apply_peer_route_if_active(self, peer_ip: str) -> None:
+        with self.lock:
+            if self.state == "idle":
+                return
+        self._apply_peer_route(peer_ip)
+
+    def _apply_peer_route(self, peer_ip: str) -> None:
+        with self.lock:
+            self.peer_ip = peer_ip
+            # Beat dead/captive Wi-Fi (metric 600) or explicit Force mode; otherwise stay fallback 700.
+            metric = METRIC_OVERRIDE_WIFI if (self.mode == "force" or (self.wlp_has_def and not self.wlp_net_ok)) else METRIC_AUTO_FALLBACK
+            self.active_metric = metric
+        run_cmd(["ip", "route", "replace", "default", "via", peer_ip, "dev", AP_IFACE, "proto", "static", "src", AP_GW_IP, "metric", str(metric)])
+        run_cmd(["resolvectl", "dns", AP_IFACE, *DNS_SERVERS])
+        run_cmd(["resolvectl", "default-route", AP_IFACE, "true"])
+        with self.lock:
+            self.state = "connected"
+            self.station_missing_ticks = 0
+            self.last_error = ""
+        self._unregister_adv()
+        log(f"Connected via phone {peer_ip} (metric={metric})")
+        self._emit_status()
+
+    def _stop_ap_and_routes(self) -> None:
+        run_cmd(["resolvectl", "revert", AP_IFACE])
+        run_cmd(["ip", "route", "del", "default", "dev", AP_IFACE])
+        run_cmd(["firewall-cmd", "--zone=trusted", f"--remove-interface={AP_IFACE}"])
+
+        with self.lock:
+            procs = (self.dnsmasq_proc, self.wpas_proc)
+            self.dnsmasq_proc = None
+            self.wpas_proc = None
+
+        for proc in procs:
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3.0)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+
+        run_cmd(["iw", "dev", AP_IFACE, "del"])
+        shutil.rmtree(RUN_DIR, ignore_errors=True)
+        with self.lock:
+            self.ssid = ""
+            self.psk = ""
+            self.peer_ip = ""
+
+    def _close_rfcomm(self, send_stop: bool) -> None:
+        with self.lock:
+            sock = self.rfcomm_sock
+            self.rfcomm_sock = None
+            self.peer_mac = ""
+        if sock is not None:
+            if send_stop:
+                try:
+                    sock.sendall(b'{"cmd":"stop"}\n')
+                    time.sleep(0.15)
+                except OSError:
+                    pass
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def _teardown_session(self, send_stop: bool = True, keep_bt_on: bool = False) -> None:
+        self._unregister_adv()
+        self._unregister_profile()
+        self._close_rfcomm(send_stop=send_stop)
+        self._stop_ap_and_routes()
+        if not keep_bt_on:
+            self._ensure_bt_powered(False)
+        with self.lock:
+            self.state = "idle"
+        self._emit_status()
+
+    def _begin_advertising(self) -> None:
+        with self.lock:
+            if self.state != "idle" or self.shutting_down:
+                return
+        if not self._ensure_bt_powered(True):
+            self._emit_status()
+            return
+        try:
+            self._start_ap()
+            self._register_profile()
+            with self.lock:
+                self.state = "advertising"
+                self.last_error = ""
+            self._register_adv()
+        except Exception as exc:
+            with self.lock:
+                self.last_error = str(exc)
+            log(f"Failed to start sharing: {exc}")
+            self._teardown_session(send_stop=False, keep_bt_on=True)
+        self._emit_status()
+
+    # ---------------- RFCOMM connection thread ----------------
+
+    def _handle_rfcomm_client(self, sock: socket.socket, mac: str) -> None:
+        try:
+            with self.lock:
+                if self.rfcomm_sock is not None:
+                    self._close_rfcomm(send_stop=True)
+                self.rfcomm_sock = sock
+                self.peer_mac = mac
+                self.last_keepalive = time.monotonic()
+                payload = json.dumps(
+                    {
+                        "cmd": "start",
+                        "ssid": self.ssid,
+                        "psk": self.psk,
+                        "freq": self.freq,
+                        "gw": AP_GW_IP,
+                    },
+                    separators=(",", ":"),
+                )
+            sock.settimeout(2.0)
+            sock.sendall((payload + "\n").encode("utf-8"))
+            log(f"Sent session credentials over RFCOMM to {mac}")
+
+            buf = b""
+            while True:
+                with self.lock:
+                    if self.rfcomm_sock is not sock:
+                        break
+                try:
+                    chunk = sock.recv(1024)
+                    if not chunk:
+                        log(f"RFCOMM EOF from {mac}")
+                        break
+                    buf += chunk
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        text = line.decode("utf-8", errors="replace").strip()
+                        if not text:
+                            continue
+                        log(f"RFCOMM rx ({mac}): {text}")
+                        try:
+                            msg = json.loads(text)
+                        except json.JSONDecodeError:
+                            continue
+                        if msg.get("event") == "stop_request":
+                            GLib.idle_add(self._on_peer_disconnect_cb, sock, "phone requested stop")
+                            return
+                        if msg.get("ip") and str(msg["ip"]).startswith("192.168.49."):
+                            GLib.idle_add(self._on_dhcp_lease_cb, str(msg["ip"]))
+                except socket.timeout:
+                    continue
+        except OSError as exc:
+            log(f"RFCOMM error ({mac}): {exc}")
+        GLib.idle_add(self._on_peer_disconnect_cb, sock, "rfcomm disconnected")
+
+    def _on_peer_disconnect_cb(self, sock: socket.socket, reason: str) -> bool:
+        self._submit_worker(self._on_peer_disconnect_work, sock, reason)
+        return False
+
+    def _on_peer_disconnect_work(self, sock: socket.socket, reason: str) -> None:
+        with self.lock:
+            matched = self.rfcomm_sock is sock or self.state == "connected"
+            keep_bt = self.mode != "off"
+        if matched:
+            log(f"Peer link ended: {reason}")
+            self._teardown_session(send_stop=False, keep_bt_on=keep_bt)
+            GLib.timeout_add_seconds(3, self._evaluate_state_cb)
+
+    # ---------------- Periodic monitor ----------------
+
+    def _wlp_probe_loop(self) -> None:
+        while True:
+            has_def, net_ok = probe_wlp1s0_internet()
+            changed = False
+            with self.lock:
+                if has_def != self.wlp_has_def or net_ok != self.wlp_net_ok:
+                    changed = True
+                self.wlp_has_def = has_def
+                self.wlp_net_ok = net_ok
+            if changed:
+                self._schedule_eval()
+            time.sleep(4)
+
+    def _evaluate_state_cb(self) -> bool:
+        self._schedule_eval()
+        return False
+
+    def _evaluate_state(self) -> None:
+        action = ""
+        peer_ip = ""
+        with self.lock:
+            if self.shutting_down or self.suspended or self.mode == "off":
+                if self.state != "idle":
+                    action = "teardown_off"
+            elif not self.allowed_peers:
+                if self.state != "idle":
+                    action = "teardown_off"
+                if self.mode == "force":
+                    self.last_error = "No allowed peer MAC configured; pair & authorize phone first"
+            elif self.mode == "force":
+                if self.state == "idle":
+                    action = "advertise"
+                elif self.state == "connected" and self.peer_ip and self.active_metric != METRIC_OVERRIDE_WIFI:
+                    action = "reroute"
+                    peer_ip = self.peer_ip
+            else:
+                if self.wlp_net_ok:
+                    self.wlp_ok_streak += 1
+                    self.wlp_down_streak = 0
+                    if self.state != "idle" and self.wlp_ok_streak >= 2:
+                        log("wlp1s0 internet recovered; stopping mobile share")
+                        action = "teardown_off"
+                else:
+                    self.wlp_down_streak += 1
+                    self.wlp_ok_streak = 0
+                    if self.state == "idle" and self.wlp_down_streak >= 1:
+                        log("wlp1s0 offline or no internet; starting mobile share request")
+                        action = "advertise"
+
+        if action == "teardown_off":
+            self._teardown_session(send_stop=True, keep_bt_on=False)
+        elif action == "advertise":
+            self._begin_advertising()
+        elif action == "reroute" and peer_ip:
+            self._apply_peer_route(peer_ip)
+
+    def _tick(self) -> bool:
+        with self.lock:
+            if self.shutting_down or self.tick_pending:
+                return not self.shutting_down
+            self.tick_pending = True
+        self.worker.submit(self._tick_work)
+        return True
+
+    def _tick_work(self) -> None:
+        with self.lock:
+            self.tick_pending = False
+            if self.shutting_down:
+                return
+            st = self.state
+            peer_ip = self.peer_ip
+            mode = self.mode
+            sock = self.rfcomm_sock
+            wpas_proc = self.wpas_proc
+            dnsmasq_proc = self.dnsmasq_proc
+
+        if st == "connected":
+            bitrate, _, _ = query_station_stats()
+            has_sta = bool(bitrate)
+            if not has_sta and peer_ip:
+                res = run_cmd(["iw", "dev", AP_IFACE, "station", "dump"])
+                has_sta = "Station " in res.stdout
+
+            need_teardown = False
+            teardown_stop = True
+            need_ping = False
+            with self.lock:
+                if has_sta:
+                    self.station_missing_ticks = 0
+                else:
+                    self.station_missing_ticks += 1
+                if self.station_missing_ticks >= 5:
+                    need_teardown = True
+                elif self.rfcomm_sock is not None and time.monotonic() - self.last_keepalive >= 12.0:
+                    self.last_keepalive = time.monotonic()
+                    need_ping = True
+                    sock = self.rfcomm_sock
+
+            if need_teardown:
+                log("Phone Wi-Fi P2P station vanished for 15s; resetting session")
+                self._teardown_session(send_stop=teardown_stop, keep_bt_on=(mode != "off"))
+            elif need_ping and sock is not None:
+                try:
+                    sock.sendall(b'{"cmd":"ping"}\n')
+                except OSError:
+                    log("RFCOMM keepalive send failed; resetting session")
+                    self._teardown_session(send_stop=False, keep_bt_on=(mode != "off"))
+            else:
+                self._emit_status()
+
+        elif st == "advertising":
+            if (wpas_proc and wpas_proc.poll() is not None) or (
+                dnsmasq_proc and dnsmasq_proc.poll() is not None
+            ):
+                with self.lock:
+                    self.last_error = "AP helper exited unexpectedly"
+                self._teardown_session(send_stop=False, keep_bt_on=True)
+
+        self._evaluate_state()
+
+    # ---------------- D-Bus registration ----------------
+
+    def _status_dict(self) -> dict[str, GLib.Variant]:
+        with self.lock:
+            mode = self.mode
+            st = self.state
+            peer_mac = self.peer_mac
+            peer_ip = self.peer_ip
+            ssid = self.ssid
+            freq = self.freq
+            last_error = self.last_error
+            allowed = list(self.allowed_peers)
+        bitrate, rx_b, tx_b = query_station_stats() if st == "connected" else ("", 0, 0)
+        return {
+            "mode": GLib.Variant("s", mode),
+            "state": GLib.Variant("s", st),
+            "peer_mac": GLib.Variant("s", peer_mac),
+            "peer_ip": GLib.Variant("s", peer_ip),
+            "ssid": GLib.Variant("s", ssid),
+            "freq": GLib.Variant("u", freq if st != "idle" else 0),
+            "tx_bitrate": GLib.Variant("s", bitrate),
+            "rx_bytes": GLib.Variant("t", rx_b),
+            "tx_bytes": GLib.Variant("t", tx_b),
+            "last_error": GLib.Variant("s", last_error),
+            "bt_powered": GLib.Variant("b", self._is_bt_powered()),
+            "allowed_peers": GLib.Variant("as", allowed),
+        }
+
+    def _emit_status(self) -> None:
+        try:
+            self.bus.emit_signal(
+                None,
+                OBJ_PATH,
+                BUS_NAME,
+                "StatusChanged",
+                GLib.Variant("(a{sv})", (self._status_dict(),)),
+            )
+        except Exception:
+            pass
+
+    def _register_dbus_objects(self) -> None:
+        main_info = Gio.DBusNodeInfo.new_for_xml(INTROSPECTION_XML)
+        self.bus.register_object(OBJ_PATH, main_info.interfaces[0], self._on_main_call, None, None)
+
+        adv_info = Gio.DBusNodeInfo.new_for_xml(ADV_XML)
+        self.bus.register_object(ADV_PATH, adv_info.interfaces[0], self._on_adv_call, self._on_adv_prop, None)
+
+        prof_info = Gio.DBusNodeInfo.new_for_xml(PROFILE_XML)
+        self.bus.register_object(PROFILE_PATH, prof_info.interfaces[0], self._on_profile_call, None, None)
+
+        Gio.bus_own_name_on_connection(
+            self.bus,
+            BUS_NAME,
+            Gio.BusNameOwnerFlags.REPLACE,
+            None,
+            None,
+        )
+
+    def _subscribe_logind_sleep(self) -> None:
+        self.bus.signal_subscribe(
+            "org.freedesktop.login1",
+            "org.freedesktop.login1.Manager",
+            "PrepareForSleep",
+            "/org/freedesktop/login1",
+            None,
+            Gio.DBusSignalFlags.NONE,
+            self._on_prepare_for_sleep,
+        )
+
+    def _on_prepare_for_sleep(self, _conn, _sender, _path, _iface, _sig, params: GLib.Variant) -> None:
+        going_down = bool(params.unpack()[0])
+        with self.lock:
+            self.suspended = going_down
+            active = self.state != "idle"
+            if not going_down:
+                self.wlp_ok_streak = 0
+                self.wlp_down_streak = 0
+        if going_down:
+            log("System going to sleep; tearing down p2p0 session cleanly")
+            if active:
+                self._submit_worker(self._teardown_session, True, False)
+        else:
+            log("System resumed; re-evaluating network share state")
+            GLib.timeout_add_seconds(2, self._evaluate_state_cb)
+
+    def _on_main_call(self, _conn, _sender, _path, _iface, method: str, params: GLib.Variant, inv: Gio.DBusMethodInvocation) -> None:
+        if method == "GetStatus":
+            inv.return_value(GLib.Variant("(a{sv})", (self._status_dict(),)))
+            return
+        if method == "SetMode":
+            mode = str(params.unpack()[0]).strip().lower()
+            if mode not in ("auto", "force", "off"):
+                inv.return_value(GLib.Variant("(bs)", (False, f"Invalid mode: {mode}")))
+                return
+            with self.lock:
+                self.mode = mode
+                self.wlp_ok_streak = 0
+                self.wlp_down_streak = 0
+                self.last_error = ""
+                self.save_config()
+            inv.return_value(GLib.Variant("(bs)", (True, f"Mode set to {mode}")))
+            self._emit_status()
+            self._schedule_eval()
+            return
+        if method == "AllowPeer":
+            try:
+                mac = normalize_mac(params.unpack()[0])
+            except ValueError as exc:
+                inv.return_value(GLib.Variant("(bs)", (False, str(exc))))
+                return
+            with self.lock:
+                if mac not in self.allowed_peers:
+                    self.allowed_peers.append(mac)
+                    self.save_config()
+            inv.return_value(GLib.Variant("(bs)", (True, f"Allowed {mac}")))
+            self._emit_status()
+            self._submit_worker(self._trust_and_eval_work, mac)
+            return
+        if method == "RemovePeer":
+            try:
+                mac = normalize_mac(params.unpack()[0])
+            except ValueError as exc:
+                inv.return_value(GLib.Variant("(bs)", (False, str(exc))))
+                return
+            with self.lock:
+                if mac in self.allowed_peers:
+                    self.allowed_peers.remove(mac)
+                    self.save_config()
+                need_stop = self.peer_mac == mac and self.state != "idle"
+                keep_bt = self.mode != "off"
+            inv.return_value(GLib.Variant("(bs)", (True, f"Removed {mac}")))
+            self._emit_status()
+            if need_stop:
+                self._submit_worker(self._teardown_session, True, keep_bt)
+            return
+        if method == "DisconnectNow":
+            with self.lock:
+                if self.mode == "force":
+                    self.mode = "auto"
+                    self.save_config()
+                need_stop = self.state != "idle"
+            inv.return_value(GLib.Variant("(b)", (True,)))
+            self._emit_status()
+            if need_stop:
+                self._submit_worker(self._teardown_session, True, False)
+            return
+        inv.return_dbus_error("org.freedesktop.DBus.Error.UnknownMethod", f"Unknown method {method}")
+
+    def _trust_and_eval_work(self, mac: str) -> None:
+        dev_path = f"{ADAPTER_PATH}/dev_{mac.replace(':', '_')}"
+        try:
+            self._bluez_prop_set(dev_path, "org.bluez.Device1", "Trusted", GLib.Variant("b", True))
+        except Exception:
+            pass
+        self._evaluate_state()
+
+    def _on_adv_call(self, _conn, _sender, _path, _iface, method: str, _params, inv: Gio.DBusMethodInvocation) -> None:
+        if method == "Release":
+            log("BlueZ released LE advertisement")
+            with self.lock:
+                self.adv_registered = False
+        inv.return_value(None)
+
+    def _on_adv_prop(self, _conn, _sender, _path, _iface, prop: str) -> GLib.Variant | None:
+        if prop == "Type":
+            return GLib.Variant("s", "peripheral")
+        if prop == "ServiceUUIDs":
+            return GLib.Variant("as", [ADV_UUID])
+        if prop == "LocalName":
+            return GLib.Variant("s", "OPD")
+        return None
+
+    def _on_profile_call(self, _conn, _sender, _path, _iface, method: str, params: GLib.Variant, inv: Gio.DBusMethodInvocation) -> None:
+        if method == "Release":
+            log("BlueZ released RFCOMM Profile1")
+            with self.lock:
+                self.profile_registered = False
+            inv.return_value(None)
+            return
+        if method == "RequestDisconnection":
+            dev_path = str(params.unpack()[0])
+            log(f"BlueZ RequestDisconnection for {dev_path}")
+            with self.lock:
+                need_stop = self.state != "idle"
+                keep_bt = self.mode != "off"
+            inv.return_value(None)
+            if need_stop:
+                self._submit_worker(self._teardown_session, False, keep_bt)
+            return
+        if method == "NewConnection":
+            dev_path, fd_idx, _props = params.unpack()
+            fd_list = inv.get_message().get_unix_fd_list()
+            raw_fd = fd_list.get(fd_idx) if fd_list else -1
+            if raw_fd < 0:
+                inv.return_dbus_error("org.bluez.Error.Failed", "Missing Unix FD")
+                return
+            paired, mac = self._is_device_paired(dev_path)
+            with self.lock:
+                if not paired or mac not in self.allowed_peers or self.state == "idle":
+                    log(f"Rejected RFCOMM peer dev={dev_path} mac={mac} paired={paired} allowed={self.allowed_peers}")
+                    inv.return_dbus_error("org.bluez.Error.Rejected", "Peer not paired/allowed")
+                    return
+                dup_fd = os.dup(raw_fd)
+                sock = socket.socket(fileno=dup_fd)
+            inv.return_value(None)
+            t = threading.Thread(target=self._handle_rfcomm_client, args=(sock, mac), daemon=True)
+            t.start()
+            return
+        inv.return_value(None)
+
+    def shutdown(self) -> None:
+        with self.lock:
+            if self.shutting_down:
+                return
+            self.shutting_down = True
+        try:
+            self.worker.submit(self._teardown_session, True, False).result(timeout=8.0)
+        except Exception:
+            pass
+        self.worker.shutdown(wait=False)
+        GLib.idle_add(self.loop.quit)
+
+
+def main() -> int:
+    if os.geteuid() != 0:
+        sys.stderr.write("opd-netshare-daemon must run as root\n")
+        return 1
+    loop = GLib.MainLoop()
+    bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+    daemon = NetShareDaemon(loop, bus)
+
+    def _sig(_signum, _frame) -> None:
+        threading.Thread(target=daemon.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, _sig)
+    signal.signal(signal.SIGINT, _sig)
+    loop.run()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

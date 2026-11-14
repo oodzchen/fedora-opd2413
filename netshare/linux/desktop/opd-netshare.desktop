@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=OPD NetShare
+Name[zh_CN]=OPD 跨设备网络共享
+Comment=Cross-device automatic mobile network sharing with phone
+Comment[zh_CN]=自动与一加手机互联共享移动网络
+Exec=/usr/bin/opd-netshare-tray
+Icon=network-wireless
+Terminal=false
+Categories=Network;System;
+Keywords=network;tether;p2p;oneplus;
+StartupNotify=false
