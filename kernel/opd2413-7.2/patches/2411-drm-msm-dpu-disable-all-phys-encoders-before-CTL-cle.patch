@@ -1,0 +1,171 @@
+From 971490450ba459ede5e5836ac392ba7b26cabcf9 Mon Sep 17 00:00:00 2001
+From: Kholin <oodzchen@gmail.com>
+Date: Sat, 14 Nov 2026 00:59:58 +0800
+Subject: [PATCH] drm/msm/dpu: disable all phys encoders before CTL cleanup
+
+In bonded dual-DSI video mode, both physical encoders (master on intf1 and slave on intf2) share one CTL. Calling dpu_encoder_helper_phys_cleanup() inside each phys->ops.disable() resets CTL_0 (falling back to CTL_SW_RESET_OVERRIDE) while the slave interface and SSPP are still active, wedging SSPP fetch / VBIF across an inline modeset (active 1->1, mode_changed=1).
+
+Keep the original phys_encs[] disable order (stopping non-master before cur_master triggers ERR_CONTENTION_LP1 / dsi1 cmd dma timeout on subsequent DPMS resume), poll slave INTF_STATUS until the slave timing engine stops before returning from dpu_encoder_phys_vid_disable(), and then run dpu_encoder_helper_phys_cleanup() once per distinct hw_ctl after all physical encoders have stopped.
+
+Co-Authored-By: Antigravity <noreply@deepmind.google>
+---
+ drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c   | 59 ++++++++++++++-----
+ .../drm/msm/disp/dpu1/dpu_encoder_phys_cmd.c  |  2 +-
+ .../drm/msm/disp/dpu1/dpu_encoder_phys_vid.c  | 21 ++++++-
+ .../drm/msm/disp/dpu1/dpu_encoder_phys_wb.c   |  6 +-
+ 4 files changed, 69 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
+index aedeab9df..f508d0654 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
+@@ -1475,6 +1475,26 @@ static void dpu_encoder_virt_atomic_disable(struct drm_encoder *drm_enc,
+ 			phys->ops.disable(phys);
+ 	}
+ 
++	for (i = 0; i < dpu_enc->num_phys_encs; i++) {
++		struct dpu_encoder_phys *phys = dpu_enc->phys_encs[i];
++		int j;
++
++		if (!phys || !phys->hw_ctl)
++			continue;
++
++		if (phys->hw_wb &&
++		    phys->dpu_kms->catalog->mdss_ver->core_major_ver < 5)
++			continue;
++
++		for (j = 0; j < i; j++) {
++			if (dpu_enc->phys_encs[j] &&
++			    dpu_enc->phys_encs[j]->hw_ctl == phys->hw_ctl)
++				break;
++		}
++		if (j == i)
++			dpu_encoder_helper_phys_cleanup(phys);
++	}
++
+ 
+ 	/* after phys waits for frame-done, should be no more frames pending */
+ 	if (atomic_xchg(&dpu_enc->frame_done_timeout_ms, 0)) {
+@@ -2379,7 +2399,12 @@ void dpu_encoder_helper_phys_cleanup(struct dpu_encoder_phys *phys_enc)
+ 
+ 	ctl->ops.reset(ctl);
+ 
+-	dpu_encoder_helper_reset_mixers(phys_enc);
++	for (i = 0; i < dpu_enc->num_phys_encs; i++) {
++		struct dpu_encoder_phys *phys = dpu_enc->phys_encs[i];
++
++		if (phys && phys->hw_ctl == ctl)
++			dpu_encoder_helper_reset_mixers(phys);
++	}
+ 
+ 	/*
+ 	 * TODO: move the once-only operation like CTL flush/trigger
+@@ -2439,21 +2464,27 @@ void dpu_encoder_helper_phys_cleanup(struct dpu_encoder_phys *phys_enc)
+ 		dpu_enc->dsc = NULL;
+ 	}
+ 
+-	intf_cfg.stream_sel = 0; /* Ignored by reset_intf_cfg */
+-	intf_cfg.mode_3d = dpu_encoder_helper_get_3d_blend_mode(phys_enc);
+-	intf_cfg.dsc = dpu_encoder_helper_get_dsc(phys_enc);
+-	intf_cfg.cwb = dpu_enc->cwb_mask;
+-
+-	if (phys_enc->hw_intf)
+-		intf_cfg.intf = phys_enc->hw_intf->idx;
+-	if (phys_enc->hw_wb)
+-		intf_cfg.wb = phys_enc->hw_wb->idx;
++	if (ctl->ops.reset_intf_cfg) {
++		for (i = 0; i < dpu_enc->num_phys_encs; i++) {
++			struct dpu_encoder_phys *phys = dpu_enc->phys_encs[i];
+ 
+-	if (phys_enc->hw_pp && phys_enc->hw_pp->merge_3d)
+-		intf_cfg.merge_3d = phys_enc->hw_pp->merge_3d->idx;
++			if (!phys || phys->hw_ctl != ctl)
++				continue;
+ 
+-	if (ctl->ops.reset_intf_cfg)
+-		ctl->ops.reset_intf_cfg(ctl, &intf_cfg);
++			memset(&intf_cfg, 0, sizeof(intf_cfg));
++			intf_cfg.mode_3d = dpu_encoder_helper_get_3d_blend_mode(phys);
++			intf_cfg.dsc = dpu_encoder_helper_get_dsc(phys);
++			intf_cfg.cwb = dpu_enc->cwb_mask;
++			if (phys->hw_intf)
++				intf_cfg.intf = phys->hw_intf->idx;
++			if (phys->hw_wb)
++				intf_cfg.wb = phys->hw_wb->idx;
++			if (phys->hw_pp && phys->hw_pp->merge_3d)
++				intf_cfg.merge_3d = phys->hw_pp->merge_3d->idx;
++
++			ctl->ops.reset_intf_cfg(ctl, &intf_cfg);
++		}
++	}
+ 
+ 	ctl->ops.trigger_flush(ctl);
+ 	ctl->ops.trigger_start(ctl);
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_cmd.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_cmd.c
+index cafbfaacd..63f501fef 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_cmd.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_cmd.c
+@@ -578,7 +578,7 @@ static void dpu_encoder_phys_cmd_disable(struct dpu_encoder_phys *phys_enc)
+ 			phys_enc->hw_pp->ops.disable_tearcheck(phys_enc->hw_pp);
+ 	}
+ 
+-	dpu_encoder_helper_phys_cleanup(phys_enc);
++	/* cleanup done by dpu_encoder_virt_atomic_disable after all phys stop */
+ 
+ 	phys_enc->enable_state = DPU_ENC_DISABLED;
+ }
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_vid.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_vid.c
+index 7a7b40825..0af3811fa 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_vid.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_vid.c
+@@ -668,9 +668,28 @@ static void dpu_encoder_phys_vid_disable(struct dpu_encoder_phys *phys_enc)
+ 				  DRMID(phys_enc->parent),
+ 				  phys_enc->hw_intf->idx - INTF_0, ret);
+ 		}
++	} else if (intf_status.is_en &&
++		   !dpu_encoder_phys_vid_is_master(phys_enc) &&
++		   phys_enc->hw_intf && phys_enc->hw_intf->ops.get_status) {
++		/*
++		 * Bonded slave INTF has no vsync IRQ registered, yet CTL cleanup
++		 * runs once after all phys encoders stop; poll until the slave
++		 * timing engine actually finishes the current frame so CTL_SW_RESET
++		 * does not race with active INTF/SSPP fetch.
++		 */
++		ktime_t deadline = ktime_add_ms(ktime_get(), 100);
++
++		while (intf_status.is_en && ktime_before(ktime_get(), deadline)) {
++			usleep_range(500, 1000);
++			phys_enc->hw_intf->ops.get_status(phys_enc->hw_intf,
++							  &intf_status);
++		}
++		if (intf_status.is_en)
++			DRM_ERROR("wait slave disable failed: id:%u intf:%d\n",
++				  DRMID(phys_enc->parent),
++				  phys_enc->hw_intf->idx - INTF_0);
+ 	}
+ 
+-	dpu_encoder_helper_phys_cleanup(phys_enc);
+ 	phys_enc->enable_state = DPU_ENC_DISABLED;
+ }
+ 
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_wb.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_wb.c
+index 22433bfbe..6116d794c 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_wb.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_wb.c
+@@ -549,10 +549,10 @@ static void dpu_encoder_phys_wb_disable(struct dpu_encoder_phys *phys_enc)
+ 	 * Any target earlier than SM8150 will need it and when
+ 	 * WB support is added to those targets will need to add
+ 	 * the legacy teardown sequence as well.
++	 *
++	 * On core_major_ver >= 5, dpu_encoder_virt_atomic_disable() calls
++	 * dpu_encoder_helper_phys_cleanup() after all physical encoders stop.
+ 	 */
+-	if (phys_enc->dpu_kms->catalog->mdss_ver->core_major_ver >= 5)
+-		dpu_encoder_helper_phys_cleanup(phys_enc);
+-
+ 	phys_enc->enable_state = DPU_ENC_DISABLED;
+ }
+ 
+-- 
+2.56.0
+

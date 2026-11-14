@@ -1,0 +1,88 @@
+From d91077a7a4f55de74f0edceefe871405ae1f14c5 Mon Sep 17 00:00:00 2001
+From: Kholin <oodzchen@gmail.com>
+Date: Sat, 14 Nov 2026 01:00:13 +0800
+Subject: [PATCH] drm/msm/dpu: allocate DSPP upfront so CTM changes avoid
+ modesets
+
+Reserve num_dspp = num_lm upfront for non-WB display outputs when catalog->dspp_count is non-zero, and stop forcing mode_changed = true when CTM toggles if hw_dspp is already assigned.
+
+This avoids unnecessary inline modesets on Night Light (CTM) toggles and keeps cstate->mixers[i].hw_dspp populated when CTM is cleared so PCC is disabled cleanly.
+
+Co-Authored-By: Antigravity <noreply@deepmind.google>
+---
+ drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c | 20 ++++++++++++++++++--
+ drivers/gpu/drm/msm/msm_atomic.c         | 16 +++-------------
+ 2 files changed, 21 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
+index 0b9449b62..2d4a0fec8 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
+@@ -1563,8 +1563,22 @@ static struct msm_display_topology dpu_crtc_get_topology(
+ 	else
+ 		topology.num_lm = 1;
+ 
+-	if (dpu_crtc_state_needs_dspp(crtc_state))
++	/*
++	 * Reserve DSPP blocks upfront for non-WB display outputs when the catalog
++	 * provides them so toggling CTM (e.g. Night Light) avoids a modeset
++	 * and keeps hw_dspp assigned when clearing PCC.
++	 */
++	if (dpu_crtc_state_needs_dspp(crtc_state)) {
+ 		topology.num_dspp = topology.num_lm;
++	} else if (dpu_kms->catalog->dspp_count) {
++		drm_for_each_encoder_mask(drm_enc, crtc->dev,
++					  crtc_state->encoder_mask) {
++			if (drm_enc->encoder_type != DRM_MODE_ENCODER_VIRTUAL) {
++				topology.num_dspp = topology.num_lm;
++				break;
++			}
++		}
++	}
+ 
+ 	return topology;
+ }
+@@ -1664,7 +1678,9 @@ int dpu_crtc_check_mode_changed(struct drm_crtc_state *old_crtc_state,
+ 	    (!clone_mode_requested && clone_mode_enabled))
+ 		new_crtc_state->mode_changed = true;
+ 
+-	if (dpu_crtc_state_needs_dspp(old_crtc_state) != dpu_crtc_state_needs_dspp(new_crtc_state))
++	if (dpu_crtc_state_needs_dspp(new_crtc_state) &&
++	    (!to_dpu_crtc_state(old_crtc_state)->num_mixers ||
++	     !to_dpu_crtc_state(old_crtc_state)->mixers[0].hw_dspp))
+ 		new_crtc_state->mode_changed = true;
+ 
+ 	return 0;
+diff --git a/drivers/gpu/drm/msm/msm_atomic.c b/drivers/gpu/drm/msm/msm_atomic.c
+index a8babf1db..5be113304 100644
+--- a/drivers/gpu/drm/msm/msm_atomic.c
++++ b/drivers/gpu/drm/msm/msm_atomic.c
+@@ -185,22 +185,12 @@ int msm_atomic_check(struct drm_device *dev, struct drm_atomic_commit *state)
+ {
+ 	struct msm_drm_private *priv = dev->dev_private;
+ 	struct msm_kms *kms = priv->kms;
+-	struct drm_crtc_state *old_crtc_state, *new_crtc_state;
+-	struct drm_crtc *crtc;
+-	int i, ret = 0;
++	int ret = 0;
+ 
+ 	/*
+-	 * FIXME: stop setting allow_modeset and move this check to the DPU
+-	 * driver.
++	 * Do not force a full modeset when CTM toggles if DSPP blocks are
++	 * already persistently allocated on the CRTC.
+ 	 */
+-	for_each_oldnew_crtc_in_state(state, crtc, old_crtc_state,
+-				      new_crtc_state, i) {
+-		if ((old_crtc_state->ctm && !new_crtc_state->ctm) ||
+-		    (!old_crtc_state->ctm && new_crtc_state->ctm)) {
+-			new_crtc_state->mode_changed = true;
+-			state->allow_modeset = true;
+-		}
+-	}
+ 
+ 	if (kms && kms->funcs && kms->funcs->check_mode_changed)
+ 		ret = kms->funcs->check_mode_changed(kms, state);
+-- 
+2.56.0
+

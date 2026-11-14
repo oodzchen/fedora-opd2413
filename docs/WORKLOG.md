@@ -1622,3 +1622,46 @@ mpv、Firefox 仍是软解（Fedora `ffmpeg-free` 的专利限制），用户选
    - **测试 2（Pogo 键盘空格键唤醒）**：`[32.841071]` 短按电源键 → `[33.924024]` `PM: suspend entry (s2idle)` → 等约 5 s 后按一次空格键 → `[35.482819]` `PM: suspend exit`（内核恢复耗时 `3.8 ms`）→ `[35.489732]` `PrepareForSleep(false=resume)` → `[35.776336]` `panel_prepared`，用户确认**一次空格键直接唤醒亮屏**。
    - **深睡统计**：`/sys/power/suspend_stats/success = 2, fail = 0`（全部 `failed_* = 0`）；`qcom_stats/cxsd` `Count = 7, Accumulated Duration = 209335981`（`10.903 s`），`qcom_stats/ddr` `Count = 7, Accumulated Duration = 209432201`（`10.908 s`）。
    - **附带观测**：此前硬件复位使 PMIC RTC 回到 `2026-10-17`，且平板侧 `chronyc sources` 解析到保留地址（`Reach = 0`、`Not synchronised`），暂未改动系统 NTP 配置。
+
+---
+
+## 2026-11-14 显示在线 modeset（60 / 30 Hz 与 Night Light）修复
+
+- **调查与根因文档**：[DISPLAY-60HZ-MODESET.md](DISPLAY-60HZ-MODESET.md)（已核查 `ok15`、`nl15`、`ok6`、`f60` 4 组 devcoredump）。
+- **根因**：
+  1. 双 DSI 绑定视频模式共用 `CTL_0`，而 `dpu_encoder_virt_atomic_disable()` 对 `phys_encs[0]`（从界面 `INTF_2`）执行 `dpu_encoder_phys_vid_disable()` 时立刻在内部调用 `dpu_encoder_helper_phys_cleanup()`，在主界面 `INTF_1` 与 `sspp_8` 仍处于扫描抓取态时即下发 `CTL_SW_RESET`（超时退化为 `CTL_SW_RESET_OVERRIDE`）、清混合器与 `CTL_FETCH_PIPE_ACTIVE` 并 `trigger_start`，造成 `vbif + 0x20c = 0x30`（`VBIF_AXI_HALT_CTRL1`）、`vbif + 0x204 = ffff0000` 与 `sspp_8` 取数停摆。此前 `DPMS 1->0 -> 0->1` 因跨提交释放 `pm_runtime` 触发 MDSS 断电复位掩盖了该问题，而在屏亮状态切换模式或夜灯的在线 modeset（`active: 1->1, mode_changed=1`）会持续带入复位后的 `0->1` 启用阶段导致黑屏卡死。
+  2. 此外，`msm_atomic_check()` 与 `dpu_crtc_check_mode_changed()` 在 `ctm` 变化时强制触发 `mode_changed = true`，且 `dpu_crtc_get_topology()` 仅在需求存在时才向 RM 申请 DSPP，导致夜灯开关不仅触发在线 modeset，还会在关夜灯时因 `hw_dspp` 丢失而跳过 `setup_pcc(dspp, NULL)`（`#35`）。
+- **内核改动（`7.2.15-13.opd2413`，补丁 `2411`–`2413`，严格 `-F0`）**：
+  - `2411`（`dpu_encoder.c`、`dpu_encoder_phys_{vid,cmd,wb}.c`）：在 `dpu_encoder_virt_atomic_disable()` 中先停止非主物理编码器、再停 `cur_master`（等待 VSYNC / `!is_en`），所有物理编码器停止后再按共享 `hw_ctl` 调用一次 `dpu_encoder_helper_phys_cleanup()`，并循环清理该 CTL 下全部物理编码器的 mixer 与 `CTL_INTF_ACTIVE` / `CTL_INTF_MASTER`。
+  - `2412`（`dpu_encoder.c`、`dpu_crtc.c`、`msm_atomic.c`）：在 `dpu_encoder_update_topology()` 中为非 WB 显示输出预先分配 `num_dspp = num_lm`，并在 `old_crtc_state` 已持有 `hw_dspp` 时取消 `ctm` 触发 `mode_changed = true`。
+  - `2413`（`panel-novatek-nt36536.c`）：在 `1412` 之后恢复 `novatek_nt36536_vfp[] = { 26, 2684, 8000 }`（120 / 60 / 30 Hz）。
+- **构建产物**：`out/rpmbuild/RPMS/aarch64/kernel-opd2413-7.2.15-13.opd2413.aarch64.rpm`（SHA256 `beafdddab88ec25bc96855564bbe69a482aa6c11760baffc806a9fea68222a0f`）。
+- **用户冷启动初测补充观察**：用户反馈首次开机曾两次卡在灰屏后自动重启、第二次后进入桌面；经肉眼确认 120/60/30 Hz 刷新率与夜光色温均可正常调节。对于灰屏问题，用户补充其一直存在（通常一闪而过，这次卡得更久），基本出现在选完 kShimC 引导后、内核日志尚未出现之前。
+- **二分定位 `-12 -> -15` 引入的 `DPMS off -> on` 回归（`dsi1 cmd dma timeout`）**：
+  1. 在 `-12` 上对照 `DPMS off -> 2s -> on` 连续 3 轮（`t = 39.07 s .. 45.24 s`，每轮 `mdss_gdsc off-0`），全部正常唤醒（`panel_prepared`、零 DSI/超时错误）；核对 `~/.config/kwinoutputconfig.json` 确认当时输出模式为 `vtotal=2658`（`120 Hz`），`-12` 与 `-15` 的 DTB SHA256 均为 `6d57fdad...`、内核参数一致，两版差异仅 `2411`（`689e095a6`）与 `2413`（`184c05cf8`）。
+  2. 构建仅含 `2411`（不含 `2412` / `2413`）的 `7.2.15-16.opd2413` 并单次引导测试：`DPMS off -> 2s -> on` 第一轮即在第 `21.683520 s` 复现 `dsi1 cmd dma timeout`（`sending dcs data b3 40 failed: -110`，`dsi0` 报 `ERR_CONTENTION_LP1` `0x10000`），确认 `2411` 本身为回归来源。
+  3. 构建保留原始 `phys_encs[]` 停用顺序（`phys_0` / `cur_master` 先、`phys_1` / 从端后）、仅保留 `2411` 延后 `dpu_encoder_helper_phys_cleanup()` 的 `7.2.15-17.opd2413` 并上机测试：`DPMS off -> 2s -> on` 连续 **8 轮全部通过**（`mdss_gdsc off-0`、零 DSI/超时错误），证明反向先停从端 `phys_1` 再停主端 `cur_master` 是触发 `ERR_CONTENTION_LP1` 的原因。
+- **最终修复（`7.2.15-18.opd2413`）构建与全套验收**：
+  - 将保留原始 `phys_encs[]` 停用顺序的 `2411`（`out/m3k/tree` `series3`）与 `2412`、`2413` 重新打包并验证 `-F0` 无模糊合入，构建 `out/rpmbuild/RPMS/aarch64/kernel-opd2413-7.2.15-18.opd2413.aarch64.rpm`（SHA256 `8df72537d0aed06614860cdd0c099bbf620a04951a22017a227d68a9cd2782b4`）。
+  - **经用户确认后装机并单次引导进入 `7.2.15-18.opd2413` 实测结果（全部真机通过）**：
+    1. **内联刷新率切换**：`120 -> 60 -> 30 -> 120 -> 60 -> 120 Hz` 连续 5 次切换全部成功（每次约 `470 ms`，零 VBIF / `vblank` / DSI 超时或卡死）。
+    2. **多刷新率 DPMS 灭屏/亮屏**：在 `120 Hz`、`60 Hz`、`30 Hz` 下各测 `DPMS off -> 1s/2s -> on`（共 6 轮）全部正常唤醒（每轮 off 均进 `mdss_gdsc off-0`，dmesg 零 `dsi`/`timeout`/`vblank` 错误）。
+    3. **Night Light（`#35`）**：经 D-Bus `org.kde.KWin.NightLight` 测 `preview 2000` → `preview 6500` → `stopPreview`，`/sys/kernel/debug/dri/0/kms` 中 `dspp_0_pcc` 与 `dspp_1_pcc` 随色温更新（`2000K`：`0x0: 00000001, 0x10: 0000b6c6`）且在 `6500K` 清零（`0x0: 00000000`），全程 `panel_unpreparing` 计数保持 `14`（零 modeset）。
+    4. **`s2idle` 休眠唤醒**：`systemctl suspend` 进入 `s2idle` 后由用户按键正常唤醒，`suspend_stats/success = 1`，`dmesg` 记录 `PM: suspend entry (s2idle)` → `PM: suspend exit` → `panel_prepared`（`count = 16`），零错误。
+    5. **切换默认项、清理临时内核与默认重启复核**：经用户确认后卸载 `kernel-opd2413-7.2.15-17.opd2413`、执行 `/usr/libexec/opd2413/boot-select default fedora-7.2.15-18.opd2413.conf`（保留 `7.2.15-12.opd2413` 作为回退）、清理 `out/m3k/tree` 的临时二分分支（仅保留 `base` 与 `series3`）并将 `out/m3k/build.sh` 默认 `N` 更新为 `18`；随后执行无参默认重启，设备 `49 s` 回到 `7.2.15-18.opd2413`（`systemctl is-system-running = running`，`systemctl --failed = 0`，SELinux `Enforcing`，`/boot/efi` 已用 `247M` / 剩余 `266M`）。
+- **追加排查（`-18` 手动 60 Hz 卡死 → `-19`/`-20`/`-21` 控制变量对比 → `-22` 补丁 `2414` 收敛）**：
+  - **问题复现**：用户在 `7.2.15-18.opd2413` 上通过 KDE 设置手动切换至 `60 Hz` 后仍触发 `CTL_0` 卡死黑屏，连带切回 `120 Hz` 亦黑屏。
+  - **控制变量对照**：
+    1. `7.2.15-19.opd2413`（`_dpu_encoder_helper_phys_cleanup()` 中保留 `trigger_flush(ctl); trigger_start(ctl);`）：`120 Hz` 下 `DPMS off -> 3s -> on` **4/4 通过**（`mdss_gdsc off-0 -> on`，`err_lines=0`），但在线切刷新率仍卡死 `CTL_0`。
+    2. `7.2.15-20.opd2413`（补丁 `2414` 初版：跳过 `trigger_flush`/`trigger_start` 且追加二次 `ctl->ops.reset(ctl)`）：在线切换 `120 <-> 60 <-> 30 Hz` **9/9 通过**，但 `DPMS off -> 3s -> on` **4/4 失败**（`dsi1 cmd dma timeout`、`hw ctl reset is set for ctl:1`、`vblank timeout: 4208c0`）。
+    3. `7.2.15-21.opd2413`（仅跳过 `trigger_flush`/`trigger_start`，去掉二次 `ctl->ops.reset(ctl)`）：在线切换 `120 -> 60 -> 30 -> 60 -> 120` 正常，但 `DPMS off -> 3s -> on` 仍 **2/2 失败**（`ff 20` / `fb 01` DCS 超时、`clk=008077c3 dln0=00088888`、`vblank timeout: 4208c0`）。对照 `-19` 与 `-21`（仅差跳过 `trigger_flush`/`trigger_start`）锁定：`DPMS off`（`mdss_gdsc` 后续掉电）必须保留 `trigger_flush`/`trigger_start`，而在线 modeset（`active == true`、`mdss_gdsc` 保持供电）必须跳过。
+  - **补丁 `2414` 定版与 `7.2.15-22.opd2413` 实机验收**：
+    - 在 `dpu_encoder_virt_atomic_disable()` 中按 `new_state && new_state->active && (!new_conn_state || new_conn_state->best_encoder == drm_enc)` 计算 `skip_vid_trigger`，仅在此条件且 `phys_enc->intf_mode == INTF_MODE_VIDEO` 时跳过 `_dpu_encoder_helper_phys_cleanup()` 里的 `trigger_flush`/`trigger_start`。构建 `kernel-opd2413-7.2.15-22.opd2413.aarch64.rpm`（SHA256 `139a520f8173bc7152d34f2f6f01c8f07` 等已校验），在平板卸载 `-19`/`-20`/`-21` 后安装 `-22` 并单次引导（`loader.conf` 默认仍保持 `-18`）。
+    - **实机验证结果（全部真机通过）**：
+      1. `DPMS off -> 3s -> on`：120 Hz 连续 3 次、60 Hz、30 Hz 下全部正常降压至 `off-0` 并恢复 `on`，零 DRM/DPU/DSI/vblank/LUTDMA 报错；
+      2. 在线切换：`120 -> 60 -> 30 -> 60 -> 120 -> 60 Hz` 全部 `rc=0`，`crtc-0/status` 与 `dri/0/kms` 验证三档刷新率均正常双路扫描出图；
+      3. 夜览：KWin `org.kde.KWin.NightLight.preview 3500` / `stopPreview`（`4050` ↔ `4500` K）内核 `kmsg` 零相关报错、无 modeset；
+      4. `s2idle` 休眠与唤醒：因 `systemctl suspend` 在 `rtcwake -s 8` 预设闹钟过点约 2 秒后才正式入睡由用户短按电源键唤醒，日志记录完整 `PM: suspend entry (s2idle)` → `PM: suspend exit` → `panel_prepared` → `follower resume #18 complete`（`uptime: 257.31` 未重启），唤醒后立即复测 `120 -> 60 -> 30 -> 120 Hz` 与 `DPMS` 零显示错误；
+      5. **用户手动测试**：用户确认桌面手动操作（切换刷新率、夜览、息屏亮屏、触控等）没有问题。
+    - **诚实记录技术债**：在 [TECH-DEBT.md](TECH-DEBT.md) 正式登记 `#36`（`2414` 为基于 `new_state->active` 的状态规避而非寄存器级根修，且仍走非无缝 disable/enable）与 `#37`（快速切换时 `nt36536` 偶发 `nvt_ts_resume 2139: -112` 竞争日志）。
+    - **切换默认项、清理旧内核与默认重启复核**：经用户确认后执行 `/usr/libexec/opd2413/boot-select default fedora-7.2.15-22.opd2413.conf` 并 `rpm -e kernel-opd2413-7.2.15-18.opd2413`（保留 `7.2.15-12.opd2413` 回退，ESP `/dev/sda16` 已用 `247M` / 剩余 `266M`、`49%`）；随后执行无参默认重启，设备 `49 s` 自动拉起 `7.2.15-22.opd2413`（`systemctl is-system-running = running`，`systemctl --failed = 0`，SELinux `Enforcing`）。

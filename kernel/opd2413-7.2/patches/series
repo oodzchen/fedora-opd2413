@@ -74,3 +74,9 @@
 
 # M3.3 / s2idle ISLAND1 PS_HOLD fix
 2410-soc-qcom-llcc-qcom-Reserve-ISLAND1-ways-on-SM8750.patch
+
+# Display inline modeset / 60 Hz & 30 Hz / Night Light CTM-DSPP fix
+2411-drm-msm-dpu-disable-all-phys-encoders-before-CTL-cle.patch
+2412-drm-msm-dpu-allocate-DSPP-upfront-so-CTM-changes-avo.patch
+2413-drm-panel-nt36536-re-enable-60-Hz-and-30-Hz-modes.patch
+2414-drm-msm-dpu-skip-video-mode-CTL-flush-start-in-phys-.patch

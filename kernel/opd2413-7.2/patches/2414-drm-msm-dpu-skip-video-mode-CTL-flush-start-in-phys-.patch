@@ -1,0 +1,99 @@
+From 504a0e5cf17549dd356cd90b3aa5b1af783e1242 Mon Sep 17 00:00:00 2001
+From: build <build@localhost>
+Date: Sat, 14 Nov 2026 12:22:03 +0800
+Subject: [PATCH] drm/msm/dpu: skip video-mode CTL flush/start in phys cleanup
+
+During an inline modeset on SM8750, MDSS GDSC does not collapse between disable and enable. Calling trigger_flush + trigger_start in dpu_encoder_helper_phys_cleanup() after the video-mode timing engines are stopped leaves CTL_FLUSH/CTL_START armed with CTL_INTF_ACTIVE cleared, wedging CTL_0 on re-enable.
+---
+ drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c | 38 ++++++++++++++++++---
+ 1 file changed, 33 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
+index f508d0654..2311e9a83 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
+@@ -1436,20 +1436,33 @@ static void dpu_encoder_virt_atomic_enable(struct drm_encoder *drm_enc,
+ 	mutex_unlock(&dpu_enc->enc_lock);
+ }
+ 
++static void _dpu_encoder_helper_phys_cleanup(struct dpu_encoder_phys *phys_enc,
++					     bool skip_vid_trigger);
++
+ static void dpu_encoder_virt_atomic_disable(struct drm_encoder *drm_enc,
+ 					struct drm_atomic_commit *state)
+ {
+ 	struct dpu_encoder_virt *dpu_enc = NULL;
+ 	struct drm_crtc *crtc;
+ 	struct drm_crtc_state *old_state = NULL;
++	struct drm_crtc_state *new_state = NULL;
++	struct drm_connector_state *new_conn_state = NULL;
++	bool skip_vid_trigger = false;
+ 	int i = 0;
+ 
+ 	dpu_enc = to_dpu_encoder_virt(drm_enc);
+ 	DPU_DEBUG_ENC(dpu_enc, "\n");
+ 
+ 	crtc = drm_atomic_get_old_crtc_for_encoder(state, drm_enc);
+-	if (crtc)
++	if (crtc) {
+ 		old_state = drm_atomic_get_old_crtc_state(state, crtc);
++		new_state = drm_atomic_get_new_crtc_state(state, crtc);
++	}
++	if (dpu_enc->connector)
++		new_conn_state = drm_atomic_get_new_connector_state(state, dpu_enc->connector);
++	if (new_state && new_state->active &&
++	    (!new_conn_state || new_conn_state->best_encoder == drm_enc))
++		skip_vid_trigger = true;
+ 
+ 	/*
+ 	 * The encoder is already disabled if self refresh mode was set earlier,
+@@ -1492,7 +1505,7 @@ static void dpu_encoder_virt_atomic_disable(struct drm_encoder *drm_enc,
+ 				break;
+ 		}
+ 		if (j == i)
+-			dpu_encoder_helper_phys_cleanup(phys);
++			_dpu_encoder_helper_phys_cleanup(phys, skip_vid_trigger);
+ 	}
+ 
+ 
+@@ -2388,7 +2401,8 @@ static void dpu_encoder_unprep_dsc(struct dpu_encoder_virt *dpu_enc)
+  * dpu_encoder_helper_phys_cleanup - helper to cleanup dpu pipeline
+  * @phys_enc: Pointer to physical encoder structure
+  */
+-void dpu_encoder_helper_phys_cleanup(struct dpu_encoder_phys *phys_enc)
++static void _dpu_encoder_helper_phys_cleanup(struct dpu_encoder_phys *phys_enc,
++					     bool skip_vid_trigger)
+ {
+ 	struct dpu_hw_ctl *ctl = phys_enc->hw_ctl;
+ 	struct dpu_hw_intf_cfg intf_cfg = { 0 };
+@@ -2486,11 +2500,25 @@ void dpu_encoder_helper_phys_cleanup(struct dpu_encoder_phys *phys_enc)
+ 		}
+ 	}
+ 
+-	ctl->ops.trigger_flush(ctl);
+-	ctl->ops.trigger_start(ctl);
++	/*
++	 * During an inline modeset (CRTC remains active, MDSS GDSC never
++	 * collapses), video-mode timing engines have already stopped before
++	 * cleanup runs, so trigger_flush/trigger_start without active VSYNC
++	 * can leave CTL_FLUSH/CTL_START armed and wedge CTL_0 on re-enable.
++	 * Full power-down disables (DPMS off) still trigger the flush/start.
++	 */
++	if (!(skip_vid_trigger && phys_enc->intf_mode == INTF_MODE_VIDEO)) {
++		ctl->ops.trigger_flush(ctl);
++		ctl->ops.trigger_start(ctl);
++	}
+ 	ctl->ops.clear_pending_flush(ctl);
+ }
+ 
++void dpu_encoder_helper_phys_cleanup(struct dpu_encoder_phys *phys_enc)
++{
++	_dpu_encoder_helper_phys_cleanup(phys_enc, false);
++}
++
+ void dpu_encoder_helper_phys_setup_cwb(struct dpu_encoder_phys *phys_enc,
+ 				       bool enable)
+ {
+-- 
+2.56.0
+

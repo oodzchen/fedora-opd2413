@@ -58,3 +58,5 @@
 | `7.2.15-10` | M3.5 麦克风根因修复 `2407`（wcd939x 按声道报告/切换 SoundWire 开关）；去掉 `2402`，TX SoundWire 布局回到 erhai 的 |
 | `7.2.15-11` | M3.6 键盘休眠唤醒 `2408`、`2409`（共享 RX `gpio3` 休眠态 `input-enable + bias-pull-down` 与 `wakeup` 中断，4 簇脉冲过滤屏蔽 10 s 脉冲与 22.66 s 电池包拍频重合，仅真实按键唤醒） |
 | `7.2.15-12` | M3.3 s2idle 修复 `2410`（erhai `b30d759d3`：`LLCC_ISLAND1` 使用 `res_ways = 0x7fffffff` 替代 `bonus_ways`，修 `2401` 引入后冷启动早休眠在 `PM: suspend-to-idle` 后触发 `PS_HOLD` 复位的问题） |
+| `7.2.15-18` | 显示与夜览：`2411`（按共享 `hw_ctl` 延后一次 `phys_cleanup`，保持 `phys_0 -> phys_1` 停用顺序）、`2412`（预分配 DSPP 且不因 `ctm` 强制 `mode_changed`）、`2413`（恢复 `60/30 Hz`） |
+| `7.2.15-22` | 显示 `2414`（`dpu_encoder_virt_atomic_disable()` 按 `new_state && new_state->active` 仅对在线 modeset 跳过 `INTF_MODE_VIDEO` 的 `trigger_flush`/`trigger_start`，解决 `-18` 手动 60 Hz 切换卡死与 `-20`/`-21` DPMS 超时互斥；技术债记为 `#36`/`#37`） |

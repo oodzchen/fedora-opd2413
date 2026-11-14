@@ -1,0 +1,36 @@
+From 72e859a05e3374fdf6e55b808817ced15832456a Mon Sep 17 00:00:00 2001
+From: Kholin <oodzchen@gmail.com>
+Date: Sat, 14 Nov 2026 01:00:13 +0800
+Subject: [PATCH] drm/panel: nt36536: re-enable 60 Hz and 30 Hz modes
+
+Restore the stock 60 Hz (vfp=2684) and 30 Hz (vfp=8000) modes alongside 120 Hz (vfp=26) now that shared-CTL dual-DSI inline modesets disable all physical encoders before cleaning up CTL_0.
+
+Co-Authored-By: Antigravity <noreply@deepmind.google>
+---
+ drivers/gpu/drm/panel/panel-novatek-nt36536.c | 10 ++--------
+ 1 file changed, 2 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/gpu/drm/panel/panel-novatek-nt36536.c b/drivers/gpu/drm/panel/panel-novatek-nt36536.c
+index b2ace1e36..7ed807840 100644
+--- a/drivers/gpu/drm/panel/panel-novatek-nt36536.c
++++ b/drivers/gpu/drm/panel/panel-novatek-nt36536.c
+@@ -322,14 +322,8 @@ static const struct drm_display_mode novatek_nt36536_mode = {
+ 	.type = DRM_MODE_TYPE_DRIVER,
+ };
+ 
+-/*
+- * Stock 120/60/30 Hz timings keep the link clock and horizontal timing fixed
+- * (vertical front porch 26, 2684 and 8000 lines). Only 120 Hz is offered:
+- * with the longer porches the panel shows no picture, and the mode switch
+- * back to 120 Hz leaves the DPU stuck until the next full disable. The stock
+- * kernel likely sends rate-switch commands that are not known yet.
+- */
+-static const unsigned int novatek_nt36536_vfp[] = { 26 };
++/* Stock 120/60/30 Hz timings keep the link clock and horizontal timing fixed. */
++static const unsigned int novatek_nt36536_vfp[] = { 26, 2684, 8000 };
+ 
+ static int novatek_nt36536_get_modes(struct drm_panel *panel,
+ 				     struct drm_connector *connector)
+-- 
+2.56.0
+
