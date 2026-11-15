@@ -1,0 +1,36 @@
+From 870167fad062e74f6de27e76db84d17cc49d8b84 Mon Sep 17 00:00:00 2001
+From: yzddmr6 <46088090+yzddmr6@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 23:56:54 +0800
+Subject: [PATCH] arm64: dts: qcom: sm8750-erhai: describe PCIe WAKE# as active
+ low
+
+WAKE# is an active-low signal, as the PCIe CEM specification defines it
+and as the other SM8750 boards describe it. The property was unused
+until the PCI core started requesting wake-gpios as a wakeup interrupt;
+with the active-high flag the idle line counts as asserted, and every
+s2idle entry is woken within about two seconds by the root port's wake
+interrupt.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+(cherry picked from commit 30ab14d7c24d9309129b5467ffb4b81242af22e9)
+
+[opd2413: applied to arch/arm64/boot/dts/qcom/sm8750-oneplus-pad2pro.dts]
+---
+ arch/arm64/boot/dts/qcom/sm8750-oneplus-pad2pro.dts | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/arch/arm64/boot/dts/qcom/sm8750-oneplus-pad2pro.dts b/arch/arm64/boot/dts/qcom/sm8750-oneplus-pad2pro.dts
+index b1c419b..634c6d8 100644
+--- a/arch/arm64/boot/dts/qcom/sm8750-oneplus-pad2pro.dts
++++ b/arch/arm64/boot/dts/qcom/sm8750-oneplus-pad2pro.dts
+@@ -2228,7 +2228,7 @@
+ };
+ 
+ &pcieport0 {
+-	wake-gpios = <&tlmm 104 GPIO_ACTIVE_HIGH>;
++	wake-gpios = <&tlmm 104 GPIO_ACTIVE_LOW>;
+ 	reset-gpios = <&tlmm 102 GPIO_ACTIVE_LOW>;
+ 
+ 	wifi@0 {
+-- 
+2.56.0

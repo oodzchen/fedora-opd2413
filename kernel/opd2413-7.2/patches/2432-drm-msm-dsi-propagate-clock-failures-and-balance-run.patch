@@ -1,0 +1,128 @@
+From 8ebec92783205780c3349fe10c7d92d09cf93f15 Mon Sep 17 00:00:00 2001
+From: yzddmr6 <46088090+yzddmr6@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 12:01:21 +0800
+Subject: [PATCH] drm/msm/dsi: propagate clock failures and balance runtime PM
+ references
+
+Return reparenting errors instead of overwriting them with a later rate result. Stop command preparation when runtime resume, rate setup or link clock enable fails, before touching controller registers. Use pm_runtime_resume_and_get and release successful PM acquisitions on every power-on and transfer failure path. Retain the existing successful-path references and clock topology, and identify the controller in error-worker messages.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+(cherry picked from commit b097f51215b224d5dfcf2eb274a33772cc54cea9)
+[Refreshed against OPD2413 7.2.15 dsi_host.c preserving active-link clock guard and byte/pixel parent tracking]
+---
+ drivers/gpu/drm/msm/dsi/dsi_host.c | 42 +++++++++++++++++++++++-------
+ 1 file changed, 33 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/dsi/dsi_host.c b/drivers/gpu/drm/msm/dsi/dsi_host.c
+index 8c44b78f3..6c4a22a6c 100644
+--- a/drivers/gpu/drm/msm/dsi/dsi_host.c
++++ b/drivers/gpu/drm/msm/dsi/dsi_host.c
+@@ -445,12 +445,16 @@ int dsi_link_clk_set_rate_6g_v2_9(struct msm_dsi_host *msm_host)
+ 	 * cannot use assigned-clock-parents.
+ 	 */
+ 	ret = clk_set_parent(msm_host->byte_src_clk, msm_host->dsi_pll_byte_clk);
+-	if (ret)
++	if (ret) {
+ 		dev_err(dev, "Failed to parent byte_src -> dsi_pll_byte: %d\n", ret);
++		return ret;
++	}
+ 
+ 	ret = clk_set_parent(msm_host->pixel_src_clk, msm_host->dsi_pll_pixel_clk);
+-	if (ret)
++	if (ret) {
+ 		dev_err(dev, "Failed to parent pixel_src -> dsi_pll_pixel: %d\n", ret);
++		return ret;
++	}
+ 
+ 	return dsi_link_clk_set_rate_6g(msm_host);
+ }
+@@ -1619,7 +1623,7 @@ static void dsi_err_worker(struct work_struct *work)
+ 		container_of(work, struct msm_dsi_host, err_work);
+ 	u32 status = msm_host->err_work_state;
+ 
+-	pr_err_ratelimited("%s: status=%x\n", __func__, status);
++	dev_err_ratelimited(&msm_host->pdev->dev, "%s: status=%x\n", __func__, status);
+ 	if (status & DSI_ERR_STATE_MDP_FIFO_UNDERFLOW)
+ 		dsi_sw_reset(msm_host);
+ 
+@@ -2251,6 +2255,7 @@ int msm_dsi_host_xfer_prepare(struct mipi_dsi_host *host,
+ {
+ 	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
+ 	const struct msm_dsi_cfg_handler *cfg_hnd = msm_host->cfg_hnd;
++	int ret;
+ 
+ 	/* TODO: make sure dsi_cmd_mdp is idle.
+ 	 * Since DSI6G v1.2.0, we can set DSI_TRIG_CTRL.BLOCK_DMA_WITHIN_FRAME
+@@ -2262,7 +2267,9 @@ int msm_dsi_host_xfer_prepare(struct mipi_dsi_host *host,
+ 	 * mdss interrupt is generated in mdp core clock domain
+ 	 * mdp clock need to be enabled to receive dsi interrupt
+ 	 */
+-	pm_runtime_get_sync(&msm_host->pdev->dev);
++	ret = pm_runtime_resume_and_get(&msm_host->pdev->dev);
++	if (ret < 0)
++		return ret;
+ 
+ 	/*
+ 	 * Skip link clock enable/set_rate when the display is already active.
+@@ -2273,14 +2280,17 @@ int msm_dsi_host_xfer_prepare(struct mipi_dsi_host *host,
+ 	 */
+ 	if (!(msm_host->power_on && msm_host->enabled) ||
+ 	    !of_machine_is_compatible("qcom,sm8250")) {
+-		int ret;
++		ret = cfg_hnd->ops->link_clk_set_rate(msm_host);
++		if (ret)
++			goto err_put_pm;
+ 
+-		cfg_hnd->ops->link_clk_set_rate(msm_host);
+ 		ret = cfg_hnd->ops->link_clk_enable(msm_host);
+-		if (ret)
++		if (ret) {
+ 			/* OPD2413: a link that cannot clock stalls a bonded transfer. */
+ 			pr_err("dsi%d: link clocks failed to enable for transfer: %d\n",
+ 			       msm_host->id, ret);
++			goto err_put_pm;
++		}
+ 	}
+ 
+ 	/* TODO: vote for bus bandwidth */
+@@ -2296,6 +2306,10 @@ int msm_dsi_host_xfer_prepare(struct mipi_dsi_host *host,
+ 	dsi_intr_ctrl(msm_host, DSI_IRQ_MASK_CMD_DMA_DONE, 1);
+ 
+ 	return 0;
++
++err_put_pm:
++	pm_runtime_put(&msm_host->pdev->dev);
++	return ret;
+ }
+ 
+ void msm_dsi_host_xfer_restore(struct mipi_dsi_host *host,
+@@ -2619,14 +2633,17 @@ int msm_dsi_host_power_on(struct mipi_dsi_host *host,
+ 		goto unlock_ret;
+ 	}
+ 
+-	pm_runtime_get_sync(&msm_host->pdev->dev);
++	ret = pm_runtime_resume_and_get(&msm_host->pdev->dev);
++	if (ret < 0)
++		goto fail_disable_reg;
++
+ 	ret = cfg_hnd->ops->link_clk_set_rate(msm_host);
+ 	if (!ret)
+ 		ret = cfg_hnd->ops->link_clk_enable(msm_host);
+ 	if (ret) {
+ 		pr_err("%s: failed to enable link clocks. ret=%d\n",
+ 		       __func__, ret);
+-		goto fail_disable_reg;
++		goto fail_put_pm;
+ 	}
+ 
+ 	ret = pinctrl_pm_select_default_state(&msm_host->pdev->dev);
+@@ -2647,6 +2664,7 @@ int msm_dsi_host_power_on(struct mipi_dsi_host *host,
+ 
+ fail_disable_clk:
+ 	cfg_hnd->ops->link_clk_disable(msm_host);
++fail_put_pm:
+ 	pm_runtime_put(&msm_host->pdev->dev);
+ fail_disable_reg:
+ 	regulator_bulk_disable(msm_host->cfg_hnd->cfg->num_regulators,
+-- 
+2.52.0

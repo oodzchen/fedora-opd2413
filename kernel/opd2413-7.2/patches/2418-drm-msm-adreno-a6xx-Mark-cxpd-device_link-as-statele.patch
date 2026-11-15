@@ -1,0 +1,63 @@
+From 62ed205f1a8716ba9270c464692fd83f6a41dcae Mon Sep 17 00:00:00 2001
+From: Akhil P Oommen <akhilpo@oss.qualcomm.com>
+Date: Wed, 13 May 2026 02:23:00 +0530
+Subject: [PATCH] FROMLIST: drm/msm/adreno/a6xx: Mark cxpd device_link as
+ stateless
+
+Since the cxpd virtual device is a driverless device, it has no real
+struct device_driver bound it the way a normal platform device does. So,
+the managed lifecycle doesn't map cleanly onto it. Since the lifecycle of
+this device_link is managed by the msm driver, pass DL_FLAG_STATELESS
+together with the existing DL_FLAG_PM_RUNTIME flag.
+
+This fix is required to avoid the below splat when a driver is attached to
+the GMU:
+
+  WARNING: drivers/base/core.c:1383 at device_links_driver_bound+0x178/0x330
+  Call trace:
+   device_links_driver_bound+0x178/0x330 (P)
+   driver_bound+0x7c/0xd0
+   really_probe+0x208/0x2a8
+   ...
+   adreno_gmu_register+0x2c/0x40 [msm]
+   adreno_register+0x3c/0x50 [msm]
+   msm_drm_register+0x50/0x78 [msm]
+
+Fixes: ead5d3e5eb37 ("drm/msm/a6xx: Vote for cx gdsc from gpu driver")
+Signed-off-by: Akhil P Oommen <akhilpo@oss.qualcomm.com>
+Reviewed-by: Dmitry Baryshkov <dmitry.baryshkov@oss.qualcomm.com>
+Link: https://lore.kernel.org/r/20260513-gmu-sync-state-fix-v1-1-6e33e6aa9b4f@oss.qualcomm.com
+
+Assisted-by: LLM
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ drivers/gpu/drm/msm/adreno/a6xx_gmu.c | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/adreno/a6xx_gmu.c b/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
+index 7847ec952..5ea99d318 100644
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
+@@ -2241,7 +2241,8 @@ int a6xx_gmu_wrapper_init(struct a6xx_gpu *a6xx_gpu, struct device_node *node)
+ 		goto err_mmio;
+ 	}
+ 
+-	if (!device_link_add(gmu->dev, gmu->cxpd, DL_FLAG_PM_RUNTIME)) {
++	if (!device_link_add(gmu->dev, gmu->cxpd,
++			     DL_FLAG_PM_RUNTIME | DL_FLAG_STATELESS)) {
+ 		ret = -ENODEV;
+ 		goto detach_cxpd;
+ 	}
+@@ -2427,7 +2428,8 @@ int a6xx_gmu_init(struct a6xx_gpu *a6xx_gpu, struct device_node *node)
+ 		goto err_mmio;
+ 	}
+ 
+-	link = device_link_add(gmu->dev, gmu->cxpd, DL_FLAG_PM_RUNTIME);
++	link = device_link_add(gmu->dev, gmu->cxpd,
++			       DL_FLAG_PM_RUNTIME | DL_FLAG_STATELESS);
+ 	if (!link) {
+ 		ret = -ENODEV;
+ 		goto detach_cxpd;
+-- 
+2.56.0
+

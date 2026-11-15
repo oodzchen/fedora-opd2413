@@ -1,0 +1,66 @@
+From 5930568b2f15c649d2b342fba2ec614ab63174d2 Mon Sep 17 00:00:00 2001
+From: zczyh0922 <345248607+zczyh0922@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 19:13:33 +0800
+Subject: [PATCH] drm/msm/dsi/phy: 7nm: program the PLL muxes on every bias
+ enable
+
+Since "drm/msm: dsi: fix PLL init in bonded mode" was reverted,
+dsi_7nm_phy_enable() takes the PLL bias reference itself by setting
+pll_enable_cnt to 1, without programming PLL_SYSTEM_MUXES. Every later
+dsi_pll_enable_pll_bias() call then returns early and skips the mux
+write and its settle delay. A rate read-back or rate change before the
+PHY enable drops the reference back to zero on its way out, and that
+disable path clears PLL_SYSTEM_MUXES, so nothing restores the mux.
+
+On the bonded dual-DSI panel of the OnePlus Pad 2 Pro this left the
+internal display dark, or the half driven by the secondary link
+garbled, depending on the probe order; the touch controller integrated
+in the panel then reported checksum errors. Both reports came from
+units running ColorOS C.35.
+
+Keep the reference counting, the lock and the power-down path, set
+PLL_SHUTDOWNB only when the first reference is taken, and write the mux
+and wait 250 ns on every call.
+
+Adapted from the patch posted in the issue below; only the comment
+wording differs.
+
+Fixes: 44784327815b ("Revert \"drm/msm: dsi: fix PLL init in bonded mode\"")
+Link: https://github.com/yzddmr6/onepluspad-2pro-mainline/issues/14
+Link: https://github.com/yzddmr6/onepluspad-2pro-mainline/issues/13
+Assisted-by: LLM
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ drivers/gpu/drm/msm/dsi/phy/dsi_phy_7nm.c | 14 ++++++--------
+ 1 file changed, 6 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/dsi/phy/dsi_phy_7nm.c b/drivers/gpu/drm/msm/dsi/phy/dsi_phy_7nm.c
+index 5d805a797..04f315c71 100644
+--- a/drivers/gpu/drm/msm/dsi/phy/dsi_phy_7nm.c
++++ b/drivers/gpu/drm/msm/dsi/phy/dsi_phy_7nm.c
+@@ -426,16 +426,14 @@ static void dsi_pll_enable_pll_bias(struct dsi_pll_7nm *pll)
+ 	u32 data;
+ 
+ 	spin_lock_irqsave(&pll->pll_enable_lock, flags);
+-	if (pll->pll_enable_cnt++) {
+-		spin_unlock_irqrestore(&pll->pll_enable_lock, flags);
+-		WARN_ON(pll->pll_enable_cnt == INT_MAX);
+-		return;
++	if (!pll->pll_enable_cnt++) {
++		data = readl(pll->phy->base + REG_DSI_7nm_PHY_CMN_CTRL_0);
++		data |= DSI_7nm_PHY_CMN_CTRL_0_PLL_SHUTDOWNB;
++		writel(data, pll->phy->base + REG_DSI_7nm_PHY_CMN_CTRL_0);
+ 	}
++	WARN_ON(pll->pll_enable_cnt == INT_MAX);
+ 
+-	data = readl(pll->phy->base + REG_DSI_7nm_PHY_CMN_CTRL_0);
+-	data |= DSI_7nm_PHY_CMN_CTRL_0_PLL_SHUTDOWNB;
+-	writel(data, pll->phy->base + REG_DSI_7nm_PHY_CMN_CTRL_0);
+-
++	/* dsi_7nm_phy_enable() takes the first reference without programming the muxes. */
+ 	writel(0xc0, pll->phy->pll_base + REG_DSI_7nm_PHY_PLL_SYSTEM_MUXES);
+ 	spin_unlock_irqrestore(&pll->pll_enable_lock, flags);
+ 	ndelay(250);
+-- 
+2.56.0
+

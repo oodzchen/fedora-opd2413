@@ -85,3 +85,25 @@
 2415-backlight-ktz8866-turn-off-bootloader-active-KTZ8868.patch
 2416-backlight-led_bl-turn-off-LEDs-synchronously-without.patch
 2417-clk-qcom-dispcc-sm8750-wait-for-panel-backlight-befo.patch
+
+# Power & runtime PM batch 1: GMU driver binding (sync_state) + DDR boot bus vote + RPMH dep votes
+2418-drm-msm-adreno-a6xx-Mark-cxpd-device_link-as-statele.patch
+2419-drm-msm-Centralize-the-standalone-drm-device-check-f.patch
+2420-drm-msm-adreno-Fix-invalid-drvdata-typecast-in-adren.patch
+2421-drm-msm-Always-use-component-model-for-standalone-GP.patch
+2422-drm-msm-Attach-a-driver-to-the-GMU.patch
+2423-drm-msm-a6xx-drop-the-boot-bus-vote-once-the-GMU-vot.patch
+2424-drm-msm-a6xx-Fix-RPMH-dependency-votes.patch
+
+# Power & runtime PM batch 2: PCIe D3 / WAKE# / GDSC / dwc3-qcom / qmp-combo
+2425-PCI-Allow-D3-for-native-hotplug-capable-Root-Ports-o.patch
+2426-PCI-qcom-retain-active-controller-and-QMP-PHY-wake-p.patch
+2427-clk-qcom-gcc-sm8750-honor-active-PCIe-wake-paths-dur.patch
+2428-arm64-dts-qcom-sm8750-oneplus-pad2pro-describe-PCIe-.patch
+2429-FROMLIST-usb-dwc3-qcom-Defer-VBUS-override-update-du.patch
+2430-phy-qcom-qmp-combo-Prevent-unnecessary-PM-runtime-su.patch
+
+# Power & runtime PM batch 3: panel true power-off across unprepare (#19) + DSI PHY/host fixes
+2431-drm-msm-dsi-phy-7nm-program-the-PLL-muxes-on-every-b.patch
+2432-drm-msm-dsi-propagate-clock-failures-and-balance-run.patch
+2433-Revert-drm-panel-nt36536-keep-supplies-on-across-unp.patch

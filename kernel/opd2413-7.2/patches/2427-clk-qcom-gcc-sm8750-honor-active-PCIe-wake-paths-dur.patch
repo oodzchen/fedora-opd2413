@@ -1,0 +1,44 @@
+From 39636e8c34fb298b940ff984f21838c2b1295eac Mon Sep 17 00:00:00 2001
+From: yzddmr6 <46088090+yzddmr6@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 17:54:42 +0800
+Subject: [PATCH] clk: qcom: gcc-sm8750: honor active PCIe wake paths during
+ sleep
+
+A retained PCIe link skips host reinitialization on resume. Let genpd
+honor the controller and PHY awake-path votes so it does not collapse
+their GDSCs underneath that retained state. Domains remain eligible to
+power off when the link and PHY have been stopped.
+
+Based on commit 31f73d72b1b8 ("clk: qcom: gcc-sm8750: honor active
+PCIe wake paths during sleep").
+
+Assisted-by: LLM
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+
+[opd2413: refreshed context with PWRSTS_OFF_ON already present per f12f2ab7a]
+---
+ drivers/clk/qcom/gcc-sm8750.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/drivers/clk/qcom/gcc-sm8750.c b/drivers/clk/qcom/gcc-sm8750.c
+index 6cfe901..7a52d55 100644
+--- a/drivers/clk/qcom/gcc-sm8750.c
++++ b/drivers/clk/qcom/gcc-sm8750.c
+@@ -2889,6 +2889,7 @@ static struct gdsc gcc_pcie_0_gdsc = {
+ 	.collapse_mask = BIT(0),
+ 	.pd = {
+ 		.name = "gcc_pcie_0_gdsc",
++		.flags = GENPD_FLAG_ACTIVE_WAKEUP,
+ 	},
+ 	.pwrsts = PWRSTS_OFF_ON,
+ 	.flags = POLL_CFG_GDSCR | RETAIN_FF_ENABLE | VOTABLE,
+@@ -2903,6 +2904,7 @@ static struct gdsc gcc_pcie_0_phy_gdsc = {
+ 	.collapse_mask = BIT(2),
+ 	.pd = {
+ 		.name = "gcc_pcie_0_phy_gdsc",
++		.flags = GENPD_FLAG_ACTIVE_WAKEUP,
+ 	},
+ 	.pwrsts = PWRSTS_OFF_ON,
+ 	.flags = POLL_CFG_GDSCR | RETAIN_FF_ENABLE | VOTABLE,
+-- 
+2.56.0

@@ -1,0 +1,70 @@
+From: Kholin <oodzchen@gmail.com>
+Subject: [PATCH] Revert "drm/panel: nt36536: keep the supplies on across unprepare"
+
+Now that DSI 7nm PLL mux programming on every bias enable (5930568b2),
+DSI host clock error propagation and runtime PM balancing (8ebec9278),
+and DPU VBIF AXI halt + phys cleanup sequencing are all in place, revert
+1411 so novatek_nt36536_unprepare() calls novatek_nt36536_power_off() and
+cuts vddio (vreg_l12b_1p8) and the KTZ8868 bias supplies (lcd_vsp,
+lcd_vsn) whenever the screen turns off or the system suspends.
+
+Addresses TECH-DEBT #19.
+---
+ drivers/gpu/drm/panel/panel-novatek-nt36536.c | 24 +++++--------------
+ 1 file changed, 6 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/gpu/drm/panel/panel-novatek-nt36536.c b/drivers/gpu/drm/panel/panel-novatek-nt36536.c
+--- a/drivers/gpu/drm/panel/panel-novatek-nt36536.c
++++ b/drivers/gpu/drm/panel/panel-novatek-nt36536.c
+@@ -24,8 +24,6 @@
+ struct novatek_nt36536 {
+ 	struct drm_panel panel;
+ 	struct mipi_dsi_device *dsi[2];
+-	/* Supplies stay on from the first prepare; see novatek_nt36536_unprepare(). */
+-	bool powered;
+ 	struct drm_dsc_config dsc;
+ 	struct gpio_desc *reset_gpio;
+ 	struct regulator *vddio;
+@@ -254,12 +252,9 @@
+ 	struct mipi_dsi_multi_context dsi_ctx = { .dsi = ctx->dsi[1] };
+ 	int ret;
+ 
+-	if (!ctx->powered) {
+-		ret = novatek_nt36536_power_on(ctx);
+-		if (ret < 0)
+-			return ret;
+-		ctx->powered = true;
+-	}
++	ret = novatek_nt36536_power_on(ctx);
++	if (ret < 0)
++		return ret;
+ 
+ 	novatek_nt36536_reset(ctx);
+ 
+@@ -283,7 +278,6 @@
+ 
+ err:
+ 	novatek_nt36536_power_off(ctx);
+-	ctx->powered = false;
+ 
+ 	return ret;
+ }
+@@ -298,14 +292,8 @@
+ 	if (ret < 0)
+ 		dev_err(dev, "failed to off panel: %d\n", ret);
+ 
+-	/*
+-	 * Keep vddio and the KTZ8868 bias on. After a full power cycle the
+-	 * on-commands are accepted (DCS power mode reads back 0x9e, no DSI
+-	 * errors) yet the panel stays dark: it loses some state that the
+-	 * bootloader set up and a reset alone does not clear. With the
+-	 * supplies kept on, display off/sleep in followed by reset and the
+-	 * on-commands restores the picture every time, as it does at boot.
+-	 */
++	novatek_nt36536_power_off(ctx);
++
+ 	return 0;
+ }
+ 
+-- 
+2.52.0

@@ -1,0 +1,86 @@
+From 81aafa28fe176e1dd569d728ec616e13f076f7d3 Mon Sep 17 00:00:00 2001
+From: GEEKiDoS <geek_ds@foxmail.com>
+Date: Sun, 27 Sep 2026 01:13:19 +0800
+Subject: [PATCH] PCI: qcom: retain active controller and QMP PHY wake paths
+
+Mark the controller as an awake path when its link is retained during
+system suspend. Likewise, keep a powered QMP PHY on the awake path so
+that genpd can honor its power requirement across system sleep.
+
+Signed-off-by: GEEKiDoS <geek_ds@foxmail.com>
+Link: https://github.com/blu-sharky/linux-piano/commit/d2f590d28247dd751bf5c413d94625271ae394a4
+
+Assisted-by: LLM
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+
+[opd2413: refreshed pcie-qcom.c context around qcom_pcie_set_suspend_opp()]
+---
+ drivers/pci/controller/dwc/pcie-qcom.c   |  3 +++
+ drivers/phy/qualcomm/phy-qcom-qmp-pcie.c | 18 ++++++++++++++++++
+ 2 files changed, 21 insertions(+)
+
+diff --git a/drivers/pci/controller/dwc/pcie-qcom.c b/drivers/pci/controller/dwc/pcie-qcom.c
+index c1c0490..be690c1 100644
+--- a/drivers/pci/controller/dwc/pcie-qcom.c
++++ b/drivers/pci/controller/dwc/pcie-qcom.c
+@@ -2292,6 +2292,9 @@ static int qcom_pcie_suspend_noirq(struct device *dev)
+ 				dev_err(dev, "Failed to set suspend OPP: %d\n", ret);
+ 		}
+ 	} else {
++		/* The active controller still needs its power domain. */
++		device_set_awake_path(dev);
++
+ 		/*
+ 		 * Set minimum bandwidth required to keep data path
+ 		 * functional during suspend.
+diff --git a/drivers/phy/qualcomm/phy-qcom-qmp-pcie.c b/drivers/phy/qualcomm/phy-qcom-qmp-pcie.c
+index 3618812e8..db59eed82 100644
+--- a/drivers/phy/qualcomm/phy-qcom-qmp-pcie.c
++++ b/drivers/phy/qualcomm/phy-qcom-qmp-pcie.c
+@@ -17,6 +17,7 @@
+ #include <linux/phy/pcie.h>
+ #include <linux/phy/phy.h>
+ #include <linux/platform_device.h>
++#include <linux/pm_wakeup.h>
+ #include <linux/regmap.h>
+ #include <linux/regulator/consumer.h>
+ #include <linux/reset.h>
+@@ -5474,6 +5475,7 @@ static int qmp_pcie_probe(struct platform_device *pdev)
+ 		return -ENOMEM;
+ 
+ 	qmp->dev = dev;
++	dev_set_drvdata(dev, qmp);
+ 
+ 	qmp->cfg = of_device_get_match_data(dev);
+ 	if (!qmp->cfg)
+@@ -5666,11 +5668,27 @@ static const struct of_device_id qmp_pcie_of_match_table[] = {
+ };
+ MODULE_DEVICE_TABLE(of, qmp_pcie_of_match_table);
+ 
++static int qmp_pcie_suspend_noirq(struct device *dev)
++{
++	struct qmp_pcie *qmp = dev_get_drvdata(dev);
++
++	/* A retained link still needs its PHY power domain. */
++	if (qmp->phy->power_count)
++		device_set_awake_path(dev);
++
++	return 0;
++}
++
++static const struct dev_pm_ops qmp_pcie_pm_ops = {
++	.suspend_noirq = qmp_pcie_suspend_noirq,
++};
++
+ static struct platform_driver qmp_pcie_driver = {
+ 	.probe		= qmp_pcie_probe,
+ 	.driver = {
+ 		.name	= "qcom-qmp-pcie-phy",
+ 		.of_match_table = qmp_pcie_of_match_table,
++		.pm = pm_ptr(&qmp_pcie_pm_ops),
+ 	},
+ };
+ 
+-- 
+2.56.0
+
