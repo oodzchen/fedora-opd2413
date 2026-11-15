@@ -1,0 +1,139 @@
+From c629b285088cec4c0785e420b9eb8e8dc8205b27 Mon Sep 17 00:00:00 2001
+From: opd2413-builder <builder@local>
+Date: Sun, 15 Nov 2026 12:41:53 +0800
+Subject: [PATCH 104/107] ipa: simple: Run swstats every frame and speed up AGC
+ convergence
+
+---
+ .../internal/software_isp/swstats_cpu.h       |  9 ++--
+ src/ipa/simple/algorithms/agc.cpp             | 44 ++++++++++++-------
+ src/ipa/simple/ipa_context.h                  |  2 +
+ 3 files changed, 33 insertions(+), 22 deletions(-)
+
+diff --git a/include/libcamera/internal/software_isp/swstats_cpu.h b/include/libcamera/internal/software_isp/swstats_cpu.h
+index 5518709..2a6a886 100644
+--- a/include/libcamera/internal/software_isp/swstats_cpu.h
++++ b/include/libcamera/internal/software_isp/swstats_cpu.h
+@@ -39,12 +39,11 @@ public:
+ 	~SwStatsCpu() = default;
+ 
+ 	/*
+-	 * The combination of pipeline + sensor delays means that
+-	 * exposure changes can take up to 3 frames to get applied,
+-	 * Run stats once every 4 frames to ensure any previous
+-	 * exposure changes have been applied.
++	 * Compute statistics on every frame so AWB and contrast-detect AF have
++	 * full frame-rate feedback. AGC gates exposure updates internally to
++	 * allow pipeline + sensor delays to settle cleanly.
+ 	 */
+-	static constexpr uint32_t kStatPerNumFrames = 4;
++	static constexpr uint32_t kStatPerNumFrames = 1;
+ 
+ 	bool isValid() const { return sharedStats_.fd().isValid(); }
+ 
+diff --git a/src/ipa/simple/algorithms/agc.cpp b/src/ipa/simple/algorithms/agc.cpp
+index a13a755..db5498c 100644
+--- a/src/ipa/simple/algorithms/agc.cpp
++++ b/src/ipa/simple/algorithms/agc.cpp
+@@ -43,23 +43,25 @@ static constexpr float kExposureSatisfactory = 0.2;
+  * Proportional gain for exposure/gain adjustment. Maps the MSV error to a
+  * multiplicative correction factor:
+  *
+- *   factor = 1.0 + kExpProportionalGain * error
++ *   factor = 1.0 + propGain * error
+  *
+- * With kExpProportionalGain = 0.04:
+- *   - max error ~2.5 -> factor 1.10 (~10% step, same as before)
+- *   - error 1.0      -> factor 1.04 (~4% step)
+- *   - error 0.3      -> factor 1.012 (~1.2% step)
+- *
+- * This replaces the fixed 10% bang-bang step with a proportional correction
+- * that converges smoothly and avoids overshooting near the target.
++ * When |error| is large (initial startup or sudden scene transitions), use a
++ * larger gain and asymmetric log-balanced step bounds so exposure converges
++ * within ~0.5 s instead of ~6 s, while staying gentle near the target.
+  */
+-static constexpr float kExpProportionalGain = 0.04;
++static constexpr float kExpProportionalGain = 0.12;
++static constexpr float kExpFastProportionalGain = 0.25;
++static constexpr float kExpFastErrorThreshold = 0.6;
+ 
+ /*
+- * Maximum multiplicative step per frame, to bound the correction when the
+- * scene changes dramatically.
++ * Maximum multiplicative step per AGC update interval, log-balanced across
++ * underexposure (+72% -> 1.72x) and overexposure (-42% -> 0.58x).
+  */
+-static constexpr float kExpMaxStep = 0.15;
++static constexpr float kExpMaxStepUp = 0.72;
++static constexpr float kExpMaxStepDown = 0.42;
++
++/* Wait at least 4 frames between exposure updates for DelayedControls + sensor latency. */
++static constexpr uint32_t kAgcUpdateIntervalFrames = 4;
+ 
+ Agc::Agc()
+ {
+@@ -80,8 +82,11 @@ void Agc::updateExposure(IPAContext &context, IPAFrameContext &frameContext, dou
+ 	 * determines the direction: positive error means too dark (increase),
+ 	 * negative means too bright (decrease).
+ 	 */
+-	float step = std::clamp(static_cast<float>(error) * kExpProportionalGain,
+-				-kExpMaxStep, kExpMaxStep);
++	const float propGain = std::abs(error) > kExpFastErrorThreshold
++				       ? kExpFastProportionalGain
++				       : kExpProportionalGain;
++	float step = std::clamp(static_cast<float>(error) * propGain,
++				-kExpMaxStepDown, kExpMaxStepUp);
+ 	float factor = 1.0f + step;
+ 
+ 	if (factor > 1.0f) {
+@@ -125,7 +130,7 @@ void Agc::updateExposure(IPAContext &context, IPAFrameContext &frameContext, dou
+ }
+ 
+ void Agc::process(IPAContext &context,
+-		  [[maybe_unused]] const uint32_t frame,
++		  const uint32_t frame,
+ 		  IPAFrameContext &frameContext,
+ 		  const SwIspStats *stats,
+ 		  ControlList &metadata)
+@@ -145,10 +150,13 @@ void Agc::process(IPAContext &context,
+ 		context.activeState.agc.valid = true;
+ 	}
+ 
+-	if (!stats->valid) {
++	if (!stats->valid ||
++	    (context.activeState.agc.updated &&
++	     frame >= context.activeState.agc.lastUpdateFrame &&
++	     (frame - context.activeState.agc.lastUpdateFrame) < kAgcUpdateIntervalFrames)) {
+ 		/*
+ 		 * Use the new exposure and gain values calculated the last time
+-		 * there were valid stats.
++		 * we updated exposure, waiting for sensor latency to settle.
+ 		 */
+ 		frameContext.sensor.exposure = context.activeState.agc.exposure;
+ 		frameContext.sensor.gain = context.activeState.agc.again;
+@@ -189,6 +197,8 @@ void Agc::process(IPAContext &context,
+ 	}
+ 
+ 	float exposureMSV = (denom == 0 ? 0 : static_cast<float>(num) / denom);
++	context.activeState.agc.lastUpdateFrame = frame;
++	context.activeState.agc.updated = true;
+ 	updateExposure(context, frameContext, exposureMSV);
+ }
+ 
+diff --git a/src/ipa/simple/ipa_context.h b/src/ipa/simple/ipa_context.h
+index 8ccfacb..5e9dec4 100644
+--- a/src/ipa/simple/ipa_context.h
++++ b/src/ipa/simple/ipa_context.h
+@@ -39,6 +39,8 @@ struct IPAActiveState {
+ 	struct {
+ 		int32_t exposure;
+ 		double again;
++		uint32_t lastUpdateFrame;
++		bool updated;
+ 		bool valid;
+ 	} agc;
+ 
+-- 
+2.56.0
+

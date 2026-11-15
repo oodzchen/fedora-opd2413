@@ -1,0 +1,28 @@
+From a5df117131399067464964b629867d943b637ede Mon Sep 17 00:00:00 2001
+From: opd2413-builder <builder@local>
+Date: Sun, 15 Nov 2026 12:40:53 +0800
+Subject: [PATCH 103/107] libcamera: dma_buf_allocator: Prefer SystemHeap
+ before CmaHeap
+
+---
+ src/libcamera/dma_buf_allocator.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/libcamera/dma_buf_allocator.cpp b/src/libcamera/dma_buf_allocator.cpp
+index d8c62dd..8d3a731 100644
+--- a/src/libcamera/dma_buf_allocator.cpp
++++ b/src/libcamera/dma_buf_allocator.cpp
+@@ -45,9 +45,9 @@ static constexpr std::array<DmaBufAllocatorInfo, 4> providerInfos = { {
+ 	 * /dev/dma_heap/linux,cma is the CMA dma-heap. When the cma heap size is
+ 	 * specified on the kernel command line, this gets renamed to "reserved".
+ 	 */
++	{ DmaBufAllocator::DmaBufAllocatorFlag::SystemHeap, "/dev/dma_heap/system" },
+ 	{ DmaBufAllocator::DmaBufAllocatorFlag::CmaHeap, "/dev/dma_heap/linux,cma" },
+ 	{ DmaBufAllocator::DmaBufAllocatorFlag::CmaHeap, "/dev/dma_heap/reserved" },
+-	{ DmaBufAllocator::DmaBufAllocatorFlag::SystemHeap, "/dev/dma_heap/system" },
+ 	{ DmaBufAllocator::DmaBufAllocatorFlag::UDmaBuf, "/dev/udmabuf" },
+ } };
+ 
+-- 
+2.56.0
+

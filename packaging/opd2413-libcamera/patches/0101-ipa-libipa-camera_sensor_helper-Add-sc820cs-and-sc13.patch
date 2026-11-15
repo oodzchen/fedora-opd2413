@@ -1,0 +1,50 @@
+From 4755d1cf69e0a4e2a8e10dadace0aaae7f8749f1 Mon Sep 17 00:00:00 2001
+From: opd2413-builder <builder@local>
+Date: Sun, 15 Nov 2026 12:40:53 +0800
+Subject: [PATCH 101/107] ipa: libipa: camera_sensor_helper: Add sc820cs and
+ sc1300cs
+
+---
+ src/ipa/libipa/camera_sensor_helper.cpp | 26 +++++++++++++++++++++++++
+ 1 file changed, 26 insertions(+)
+
+diff --git a/src/ipa/libipa/camera_sensor_helper.cpp b/src/ipa/libipa/camera_sensor_helper.cpp
+index 9457d62..3e56b81 100644
+--- a/src/ipa/libipa/camera_sensor_helper.cpp
++++ b/src/ipa/libipa/camera_sensor_helper.cpp
+@@ -851,6 +851,32 @@ public:
+ };
+ REGISTER_CAMERA_SENSOR_HELPER("vd56g3", CameraSensorHelperVd56g3)
+ 
++class CameraSensorHelperSc820cs : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperSc820cs()
++	{
++		/* 10-bit black level offset 0x40 -> 4096 at 16-bit precision. */
++		blackLevel_ = 4096;
++		/* Driver exposes 1024 = 1x linear analogue gain (1024..16384, step 8). */
++		gain_ = AnalogueGainLinear{ 1, 0, 0, 1024 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("sc820cs", CameraSensorHelperSc820cs)
++
++class CameraSensorHelperSc1300cs : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperSc1300cs()
++	{
++		/* 10-bit black level offset 0x40 -> 4096 at 16-bit precision. */
++		blackLevel_ = 4096;
++		/* Driver exposes 1024 = 1x linear analogue gain (1024..16384, step 8). */
++		gain_ = AnalogueGainLinear{ 1, 0, 0, 1024 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("sc1300cs", CameraSensorHelperSc1300cs)
++
+ #endif /* __DOXYGEN__ */
+ 
+ } /* namespace ipa */
+-- 
+2.56.0
+

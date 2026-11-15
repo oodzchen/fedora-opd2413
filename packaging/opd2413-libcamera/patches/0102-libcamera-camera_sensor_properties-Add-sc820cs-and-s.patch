@@ -1,0 +1,44 @@
+From 4f34658417172a8af0465bc25ebbbcbaf28779fe Mon Sep 17 00:00:00 2001
+From: opd2413-builder <builder@local>
+Date: Sun, 15 Nov 2026 12:40:53 +0800
+Subject: [PATCH 102/107] libcamera: camera_sensor_properties: Add sc820cs and
+ sc1300cs
+
+---
+ .../sensor/camera_sensor_properties.cpp       | 20 +++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/src/libcamera/sensor/camera_sensor_properties.cpp b/src/libcamera/sensor/camera_sensor_properties.cpp
+index 2804315..1e9853d 100644
+--- a/src/libcamera/sensor/camera_sensor_properties.cpp
++++ b/src/libcamera/sensor/camera_sensor_properties.cpp
+@@ -541,6 +541,26 @@ const CameraSensorProperties *CameraSensorProperties::get(const std::string &sen
+ 				.hblankDelay = 2
+ 			},
+ 		} },
++		{ "sc820cs", {
++			.unitCellSize = { 1120, 1120 },
++			.testPatternModes = { },
++			.sensorDelays = {
++				.exposureDelay = 2,
++				.gainDelay = 2,
++				.vblankDelay = 2,
++				.hblankDelay = 2
++			},
++		} },
++		{ "sc1300cs", {
++			.unitCellSize = { 1120, 1120 },
++			.testPatternModes = { },
++			.sensorDelays = {
++				.exposureDelay = 2,
++				.gainDelay = 2,
++				.vblankDelay = 2,
++				.hblankDelay = 2
++			},
++		} },
+ 	};
+ 
+ 	const auto it = sensorProps.find(sensor);
+-- 
+2.56.0
+

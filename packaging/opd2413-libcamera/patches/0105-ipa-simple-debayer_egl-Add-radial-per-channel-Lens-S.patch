@@ -1,0 +1,316 @@
+From b95d60ae5af3e94ff47f358901cb3e8ac769b471 Mon Sep 17 00:00:00 2001
+From: opd2413-builder <builder@local>
+Date: Sun, 15 Nov 2026 12:43:41 +0800
+Subject: [PATCH 105/107] ipa: simple: debayer_egl: Add radial per-channel Lens
+ Shading Correction
+
+---
+ .../internal/software_isp/debayer_params.h    |  4 ++
+ src/ipa/simple/algorithms/lsc.cpp             | 66 +++++++++++++++++++
+ src/ipa/simple/algorithms/lsc.h               | 39 +++++++++++
+ src/ipa/simple/algorithms/meson.build         |  1 +
+ src/ipa/simple/soft_simple.cpp                |  4 ++
+ src/libcamera/shaders/bayer_1x_packed.frag    | 24 ++++++-
+ src/libcamera/shaders/bayer_unpacked.frag     | 27 +++++++-
+ src/libcamera/software_isp/debayer_egl.cpp    | 13 ++++
+ src/libcamera/software_isp/debayer_egl.h      |  5 ++
+ 9 files changed, 177 insertions(+), 6 deletions(-)
+ create mode 100644 src/ipa/simple/algorithms/lsc.cpp
+ create mode 100644 src/ipa/simple/algorithms/lsc.h
+
+diff --git a/include/libcamera/internal/software_isp/debayer_params.h b/include/libcamera/internal/software_isp/debayer_params.h
+index 6772b43..707e376 100644
+--- a/include/libcamera/internal/software_isp/debayer_params.h
++++ b/include/libcamera/internal/software_isp/debayer_params.h
+@@ -25,6 +25,10 @@ struct DebayerParams {
+ 	float gamma = 1.0;
+ 	float contrastExp = 1.0;
+ 	RGB<float> gains = RGB<float>({ 1.0, 1.0, 1.0 });
++	RGB<float> lscCx = RGB<float>({ 0.5, 0.5, 0.5 });
++	RGB<float> lscCy = RGB<float>({ 0.5, 0.5, 0.5 });
++	RGB<float> lscK1 = RGB<float>({ 0.0, 0.0, 0.0 });
++	RGB<float> lscK2 = RGB<float>({ 0.0, 0.0, 0.0 });
+ };
+ 
+ } /* namespace libcamera */
+diff --git a/src/ipa/simple/algorithms/lsc.cpp b/src/ipa/simple/algorithms/lsc.cpp
+new file mode 100644
+index 0000000..9dbf365
+--- /dev/null
++++ b/src/ipa/simple/algorithms/lsc.cpp
+@@ -0,0 +1,66 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Copyright (C) 2026, Fedora OPD2413 contributors
++ *
++ * Radial Lens Shading Correction for Simple Software ISP
++ */
++
++#include "lsc.h"
++
++#include <libcamera/base/log.h>
++
++#include "libcamera/internal/value_node.h"
++
++namespace libcamera {
++
++namespace ipa::soft::algorithms {
++
++LOG_DEFINE_CATEGORY(IPASoftLsc)
++
++namespace {
++
++void parseChannel(const ValueNode &node, float &cx, float &cy, float &k1, float &k2)
++{
++	if (!node)
++		return;
++
++	cx = static_cast<float>(node["cx"].get<double>().value_or(cx));
++	cy = static_cast<float>(node["cy"].get<double>().value_or(cy));
++	/* Support DNG k0/k1 naming (k0 -> r^2 term, k1 -> r^4 term). */
++	k1 = static_cast<float>(node["k0"].get<double>().value_or(k1));
++	k2 = static_cast<float>(node["k1"].get<double>().value_or(k2));
++}
++
++} /* namespace */
++
++int Lsc::init([[maybe_unused]] IPAContext &context, const ValueNode &tuningData)
++{
++	parseChannel(tuningData["r"], cx_.r(), cy_.r(), k1_.r(), k2_.r());
++	parseChannel(tuningData["g"], cx_.g(), cy_.g(), k1_.g(), k2_.g());
++	parseChannel(tuningData["b"], cx_.b(), cy_.b(), k1_.b(), k2_.b());
++
++	LOG(IPASoftLsc, Info)
++		<< "Configured radial LSC: cx=" << cx_
++		<< " cy=" << cy_
++		<< " k0=" << k1_
++		<< " k1=" << k2_;
++
++	return 0;
++}
++
++void Lsc::prepare([[maybe_unused]] IPAContext &context,
++		  [[maybe_unused]] const uint32_t frame,
++		  [[maybe_unused]] IPAFrameContext &frameContext,
++		  DebayerParams *params)
++{
++	params->lscCx = cx_;
++	params->lscCy = cy_;
++	params->lscK1 = k1_;
++	params->lscK2 = k2_;
++}
++
++REGISTER_IPA_ALGORITHM(Lsc, "Lsc")
++
++} /* namespace ipa::soft::algorithms */
++
++} /* namespace libcamera */
+diff --git a/src/ipa/simple/algorithms/lsc.h b/src/ipa/simple/algorithms/lsc.h
+new file mode 100644
+index 0000000..f21513b
+--- /dev/null
++++ b/src/ipa/simple/algorithms/lsc.h
+@@ -0,0 +1,39 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Copyright (C) 2026, Fedora OPD2413 contributors
++ *
++ * Radial Lens Shading Correction for Simple Software ISP
++ */
++
++#pragma once
++
++#include "libcamera/internal/vector.h"
++
++#include "algorithm.h"
++
++namespace libcamera {
++
++namespace ipa::soft::algorithms {
++
++class Lsc : public Algorithm
++{
++public:
++	Lsc() = default;
++	~Lsc() = default;
++
++	int init(IPAContext &context, const ValueNode &tuningData) override;
++	void prepare(IPAContext &context,
++		     const uint32_t frame,
++		     IPAFrameContext &frameContext,
++		     DebayerParams *params) override;
++
++private:
++	RGB<float> cx_{ { 0.5f, 0.5f, 0.5f } };
++	RGB<float> cy_{ { 0.5f, 0.5f, 0.5f } };
++	RGB<float> k1_{ { 0.0f, 0.0f, 0.0f } };
++	RGB<float> k2_{ { 0.0f, 0.0f, 0.0f } };
++};
++
++} /* namespace ipa::soft::algorithms */
++
++} /* namespace libcamera */
+diff --git a/src/ipa/simple/algorithms/meson.build b/src/ipa/simple/algorithms/meson.build
+index 73c6372..c9f6e55 100644
+--- a/src/ipa/simple/algorithms/meson.build
++++ b/src/ipa/simple/algorithms/meson.build
+@@ -6,4 +6,5 @@ soft_simple_ipa_algorithms = files([
+     'agc.cpp',
+     'blc.cpp',
+     'ccm.cpp',
++    'lsc.cpp',
+ ])
+diff --git a/src/ipa/simple/soft_simple.cpp b/src/ipa/simple/soft_simple.cpp
+index 95cc63a..d6a718d 100644
+--- a/src/ipa/simple/soft_simple.cpp
++++ b/src/ipa/simple/soft_simple.cpp
+@@ -163,6 +163,10 @@ int IPASoftSimple::init(const IPASettings &settings,
+ 		params_->gamma = 1.0 / algorithms::kDefaultGamma;
+ 		params_->contrastExp = 1.0;
+ 		params_->gains = { { 1.0, 1.0, 1.0 } };
++		params_->lscCx = { { 0.5, 0.5, 0.5 } };
++		params_->lscCy = { { 0.5, 0.5, 0.5 } };
++		params_->lscK1 = { { 0.0, 0.0, 0.0 } };
++		params_->lscK2 = { { 0.0, 0.0, 0.0 } };
+ 		/* combinedMatrix is reset for each frame. */
+ 	}
+ 
+diff --git a/src/libcamera/shaders/bayer_1x_packed.frag b/src/libcamera/shaders/bayer_1x_packed.frag
+index 0b641a5..5fe68ef 100644
+--- a/src/libcamera/shaders/bayer_1x_packed.frag
++++ b/src/libcamera/shaders/bayer_1x_packed.frag
+@@ -70,6 +70,19 @@ uniform mat3 ccm;
+ uniform vec3 blacklevel;
+ uniform float gamma;
+ uniform float contrastExp;
++uniform vec4 lscR;
++uniform vec4 lscG;
++uniform vec4 lscB;
++
++float lsc_eval(vec2 uv, vec2 imgSize, vec4 p)
++{
++	vec2 centerPx = p.xy * imgSize;
++	vec2 maxDist = max(centerPx, imgSize - centerPx);
++	float m2 = max(dot(maxDist, maxDist), 1.0);
++	vec2 dPx = (uv - p.xy) * imgSize;
++	float r2 = dot(dPx, dPx) / m2;
++	return max(1.0, 1.0 + p.z * r2 + p.w * r2 * r2);
++}
+ 
+ float apply_contrast(float value)
+ {
+@@ -230,10 +243,15 @@ void main(void)
+ 	 * \todo: Black level normalising, AWB and digital gain could be
+ 	 * reworked into a single multiplication.
+ 	 */
+-	rgb = (rgb - blacklevel) / (1.0 - blacklevel);
++	rgb = max((rgb - blacklevel) / (1.0 - blacklevel), vec3(0.0));
++
++	/* Lens Shading Correction (radial DNG polynomial) */
++	vec3 lscGain = vec3(lsc_eval(textureOut, tex_size, lscR),
++			    lsc_eval(textureOut, tex_size, lscG),
++			    lsc_eval(textureOut, tex_size, lscB));
+ 
+-	/* Apply AWB gains, and saturate each channel at sensor range */
+-	rgb = clamp(rgb * awb, vec3(0.0), vec3(1.0));
++	/* Apply LSC and AWB gains, and saturate each channel at sensor range */
++	rgb = clamp(rgb * lscGain * awb, vec3(0.0), vec3(1.0));
+ 
+ 	/* Colour Correction Matrix */
+ 	rgb = ccm * rgb;
+diff --git a/src/libcamera/shaders/bayer_unpacked.frag b/src/libcamera/shaders/bayer_unpacked.frag
+index 10c5e94..f7ccbb6 100644
+--- a/src/libcamera/shaders/bayer_unpacked.frag
++++ b/src/libcamera/shaders/bayer_unpacked.frag
+@@ -29,6 +29,21 @@ uniform mat3            ccm;
+ uniform vec3            blacklevel;
+ uniform float           gamma;
+ uniform float           contrastExp;
++uniform vec2            tex_size;
++uniform float           stride_factor;
++uniform vec4            lscR;
++uniform vec4            lscG;
++uniform vec4            lscB;
++
++float lsc_eval(vec2 uv, vec2 imgSize, vec4 p)
++{
++    vec2 centerPx = p.xy * imgSize;
++    vec2 maxDist = max(centerPx, imgSize - centerPx);
++    float m2 = max(dot(maxDist, maxDist), 1.0);
++    vec2 dPx = (uv - p.xy) * imgSize;
++    float r2 = dot(dPx, dPx) / m2;
++    return max(1.0, 1.0 + p.z * r2 + p.w * r2 * r2);
++}
+ 
+ float apply_contrast(float value)
+ {
+@@ -133,10 +148,16 @@ void main(void) {
+      * \todo: Black level normalising, AWB and digital gain could be
+      * reworked into a single multiplication.
+      */
+-    rgb = (rgb - blacklevel) / (1.0 - blacklevel);
++    rgb = max((rgb - blacklevel) / (1.0 - blacklevel), vec3(0.0));
++
++    /* Lens Shading Correction (radial DNG polynomial) */
++    vec2 lscUv = vec2(center.x / max(stride_factor, 0.0001), center.y);
++    vec3 lscGain = vec3(lsc_eval(lscUv, tex_size, lscR),
++                        lsc_eval(lscUv, tex_size, lscG),
++                        lsc_eval(lscUv, tex_size, lscB));
+ 
+-    /* Apply AWB gains, and saturate each channel at sensor range */
+-    rgb = clamp(rgb * awb, vec3(0.0), vec3(1.0));
++    /* Apply LSC and AWB gains, and saturate each channel at sensor range */
++    rgb = clamp(rgb * lscGain * awb, vec3(0.0), vec3(1.0));
+ 
+     /* Colour Correction Matrix */
+     rgb = ccm * rgb;
+diff --git a/src/libcamera/software_isp/debayer_egl.cpp b/src/libcamera/software_isp/debayer_egl.cpp
+index 02651fe..20a2a60 100644
+--- a/src/libcamera/software_isp/debayer_egl.cpp
++++ b/src/libcamera/software_isp/debayer_egl.cpp
+@@ -121,6 +121,9 @@ int DebayerEGL::getShaderVariableLocations(void)
+ 	blackLevelUniformDataIn_ = glGetUniformLocation(programId_, "blacklevel");
+ 	gammaUniformDataIn_ = glGetUniformLocation(programId_, "gamma");
+ 	contrastExpUniformDataIn_ = glGetUniformLocation(programId_, "contrastExp");
++	lscRUniformDataIn_ = glGetUniformLocation(programId_, "lscR");
++	lscGUniformDataIn_ = glGetUniformLocation(programId_, "lscG");
++	lscBUniformDataIn_ = glGetUniformLocation(programId_, "lscB");
+ 
+ 	textureUniformStep_ = glGetUniformLocation(programId_, "tex_step");
+ 	textureUniformSize_ = glGetUniformLocation(programId_, "tex_size");
+@@ -504,6 +507,16 @@ void DebayerEGL::setShaderVariableValues(eGLImage &eglImageIn, const DebayerPara
+ 	glUniform1f(contrastExpUniformDataIn_, params.contrastExp);
+ 	LOG(Debayer, Debug) << " contrastExpUniformDataIn_ " << contrastExpUniformDataIn_ << " data " << params.contrastExp;
+ 
++	/*
++	 * Lens Shading Correction
++	 */
++	glUniform4f(lscRUniformDataIn_, params.lscCx.r(), params.lscCy.r(),
++		    params.lscK1.r(), params.lscK2.r());
++	glUniform4f(lscGUniformDataIn_, params.lscCx.g(), params.lscCy.g(),
++		    params.lscK1.g(), params.lscK2.g());
++	glUniform4f(lscBUniformDataIn_, params.lscCx.b(), params.lscCy.b(),
++		    params.lscK1.b(), params.lscK2.b());
++
+ 	return;
+ }
+ 
+diff --git a/src/libcamera/software_isp/debayer_egl.h b/src/libcamera/software_isp/debayer_egl.h
+index d6223f3..9a86a0a 100644
+--- a/src/libcamera/software_isp/debayer_egl.h
++++ b/src/libcamera/software_isp/debayer_egl.h
+@@ -111,6 +111,11 @@ private:
+ 	/* Contrast */
+ 	GLint contrastExpUniformDataIn_;
+ 
++	/* Lens Shading Correction */
++	GLint lscRUniformDataIn_;
++	GLint lscGUniformDataIn_;
++	GLint lscBUniformDataIn_;
++
+ 	Size nativeOutputSize_;
+ 	Rectangle window_;
+ 	std::unique_ptr<SwStatsCpu> stats_;
+-- 
+2.56.0
+
