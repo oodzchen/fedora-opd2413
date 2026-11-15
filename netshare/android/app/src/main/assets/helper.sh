@@ -103,6 +103,25 @@ find_p2p_ip() {
     done
 }
 
+get_sta_freq() {
+    f=""
+    if command -v iw >/dev/null 2>&1; then
+        f="$(iw dev wlan0 link 2>/dev/null | sed -n 's/.*freq:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)"
+    fi
+    if [ -z "$f" ] && command -v wpa_cli >/dev/null 2>&1; then
+        f="$(wpa_cli -i wlan0 status 2>/dev/null | sed -n 's/^freq=\([0-9][0-9]*\).*/\1/p' | head -n1)"
+    fi
+    if [ -n "$f" ] && [ "$f" -ge 2400 ] 2>/dev/null; then
+        echo "$f"
+        return 0
+    fi
+    return 1
+}
+
+get_p2p_cur_state() {
+    dumpsys wifip2p 2>/dev/null | sed -n 's/.*curState=\([A-Za-z0-9_]*\).*/\1/p' | head -n1
+}
+
 clear_rules_and_chains() {
     while ip rule del pref 9996 >/dev/null 2>&1; do :; done
     while ip rule del pref 9997 >/dev/null 2>&1; do :; done
@@ -180,30 +199,53 @@ cmd_up() {
         exit 2
     fi
 
+    sta_freq="$(get_sta_freq || true)"
+
     clear_rules_and_chains
     cmd wifip2p remove-group >/dev/null 2>&1 || true
     cmd wifip2p init >/dev/null 2>&1 || true
     sleep 0.25
 
     if ! conn_out="$(cmd wifip2p connect-with-config "$ssid" "$psk" "$freq" false 2>&1)"; then
-        log_err "wifip2p connect-with-config failed: ${conn_out}"
+        log_err "wifip2p connect-with-config failed (sta_freq=${sta_freq:-0}): ${conn_out}"
         cmd_down >/dev/null 2>&1 || true
         exit 1
     fi
 
     p2p_info=""
+    seen_negotiating=0
+    early_fail=""
     i=0
     while [ "$i" -lt 90 ]; do
         p2p_info="$(find_p2p_ip || true)"
         if [ -n "$p2p_info" ]; then
             break
         fi
+        if [ "$i" -ge 2 ] && [ $((i % 4)) -eq 2 ]; then
+            cur_state="$(get_p2p_cur_state || true)"
+            case "$cur_state" in
+                GroupNegotiationState|ProvisionDiscoveryState|OngoingGroupRemovalState|FrequencyConflictState)
+                    seen_negotiating=1
+                    ;;
+                InactiveState|P2pDisabledState)
+                    if [ "$seen_negotiating" -eq 1 ] || [ "$i" -ge 22 ]; then
+                        early_fail="$cur_state"
+                        break
+                    fi
+                    ;;
+            esac
+        fi
         i=$((i + 1))
         sleep 0.2
     done
 
     if [ -z "$p2p_info" ]; then
-        log_err "timed out waiting for 192.168.49.x on p2p"
+        sta_freq="$(get_sta_freq || echo "${sta_freq:-0}")"
+        if [ -n "$early_fail" ]; then
+            log_err "p2p group formation failed (state=${early_fail}, freq=${freq}, sta_freq=${sta_freq:-0})"
+        else
+            log_err "timed out waiting for 192.168.49.x on p2p (freq=${freq}, sta_freq=${sta_freq:-0})"
+        fi
         cmd_down >/dev/null 2>&1 || true
         exit 1
     fi

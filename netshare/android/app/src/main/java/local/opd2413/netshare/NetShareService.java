@@ -34,6 +34,7 @@ import android.os.ParcelUuid;
 import android.os.PowerManager;
 import android.os.SystemClock;
 import android.service.quicksettings.TileService;
+import android.util.Log;
 import android.content.ComponentName;
 
 import org.json.JSONObject;
@@ -54,15 +55,18 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 public class NetShareService extends Service {
+    private static final String TAG = "OPDNetShare";
     private static final String CHANNEL_ID = "opd_netshare";
     private static final int NOTIF_ID = 2413;
     private static final int BLE_SCAN_REQ_CODE = 2414;
 
     private static final Pattern SAFE_TOKEN = Pattern.compile("^[A-Za-z0-9._-]{1,64}$");
     private static final Pattern SAFE_PSK = Pattern.compile("^[A-Za-z0-9._-]{8,63}$");
+    private static final Pattern STA_FREQ_PAT = Pattern.compile("sta_freq=(\\d+)");
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final ExecutorService helperExecutor = Executors.newSingleThreadExecutor();
@@ -107,20 +111,48 @@ public class NetShareService extends Service {
     }
 
     private final BroadcastReceiver btStateReceiver = new BroadcastReceiver() {
+        @SuppressLint("MissingPermission")
         @Override
         public void onReceive(Context context, Intent intent) {
-            if (!BluetoothAdapter.ACTION_STATE_CHANGED.equals(intent.getAction())) {
-                return;
-            }
-            int st = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR);
-            if (st == BluetoothAdapter.STATE_OFF || st == BluetoothAdapter.STATE_TURNING_OFF) {
-                log("蓝牙已关闭，停止 BLE 扫描");
-                stopBleScan();
-                closeActiveSocket();
-            } else if (st == BluetoothAdapter.STATE_ON) {
-                log("蓝牙已开启，恢复检查监听");
-                if (NetSharePrefs.isEnabled(NetShareService.this) && !isSessionBusy()) {
-                    startBleScan();
+            String action = intent.getAction();
+            if (BluetoothAdapter.ACTION_STATE_CHANGED.equals(action)) {
+                int st = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR);
+                if (st == BluetoothAdapter.STATE_OFF || st == BluetoothAdapter.STATE_TURNING_OFF) {
+                    log("蓝牙已关闭，停止 BLE 扫描");
+                    stopBleScan();
+                    closeActiveSocket();
+                } else if (st == BluetoothAdapter.STATE_ON) {
+                    log("蓝牙已开启，恢复检查监听");
+                    lastAttemptMs = 0L;
+                    if (NetSharePrefs.isEnabled(NetShareService.this) && !isSessionBusy()) {
+                        startBleScan();
+                    }
+                }
+            } else if (BluetoothDevice.ACTION_BOND_STATE_CHANGED.equals(action)) {
+                BluetoothDevice dev = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice.class);
+                int bond = intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, BluetoothDevice.ERROR);
+                String mac = (dev != null && dev.getAddress() != null)
+                        ? dev.getAddress().trim().toUpperCase(Locale.ROOT)
+                        : "";
+                String targetMac = NetSharePrefs.getTargetMac(NetShareService.this);
+                if (!mac.isEmpty() && mac.equals(targetMac)) {
+                    if (bond == BluetoothDevice.BOND_BONDED) {
+                        lastAttemptMs = 0L;
+                        log("目标蓝牙已重新配对 (" + mac + ")，刷新 BLE 扫描");
+                        if (NetSharePrefs.isEnabled(NetShareService.this) && !isSessionBusy()) {
+                            stopBleScan();
+                            startBleScan();
+                        }
+                    } else if (bond == BluetoothDevice.BOND_NONE) {
+                        lastAttemptMs = 0L;
+                        log("目标蓝牙配对已解除 (" + mac + ")");
+                        closeActiveSocket();
+                        if (NetSharePrefs.isEnabled(NetShareService.this) && !isSessionBusy()) {
+                            updateStatus(NetSharePrefs.STATE_SCANNING, "目标蓝牙已取消配对，等待重新配对...", "", currentUpstreamLabel());
+                        }
+                    }
+                } else if (bond == BluetoothDevice.BOND_BONDED) {
+                    lastAttemptMs = 0L;
                 }
             }
         }
@@ -222,9 +254,11 @@ public class NetShareService extends Service {
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
         );
 
+        IntentFilter btFilter = new IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED);
+        btFilter.addAction(BluetoothDevice.ACTION_BOND_STATE_CHANGED);
         registerReceiver(
                 btStateReceiver,
-                new IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED),
+                btFilter,
                 Context.RECEIVER_EXPORTED
         );
 
@@ -382,6 +416,7 @@ public class NetShareService extends Service {
     }
 
     private void log(String msg) {
+        Log.i(TAG, msg);
         NetSharePrefs.appendLog(msg);
         Intent b = new Intent(NetSharePrefs.ACTION_STATE_CHANGED);
         b.setPackage(getPackageName());
@@ -666,13 +701,30 @@ public class NetShareService extends Service {
         }
     }
 
+    private static int parseStaFreq(String output) {
+        if (output == null || output.isEmpty()) {
+            return 0;
+        }
+        Matcher m = STA_FREQ_PAT.matcher(output);
+        if (m.find()) {
+            try {
+                return Integer.parseInt(m.group(1));
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        return 0;
+    }
+
     @SuppressLint("MissingPermission")
     private void runRfcommSession(BluetoothDevice dev) {
         BluetoothSocket sock = null;
         PowerManager.WakeLock wl = null;
+        boolean everConnected = false;
+        Runnable waitFallbackTimeout = null;
         try {
             if (powerManager != null) {
                 wl = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "opd:netshare");
+                wl.setReferenceCounted(false);
                 wl.acquire(35_000L);
             }
             if (btAdapter != null && hasBtPermissions() && btAdapter.isDiscovering()) {
@@ -685,12 +737,25 @@ public class NetShareService extends Service {
             stopBleScan();
             log("RFCOMM 控制通道已连接");
 
+            final BluetoothSocket activeSockRef = sock;
+            waitFallbackTimeout = () -> {
+                if (activeSocket == activeSockRef && !p2pActive) {
+                    log("等待平板切换备用信道超时，关闭当前会话");
+                    try {
+                        activeSockRef.close();
+                    } catch (IOException ignored) {
+                    }
+                }
+            };
+
             BufferedReader br = new BufferedReader(
                     new InputStreamReader(sock.getInputStream(), StandardCharsets.UTF_8));
             OutputStreamWriter writer = new OutputStreamWriter(sock.getOutputStream(), StandardCharsets.UTF_8);
 
+            int failCount = 0;
             String line;
             while ((line = br.readLine()) != null) {
+                mainHandler.removeCallbacks(waitFallbackTimeout);
                 String trimmed = line.trim();
                 if (trimmed.isEmpty()) {
                     continue;
@@ -712,6 +777,9 @@ public class NetShareService extends Service {
                         log("收到非法 AP 凭据，拒绝拉起");
                         break;
                     }
+                    if (wl != null) {
+                        wl.acquire(35_000L);
+                    }
                     refreshAllPhysicalNets();
                     String upstream = currentUpstreamLabel();
                     log("正在拉起 P2P 连接 (" + ssid + ", freq=" + freq + ", upstream=" + upstream + ")");
@@ -725,7 +793,25 @@ public class NetShareService extends Service {
                     }
 
                     if (res.code != 0 || !res.output.startsWith("OK ")) {
-                        log("P2P 拉起失败: " + res.output);
+                        failCount++;
+                        int staFreq = parseStaFreq(res.output);
+                        log("P2P 拉起失败 (#" + failCount + ", freq=" + freq + ", staFreq=" + staFreq + "): " + res.output);
+                        if (failCount < 5) {
+                            updateStatus(
+                                    NetSharePrefs.STATE_CONNECTING,
+                                    "信道 " + freq + " MHz 组网失败，请求平板切换备用信道...",
+                                    "",
+                                    ""
+                            );
+                            JSONObject failEvt = new JSONObject();
+                            failEvt.put("event", "p2p_failed");
+                            failEvt.put("freq", freq);
+                            failEvt.put("sta_freq", staFreq);
+                            writer.write(failEvt.toString() + "\n");
+                            writer.flush();
+                            mainHandler.postDelayed(waitFallbackTimeout, 14_000L);
+                            continue;
+                        }
                         updateStatus(NetSharePrefs.STATE_ERROR, "P2P 拉起失败: " + res.output, "", "");
                         try {
                             writer.write("{\"event\":\"stop_request\"}\n");
@@ -741,6 +827,7 @@ public class NetShareService extends Service {
                     activeP2pIp = ip;
                     activeOutIf = outIf;
                     p2pActive = true;
+                    everConnected = true;
 
                     updateStatus(
                             NetSharePrefs.STATE_CONNECTED,
@@ -765,11 +852,18 @@ public class NetShareService extends Service {
         } catch (Exception e) {
             log("RFCOMM 会话结束: " + (e.getMessage() == null ? "已断开" : e.getMessage()));
         } finally {
+            if (waitFallbackTimeout != null) {
+                mainHandler.removeCallbacks(waitFallbackTimeout);
+            }
             if (wl != null && wl.isHeld()) {
                 try {
                     wl.release();
                 } catch (Exception ignored) {
                 }
+            }
+            if (!everConnected) {
+                // Allow prompt retry on handshake failure without 10s lockout (2s anti-spin floor)
+                lastAttemptMs = SystemClock.elapsedRealtime() - 8_000L;
             }
             connecting = false;
             p2pActive = false;

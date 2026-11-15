@@ -154,15 +154,148 @@ def probe_wlp1s0_internet() -> tuple[bool, bool]:
     return True, False
 
 
-def pick_ap_frequency() -> int:
-    """Stay on wlp1s0's 2.4 GHz frequency if associated there (#channels <= 1); else Ch11."""
+# Non-DFS CN 80 MHz 5 GHz AP channels: freq -> (ht40_dir, vht_center_freq1).
+# Ch 165 (5825 MHz) is 20 MHz only in CN (5735-5835 @ 80) and has no HT40/VHT80 peer.
+FREQ_80_MAP: dict[int, tuple[int, int]] = {
+    5180: (1, 5210),
+    5200: (-1, 5210),
+    5220: (1, 5210),
+    5240: (-1, 5210),
+    5745: (1, 5775),
+    5765: (-1, 5775),
+    5785: (1, 5775),
+    5805: (-1, 5775),
+}
+
+
+def get_wlp1s0_freq() -> int | None:
+    """Return wlp1s0's associated center frequency in MHz, or None if unassociated."""
     res = run_cmd(["iw", "dev", "wlp1s0", "info"])
     m = re.search(r"channel\s+\d+\s+\((\d+)\s+MHz\)", res.stdout)
-    if m:
-        freq = int(m.group(1))
-        if 2412 <= freq <= 2462:
-            return freq
-    return 2462
+    return int(m.group(1)) if m else None
+
+
+def get_phy_country() -> str:
+    """Return phy#0's active ISO regulatory alpha2 (e.g. 'CN', '00', 'US'), or ''."""
+    res = run_cmd(["iw", "reg", "get"])
+    in_phy0 = False
+    for line in res.stdout.splitlines():
+        s = line.strip()
+        if line.startswith("phy#0"):
+            in_phy0 = True
+            continue
+        if in_phy0:
+            if line.startswith("phy#") or line.startswith("global"):
+                break
+            m = re.match(r"country\s+([A-Z0-9]{2}):", s)
+            if m:
+                return m.group(1)
+    return ""
+
+
+def get_ap_allowed_5g_freqs() -> set[int]:
+    """Return non-DFS, non-NO-IR enabled 5 GHz frequencies on phy0."""
+    res = run_cmd(["iw", "phy", "phy0", "channels"])
+    allowed: set[int] = set()
+    cur_freq: int | None = None
+    cur_ok = False
+
+    def flush() -> None:
+        if cur_freq is not None and cur_ok and 5180 <= cur_freq <= 5825:
+            allowed.add(cur_freq)
+
+    for line in res.stdout.splitlines():
+        m = re.match(r"^\s*\*\s+(\d+)\s+MHz\s+\[\d+\](.*)$", line)
+        if m:
+            flush()
+            cur_freq = int(m.group(1))
+            tail = m.group(2).lower()
+            cur_ok = "disabled" not in tail and "no ir" not in tail
+            continue
+        if cur_freq is not None:
+            if not line.startswith((" ", "\t")):
+                flush()
+                cur_freq = None
+                cur_ok = False
+                continue
+            low = line.lower()
+            if "radar detection" in low or "no ir" in low or "disabled" in low:
+                cur_ok = False
+    flush()
+    return allowed
+
+
+def ensure_regdomain_cn_unassociated() -> bool:
+    """Ensure phy#0 is in CN when wlp1s0 is unassociated; never change while associated."""
+    if get_phy_country() == "CN":
+        return True
+    if get_wlp1s0_freq() is not None:
+        return False
+    run_cmd(["iw", "reg", "set", "CN"])
+    for _ in range(6):
+        if get_phy_country() == "CN":
+            return True
+        if get_wlp1s0_freq() is not None:
+            return False
+        time.sleep(0.1)
+    return get_phy_country() == "CN"
+
+
+def pick_ap_candidates(
+    wlp_freq: int | None,
+    allowed_5g: set[int],
+    preferred_5g: int | None = None,
+    failed_freqs: dict[int, float] | None = None,
+    now: float | None = None,
+    peer_sta_freq: int | None = None,
+) -> list[int]:
+    """Choose ordered AP frequencies avoiding 5G+5G MCC and failed-channel loops."""
+    candidates: list[int] = []
+
+    def add(freq: int) -> None:
+        if freq not in candidates:
+            candidates.append(freq)
+
+    def add_pref_and_defaults() -> None:
+        if preferred_5g is not None and preferred_5g >= 5000 and preferred_5g in allowed_5g:
+            add(preferred_5g)
+        for f in (5745, 5180):
+            if f in allowed_5g:
+                add(f)
+
+    peer_5g = peer_sta_freq if (peer_sta_freq is not None and peer_sta_freq >= 5000) else None
+    if peer_5g is not None:
+        # Single-radio DBS peers fail 5 GHz P2P on any channel other than their STA 5 GHz channel.
+        if (wlp_freq is None or wlp_freq < 5000 or wlp_freq == peer_5g) and peer_5g in allowed_5g:
+            add(peer_5g)
+        if wlp_freq is not None and 2412 <= wlp_freq <= 2462:
+            add(wlp_freq)
+    elif wlp_freq is None:
+        add_pref_and_defaults()
+    elif 2412 <= wlp_freq <= 2462:
+        # WCN7860 supports 2.4 GHz STA + 5 GHz AP DBS; keep same 2.4 GHz channel as fallback.
+        add_pref_and_defaults()
+        add(wlp_freq)
+    elif wlp_freq >= 5000:
+        # 5G+5G MCC starves wlp1s0; only use 5 GHz SCC matching wlp_freq, else 2.4 GHz DBS.
+        if wlp_freq in allowed_5g:
+            add(wlp_freq)
+    else:
+        add_pref_and_defaults()
+
+    add(2462)
+    if not failed_freqs:
+        return candidates
+
+    cur = time.monotonic() if now is None else now
+    fresh = [f for f in candidates if failed_freqs.get(f, 0.0) <= cur]
+    cooled = [f for f in candidates if f not in fresh]
+    return fresh + cooled
+
+
+def pick_ap_frequency() -> int:
+    """Return the primary candidate AP frequency for current wireless state."""
+    return pick_ap_candidates(get_wlp1s0_freq(), get_ap_allowed_5g_freqs())[0]
 
 
 def query_station_stats() -> tuple[str, int, int]:
@@ -214,6 +347,9 @@ class NetShareDaemon:
         self.wlp_down_streak = 0
         self.wlp_has_def = False
         self.wlp_net_ok = True
+        self.last_wlp_5g_freq: int | None = None
+        self.failed_freqs: dict[int, float] = {}
+        self.rfcomm_had_lease = False
         self.station_missing_ticks = 0
         self.last_keepalive = 0.0
         self.suspended = False
@@ -226,6 +362,7 @@ class NetShareDaemon:
         self.cleanup_stale_system_state()
         self._register_dbus_objects()
         self._subscribe_logind_sleep()
+        self._subscribe_bluez_signals()
 
         threading.Thread(target=self._wlp_probe_loop, daemon=True).start()
         GLib.timeout_add_seconds(3, self._tick)
@@ -338,9 +475,28 @@ class NetShareDaemon:
         except Exception:
             return False, ""
 
-    def _register_profile(self) -> None:
-        if self.profile_registered:
+    def _has_active_adv(self) -> bool:
+        try:
+            cnt = int(self._bluez_prop_get(ADAPTER_PATH, "org.bluez.LEAdvertisingManager1", "ActiveInstances"))
+            return cnt > 0
+        except Exception:
+            return False
+
+    def _set_device_trusted(self, mac: str) -> None:
+        dev_path = f"{ADAPTER_PATH}/dev_{mac.replace(':', '_')}"
+        try:
+            trusted = bool(self._bluez_prop_get(dev_path, "org.bluez.Device1", "Trusted"))
+            if not trusted:
+                self._bluez_prop_set(dev_path, "org.bluez.Device1", "Trusted", GLib.Variant("b", True))
+                log(f"Marked {mac} Trusted=True")
+        except Exception:
+            pass
+
+    def _register_profile(self, force: bool = False) -> None:
+        if self.profile_registered and not force:
             return
+        if force:
+            self._unregister_profile(force=True)
         opts = {
             "Name": GLib.Variant("s", "OPD NetShare"),
             "Role": GLib.Variant("s", "server"),
@@ -348,22 +504,43 @@ class NetShareDaemon:
             "RequireAuthentication": GLib.Variant("b", True),
             "RequireAuthorization": GLib.Variant("b", False),
         }
-        self.bus.call_sync(
-            BLUEZ_SERVICE,
-            "/org/bluez",
-            "org.bluez.ProfileManager1",
-            "RegisterProfile",
-            GLib.Variant("(osa{sv})", (PROFILE_PATH, RFCOMM_UUID, opts)),
-            None,
-            Gio.DBusCallFlags.NONE,
-            5000,
-            None,
-        )
+        try:
+            self.bus.call_sync(
+                BLUEZ_SERVICE,
+                "/org/bluez",
+                "org.bluez.ProfileManager1",
+                "RegisterProfile",
+                GLib.Variant("(osa{sv})", (PROFILE_PATH, RFCOMM_UUID, opts)),
+                None,
+                Gio.DBusCallFlags.NONE,
+                5000,
+                None,
+            )
+            log("Registered BlueZ RFCOMM Profile1")
+        except Exception as exc:
+            if "AlreadyExists" not in str(exc):
+                raise
+            log("BlueZ RFCOMM Profile1 already registered; refreshing")
+            self._unregister_profile(force=True)
+            try:
+                self.bus.call_sync(
+                    BLUEZ_SERVICE,
+                    "/org/bluez",
+                    "org.bluez.ProfileManager1",
+                    "RegisterProfile",
+                    GLib.Variant("(osa{sv})", (PROFILE_PATH, RFCOMM_UUID, opts)),
+                    None,
+                    Gio.DBusCallFlags.NONE,
+                    5000,
+                    None,
+                )
+            except Exception as exc2:
+                if "AlreadyExists" not in str(exc2):
+                    raise
         self.profile_registered = True
-        log("Registered BlueZ RFCOMM Profile1")
 
-    def _unregister_profile(self) -> None:
-        if not self.profile_registered:
+    def _unregister_profile(self, force: bool = False) -> None:
+        if not self.profile_registered and not force:
             return
         try:
             self.bus.call_sync(
@@ -439,9 +616,41 @@ class NetShareDaemon:
             return
         self._force_unregister_adv()
 
+    def _ensure_adv_and_profile_healthy(self) -> None:
+        with self.lock:
+            if self.shutting_down or self.suspended or self.state != "advertising":
+                return
+            adv_reg = self.adv_registered
+            prof_reg = self.profile_registered
+        if not self._is_bt_powered():
+            log("hci0 powered off while advertising; restoring Bluetooth & advertisement")
+            with self.lock:
+                self.adv_registered = False
+                self.profile_registered = False
+            if not self._ensure_bt_powered(True):
+                self._emit_status()
+                return
+            adv_reg = False
+            prof_reg = False
+        if not adv_reg or not prof_reg or not self._has_active_adv():
+            log("BlueZ advertisement/profile missing while advertising; re-registering")
+            with self.lock:
+                self.adv_registered = False
+            try:
+                self._register_profile(force=not prof_reg)
+                self._force_unregister_adv()
+                self._register_adv()
+                with self.lock:
+                    self.last_error = ""
+            except Exception as exc:
+                with self.lock:
+                    self.last_error = f"BT recovery pending: {exc}"
+                log(f"BlueZ recovery failed (will retry): {exc}")
+            self._emit_status()
+
     # ---------------- AP + DHCP + Route lifecycle ----------------
 
-    def _start_ap(self) -> None:
+    def _start_ap(self, freq_override: int | None = None) -> None:
         if self.wpas_proc is not None:
             return
         RUN_DIR.mkdir(parents=True, exist_ok=True)
@@ -450,7 +659,23 @@ class NetShareDaemon:
         os.chmod(WPAS_CTRL_DIR, 0o700)
 
         self.ssid, self.psk = random_credentials()
-        self.freq = pick_ap_frequency()
+        wlp_freq = get_wlp1s0_freq()
+        if wlp_freq is None:
+            ensure_regdomain_cn_unassociated()
+            wlp_freq = get_wlp1s0_freq()
+        phy_country = get_phy_country()
+        if freq_override is not None:
+            self.freq = freq_override
+        else:
+            with self.lock:
+                pref_5g = self.last_wlp_5g_freq
+                failed = dict(self.failed_freqs)
+            self.freq = pick_ap_candidates(
+                wlp_freq,
+                get_ap_allowed_5g_freqs(),
+                preferred_5g=pref_5g,
+                failed_freqs=failed,
+            )[0]
 
         run_cmd(["iw", "dev", AP_IFACE, "del"])
         res = run_cmd(["iw", "phy", "phy0", "interface", "add", AP_IFACE, "type", "__ap"])
@@ -458,22 +683,39 @@ class NetShareDaemon:
             raise RuntimeError(f"iw interface add failed: {res.stderr.strip()}")
         run_cmd(["ip", "link", "set", AP_IFACE, "up"], check=True)
 
-        conf = (
-            f"ctrl_interface={WPAS_CTRL_DIR}\n"
-            "ap_scan=2\n"
-            "p2p_disabled=1\n"
-            "country=CN\n"
-            "network={\n"
-            f'    ssid="{self.ssid}"\n'
-            "    mode=2\n"
-            f"    frequency={self.freq}\n"
-            "    key_mgmt=WPA-PSK\n"
-            "    proto=RSN\n"
-            "    pairwise=CCMP\n"
-            "    group=CCMP\n"
-            f'    psk="{self.psk}"\n'
-            "}\n"
-        )
+        header_lines = [
+            f"ctrl_interface={WPAS_CTRL_DIR}",
+            "ap_scan=2",
+            "p2p_disabled=1",
+        ]
+        # Never inject a country change while wlp1s0 is associated (WCN7860 firmware crash risk).
+        if wlp_freq is None and phy_country != "CN":
+            header_lines.append("country=CN")
+
+        net_lines = [
+            f'    ssid="{self.ssid}"',
+            "    mode=2",
+            f"    frequency={self.freq}",
+            "    beacon_int=100",
+            "    key_mgmt=WPA-PSK",
+            "    proto=RSN",
+            "    pairwise=CCMP",
+            "    group=CCMP",
+            f'    psk="{self.psk}"',
+        ]
+        if self.freq >= 5000:
+            net_lines.extend(["    vht=1", "    he=1"])
+            if self.freq in FREQ_80_MAP:
+                ht40, cf1 = FREQ_80_MAP[self.freq]
+                net_lines.extend(
+                    [
+                        f"    ht40={ht40}",
+                        "    max_oper_chwidth=1",
+                        f"    vht_center_freq1={cf1}",
+                    ]
+                )
+
+        conf = "\n".join(header_lines) + "\nnetwork={\n" + "\n".join(net_lines) + "\n}\n"
         WPAS_CONF.write_text(conf, encoding="utf-8")
         os.chmod(WPAS_CONF, 0o600)
 
@@ -580,6 +822,7 @@ class NetShareDaemon:
     def _apply_peer_route(self, peer_ip: str) -> None:
         with self.lock:
             self.peer_ip = peer_ip
+            self.failed_freqs.pop(self.freq, None)
             # Beat dead/captive Wi-Fi (metric 600) or explicit Force mode; otherwise stay fallback 700.
             metric = METRIC_OVERRIDE_WIFI if (self.mode == "force" or (self.wlp_has_def and not self.wlp_net_ok)) else METRIC_AUTO_FALLBACK
             self.active_metric = metric
@@ -655,11 +898,36 @@ class NetShareDaemon:
         with self.lock:
             if self.state != "idle" or self.shutting_down:
                 return
+            mode = self.mode
+        if mode == "auto":
+            has_def, net_ok = probe_wlp1s0_internet()
+            wlp_freq = get_wlp1s0_freq()
+            if wlp_freq is not None and 5180 <= wlp_freq <= 5825:
+                with self.lock:
+                    if wlp_freq in get_ap_allowed_5g_freqs():
+                        self.last_wlp_5g_freq = wlp_freq
+            if net_ok:
+                with self.lock:
+                    self.wlp_has_def = has_def
+                    self.wlp_net_ok = True
+                    self.wlp_ok_streak = 2
+                    self.wlp_down_streak = 0
+                log("wlp1s0 already has internet before advertising; skipping AP startup")
+                self._emit_status()
+                return
         if not self._ensure_bt_powered(True):
             self._emit_status()
             return
         try:
-            self._start_ap()
+            try:
+                self._start_ap()
+            except Exception as ap_exc:
+                if self.freq >= 5000:
+                    log(f"5 GHz AP startup failed on {self.freq} MHz ({ap_exc}); falling back to 2462 MHz")
+                    self._stop_ap_and_routes()
+                    self._start_ap(freq_override=2462)
+                else:
+                    raise
             self._register_profile()
             with self.lock:
                 self.state = "advertising"
@@ -674,27 +942,33 @@ class NetShareDaemon:
 
     # ---------------- RFCOMM connection thread ----------------
 
+    def _send_start_payload(self, sock: socket.socket, mac: str) -> None:
+        with self.lock:
+            payload = json.dumps(
+                {
+                    "cmd": "start",
+                    "ssid": self.ssid,
+                    "psk": self.psk,
+                    "freq": self.freq,
+                    "gw": AP_GW_IP,
+                },
+                separators=(",", ":"),
+            )
+        sock.sendall((payload + "\n").encode("utf-8"))
+        log(f"Sent session credentials over RFCOMM to {mac} (freq={self.freq} MHz)")
+
     def _handle_rfcomm_client(self, sock: socket.socket, mac: str) -> None:
         try:
+            self._submit_worker(self._set_device_trusted, mac)
             with self.lock:
                 if self.rfcomm_sock is not None:
                     self._close_rfcomm(send_stop=True)
                 self.rfcomm_sock = sock
                 self.peer_mac = mac
+                self.rfcomm_had_lease = False
                 self.last_keepalive = time.monotonic()
-                payload = json.dumps(
-                    {
-                        "cmd": "start",
-                        "ssid": self.ssid,
-                        "psk": self.psk,
-                        "freq": self.freq,
-                        "gw": AP_GW_IP,
-                    },
-                    separators=(",", ":"),
-                )
             sock.settimeout(2.0)
-            sock.sendall((payload + "\n").encode("utf-8"))
-            log(f"Sent session credentials over RFCOMM to {mac}")
+            self._send_start_payload(sock, mac)
 
             buf = b""
             while True:
@@ -717,16 +991,86 @@ class NetShareDaemon:
                             msg = json.loads(text)
                         except json.JSONDecodeError:
                             continue
-                        if msg.get("event") == "stop_request":
+                        evt = msg.get("event")
+                        if evt == "stop_request":
                             GLib.idle_add(self._on_peer_disconnect_cb, sock, "phone requested stop")
                             return
+                        if evt == "p2p_failed":
+                            try:
+                                failed_freq = int(msg.get("freq") or 0)
+                            except (TypeError, ValueError):
+                                failed_freq = 0
+                            try:
+                                sta_freq = int(msg.get("sta_freq") or 0)
+                            except (TypeError, ValueError):
+                                sta_freq = 0
+                            self._submit_worker(self._handle_peer_p2p_failed, sock, mac, failed_freq, sta_freq)
+                            continue
                         if msg.get("ip") and str(msg["ip"]).startswith("192.168.49."):
+                            with self.lock:
+                                self.rfcomm_had_lease = True
                             GLib.idle_add(self._on_dhcp_lease_cb, str(msg["ip"]))
                 except socket.timeout:
                     continue
         except OSError as exc:
             log(f"RFCOMM error ({mac}): {exc}")
         GLib.idle_add(self._on_peer_disconnect_cb, sock, "rfcomm disconnected")
+
+    def _handle_peer_p2p_failed(self, sock: socket.socket, mac: str, failed_freq: int, sta_freq: int) -> None:
+        now = time.monotonic()
+        with self.lock:
+            if self.shutting_down or self.rfcomm_sock is not sock or self.state == "idle":
+                return
+            eff_failed = failed_freq if failed_freq >= 2412 else self.freq
+            if eff_failed >= 2412:
+                self.failed_freqs[eff_failed] = now + 180.0
+            pref_5g = sta_freq if sta_freq >= 5000 else self.last_wlp_5g_freq
+            peer_sta = sta_freq if sta_freq >= 2412 else None
+            failed_copy = dict(self.failed_freqs)
+            keep_bt = self.mode != "off"
+
+        wlp_freq = get_wlp1s0_freq()
+        allowed_5g = get_ap_allowed_5g_freqs()
+        candidates = pick_ap_candidates(
+            wlp_freq,
+            allowed_5g,
+            preferred_5g=pref_5g,
+            failed_freqs=failed_copy,
+            now=now,
+            peer_sta_freq=peer_sta,
+        )
+        next_freq = next((c for c in candidates if failed_copy.get(c, 0.0) <= now), None)
+        if next_freq is None or next_freq == eff_failed:
+            log(f"All AP candidate channels exhausted (last={eff_failed} MHz, sta_freq={sta_freq}); resetting session")
+            self._teardown_session(send_stop=True, keep_bt_on=keep_bt)
+            GLib.timeout_add_seconds(3, self._evaluate_state_cb)
+            return
+
+        log(f"Phone P2P failed on {eff_failed} MHz (sta_freq={sta_freq}); switching session AP to {next_freq} MHz")
+        try:
+            self._stop_ap_and_routes()
+            try:
+                self._start_ap(freq_override=next_freq)
+            except Exception as ap_exc:
+                if next_freq >= 5000:
+                    log(f"Switch AP startup failed on {next_freq} MHz ({ap_exc}); falling back to 2462 MHz")
+                    self._stop_ap_and_routes()
+                    self._start_ap(freq_override=2462)
+                else:
+                    raise
+            with self.lock:
+                if self.rfcomm_sock is not sock or self.shutting_down:
+                    return
+                self.state = "advertising"
+                self.last_error = ""
+            self._send_start_payload(sock, mac)
+            self._emit_status()
+        except Exception as exc:
+            log(f"In-session AP channel switch failed: {exc}")
+            with self.lock:
+                self.last_error = str(exc)
+            self._teardown_session(send_stop=False, keep_bt_on=keep_bt)
+            GLib.timeout_add_seconds(3, self._evaluate_state_cb)
 
     def _on_peer_disconnect_cb(self, sock: socket.socket, reason: str) -> bool:
         self._submit_worker(self._on_peer_disconnect_work, sock, reason)
@@ -736,15 +1080,45 @@ class NetShareDaemon:
         with self.lock:
             matched = self.rfcomm_sock is sock or self.state == "connected"
             keep_bt = self.mode != "off"
+            pre_lease_fail = matched and (not self.rfcomm_had_lease) and self.freq >= 2412
+            failed_freq = self.freq
+            if pre_lease_fail and failed_freq >= 2412:
+                self.failed_freqs[failed_freq] = time.monotonic() + 120.0
         if matched:
-            log(f"Peer link ended: {reason}")
+            if pre_lease_fail:
+                log(f"Peer link ended before DHCP lease on {failed_freq} MHz ({reason}); cooling channel")
+            else:
+                log(f"Peer link ended: {reason}")
             self._teardown_session(send_stop=False, keep_bt_on=keep_bt)
             GLib.timeout_add_seconds(3, self._evaluate_state_cb)
 
     # ---------------- Periodic monitor ----------------
 
+    def _handle_5g_mcc_conflict(self, wlp_freq: int, ap_freq: int) -> None:
+        with self.lock:
+            if self.shutting_down or self.mode != "auto" or self.state == "idle" or self.freq != ap_freq:
+                return
+        log(f"wlp1s0 associated on {wlp_freq} MHz while {AP_IFACE} is on {ap_freq} MHz (5G MCC conflict); resetting")
+        self._teardown_session(send_stop=True, keep_bt_on=False)
+        GLib.timeout_add_seconds(2, self._evaluate_state_cb)
+
     def _wlp_probe_loop(self) -> None:
         while True:
+            wlp_freq = get_wlp1s0_freq()
+            if wlp_freq is not None and 5180 <= wlp_freq <= 5825:
+                with self.lock:
+                    prev_5g = self.last_wlp_5g_freq
+                if wlp_freq != prev_5g and wlp_freq in get_ap_allowed_5g_freqs():
+                    with self.lock:
+                        self.last_wlp_5g_freq = wlp_freq
+            with self.lock:
+                mode = self.mode
+                st = self.state
+                ap_freq = self.freq
+            if mode == "auto" and st != "idle" and ap_freq >= 5000:
+                if wlp_freq is not None and wlp_freq >= 5000 and wlp_freq != ap_freq:
+                    self._submit_worker(self._handle_5g_mcc_conflict, wlp_freq, ap_freq)
+
             has_def, net_ok = probe_wlp1s0_internet()
             changed = False
             with self.lock:
@@ -782,6 +1156,8 @@ class NetShareDaemon:
                 if self.wlp_net_ok:
                     self.wlp_ok_streak += 1
                     self.wlp_down_streak = 0
+                    if self.wlp_ok_streak >= 2:
+                        self.failed_freqs.clear()
                     if self.state != "idle" and self.wlp_ok_streak >= 2:
                         log("wlp1s0 internet recovered; stopping mobile share")
                         action = "teardown_off"
@@ -860,6 +1236,8 @@ class NetShareDaemon:
                 with self.lock:
                     self.last_error = "AP helper exited unexpectedly"
                 self._teardown_session(send_stop=False, keep_bt_on=True)
+            else:
+                self._ensure_adv_and_profile_healthy()
 
         self._evaluate_state()
 
@@ -932,6 +1310,62 @@ class NetShareDaemon:
             self._on_prepare_for_sleep,
         )
 
+    def _subscribe_bluez_signals(self) -> None:
+        self.bus.signal_subscribe(
+            BLUEZ_SERVICE,
+            "org.freedesktop.DBus.Properties",
+            "PropertiesChanged",
+            ADAPTER_PATH,
+            "org.bluez.Adapter1",
+            Gio.DBusSignalFlags.NONE,
+            self._on_bluez_adapter_props,
+        )
+        self.bus.signal_subscribe(
+            BLUEZ_SERVICE,
+            "org.freedesktop.DBus.Properties",
+            "PropertiesChanged",
+            None,
+            "org.bluez.Device1",
+            Gio.DBusSignalFlags.NONE,
+            self._on_bluez_device_props,
+        )
+
+    def _on_bluez_adapter_props(self, _conn, _sender, _path, _iface, _sig, params: GLib.Variant) -> None:
+        try:
+            _iface_name, changed, _invalid = params.unpack()
+        except Exception:
+            return
+        if "Powered" not in changed:
+            return
+        with self.lock:
+            need_recover = self.state == "advertising" and not self.shutting_down and not self.suspended
+        if need_recover:
+            log(f"hci0 Powered changed to {bool(changed['Powered'])} while advertising; scheduling BT recovery")
+            self._submit_worker(self._ensure_adv_and_profile_healthy)
+
+    def _on_bluez_device_props(self, _conn, _sender, path: str, _iface, _sig, params: GLib.Variant) -> None:
+        if not path.startswith(f"{ADAPTER_PATH}/dev_"):
+            return
+        try:
+            _iface_name, changed, _invalid = params.unpack()
+        except Exception:
+            return
+        if changed.get("Paired") is not True:
+            return
+        suffix = path.rsplit("/dev_", 1)[-1].replace("_", ":").upper()
+        try:
+            mac = normalize_mac(suffix)
+        except ValueError:
+            return
+        with self.lock:
+            allowed = mac in self.allowed_peers
+            advertising = self.state == "advertising" and not self.shutting_down
+        if allowed:
+            log(f"Allowed peer {mac} paired/re-paired; ensuring Trusted=True")
+            self._submit_worker(self._trust_and_eval_work, mac)
+            if advertising:
+                self._submit_worker(self._ensure_adv_and_profile_healthy)
+
     def _on_prepare_for_sleep(self, _conn, _sender, _path, _iface, _sig, params: GLib.Variant) -> None:
         going_down = bool(params.unpack()[0])
         with self.lock:
@@ -961,6 +1395,7 @@ class NetShareDaemon:
                 self.mode = mode
                 self.wlp_ok_streak = 0
                 self.wlp_down_streak = 0
+                self.failed_freqs.clear()
                 self.last_error = ""
                 self.save_config()
             inv.return_value(GLib.Variant("(bs)", (True, f"Mode set to {mode}")))
@@ -1012,11 +1447,7 @@ class NetShareDaemon:
         inv.return_dbus_error("org.freedesktop.DBus.Error.UnknownMethod", f"Unknown method {method}")
 
     def _trust_and_eval_work(self, mac: str) -> None:
-        dev_path = f"{ADAPTER_PATH}/dev_{mac.replace(':', '_')}"
-        try:
-            self._bluez_prop_set(dev_path, "org.bluez.Device1", "Trusted", GLib.Variant("b", True))
-        except Exception:
-            pass
+        self._set_device_trusted(mac)
         self._evaluate_state()
 
     def _on_adv_call(self, _conn, _sender, _path, _iface, method: str, _params, inv: Gio.DBusMethodInvocation) -> None:

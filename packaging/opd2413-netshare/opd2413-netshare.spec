@@ -19,6 +19,7 @@ Requires:       procps-ng
 Requires:       firewalld
 Requires:       systemd
 Requires:       NetworkManager
+Requires:       wireless-regdb
 
 %description
 Replicates ColorOS-style cross-device network sharing on the OnePlus Pad 2 Pro
@@ -36,11 +37,13 @@ install -D -m 0755 %{srcdir}/opd-netshare %{buildroot}%{_bindir}/opd-netshare
 install -D -m 0755 %{srcdir}/opd-netshare-tray %{buildroot}%{_bindir}/opd-netshare-tray
 
 install -D -m 0600 %{srcdir}/config/netshare.conf %{buildroot}%{_sysconfdir}/opd2413/netshare.conf
+install -D -m 0644 %{srcdir}/config/regdomain %{buildroot}%{_sysconfdir}/sysconfig/regdomain
 install -D -m 0644 %{srcdir}/dbus/local.opd2413.NetShare.conf %{buildroot}%{_datadir}/dbus-1/system.d/local.opd2413.NetShare.conf
 install -D -m 0644 %{srcdir}/nm/90-opd2413-netshare.conf %{buildroot}%{_prefix}/lib/NetworkManager/conf.d/90-opd2413-netshare.conf
 install -D -m 0644 %{srcdir}/systemd/opd-netshare.service %{buildroot}%{_unitdir}/opd-netshare.service
 install -D -m 0644 %{srcdir}/desktop/opd-netshare.desktop %{buildroot}%{_datadir}/applications/opd-netshare.desktop
 install -D -m 0644 %{srcdir}/desktop/opd-netshare-tray.desktop %{buildroot}%{_sysconfdir}/xdg/autostart/opd-netshare-tray.desktop
+install -D -m 0644 %{srcdir}/wireplumber/50-opd2413-bt-roles.conf %{buildroot}%{_datadir}/wireplumber/wireplumber.conf.d/50-opd2413-bt-roles.conf
 
 %post
 systemctl daemon-reload >/dev/null 2>&1 || :
@@ -67,8 +70,10 @@ systemctl daemon-reload >/dev/null 2>&1 || :
 %{_bindir}/opd-netshare-tray
 %dir %{_sysconfdir}/opd2413
 %config(noreplace) %attr(0600,root,root) %{_sysconfdir}/opd2413/netshare.conf
+%config(noreplace) %attr(0644,root,root) %{_sysconfdir}/sysconfig/regdomain
 %{_datadir}/dbus-1/system.d/local.opd2413.NetShare.conf
 %{_prefix}/lib/NetworkManager/conf.d/90-opd2413-netshare.conf
 %{_unitdir}/opd-netshare.service
 %{_datadir}/applications/opd-netshare.desktop
 %{_sysconfdir}/xdg/autostart/opd-netshare-tray.desktop
+%{_datadir}/wireplumber/wireplumber.conf.d/50-opd2413-bt-roles.conf

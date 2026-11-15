@@ -1,0 +1,2 @@
+# Installed by opd2413-netshare so udev setregdomain sets CN before wlp1s0 associates.
+COUNTRY=CN

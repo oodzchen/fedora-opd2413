@@ -5,7 +5,11 @@
 
 ## 唯一的下一步
 
-**`7.2.15-23.opd2413`（`2415`–`2417`，解除 [TECH-DEBT.md](TECH-DEBT.md) `#9` 开机灰闪）已设为主启动项并通过 3 次热重启、`120/60/30 Hz` 切换、DPMS、Night Light、`s2idle` 与 3 次冷启动的无灰闪验证（`7.2.15-22` 保留为回退项）；下一步排查第 2 次冷启动选引导入口后偶发黑屏并自动重启问题（[TECH-DEBT.md](TECH-DEBT.md) `#39`），其余 `2414` 深层根因、`#37`、`#19`、M4 外设与回馈 erhai 按需接续。**
+**`kernel-opd2413-7.2.15-24.opd2413` 已设为默认启动条目（`fedora-7.2.15-24.opd2413.conf`，保留 `-23` 为回退）并通过 `46.3 s` 插电冷启动复查；`opd2413-netshare-0.1-7.noarch` 与新版 Android 伴侣 APK 均已完成真机端到端验收并合入提交。下一步按优先级继续 M4 收尾与按需增强：(1) 用真无线耳机实际播放验证 WirePlumber 音频规则保留正常；(2) 如需免除冷启无记忆态 `5745 MHz` 异频重连局限（[TECH-DEBT.md](TECH-DEBT.md) `#41`）或彻底免开手机后台权限（`#40`），分别补做 NM `connecting` 监听或 `CompanionDeviceManager`；(3) 继续内核长尾项 `#39`（冷启动选入口偶发黑屏重启）、`#36`/`#37`/`#19`（显示寄存器级根因/熄屏断电）及 `#34`（GMU 驱动绑定去掉 `fw_devlink.sync_state=timeout`），以及 USB 3 双向与 DP 外接。**
+- 2026-11-15 `kernel-opd2413-7.2.15-24.opd2413` 设默认启动并冷启动复查通过（见 [WORKLOG.md](WORKLOG.md)）：执行 `/usr/libexec/opd2413/boot-select default fedora-7.2.15-24.opd2413.conf` 并插电 `systemctl poweroff` 冷启动，`46.3 s` 后无干预回到 `7.2.15-24.opd2413`（`running`、`0 failed`、SELinux `Enforcing`、`0 AVC`、`country CN`、`opd-netshare` `Mode: auto`/`State: idle`，`7.2.15-23` 保留作回退入口）。
+- 2026-11-15 `opd2413-netshare 0.1-7` + Android 伴侣端联调修复真机通过（见 [WORKLOG.md](WORKLOG.md)）：针对手机忘记蓝牙重配对并断开平板 Wi-Fi 后无法共享的问题，修复平板 `opd-netshare-daemon` 在 `hci0` 掉电/重配对后未监听 `Adapter1.Powered` / `Device1.Paired` 及未校验 `LEAdvertisement1` `ActiveInstances` 导致广播静默丢失、以及手机 `ACTION_BOND_STATE_CHANGED`（`BOND_BONDED`）未清冷却重扫的缺陷；同时新增 `last_wlp_5g_freq` 断网信道记忆、`failed_freqs` 冷却与基于手机 `sta_freq` 的同会话 `peer_sta_freq` 跨频段选频（配合伴侣端 `failCount < 5` 与 `14_000L` ms 等待）。真机实测 `bluetoothctl power off` 与 `rfkill` 自愈建连（`CURL_HTTP=200`）、`mode auto` 断开 `wlp1s0` 沿用 `5240 MHz` 建连（`1200.9 MBit/s`、`CURL_T28=200`/`CURL_T44=200`）并无 `#41` 超时平滑重连、断网强制 `5745 MHz` 起播时识别 `sta_freq=5240` 同会话切换至 `5240 MHz`（`CURL_CASEC=200`），且 WirePlumber `Audio Sink`/`Handsfree` 隔离回归通过（`5240 -> 2462 MHz` 跳过冲突 5 GHz 信道已由离线单测验证；另实证手机深休眠 `Dozing` 受 ColorOS `OplusProxyWakeLock` / `OplusHansManager` 节流，需亮屏唤醒触发）。
+- 2026-11-15 `opd2413-netshare 0.1-5` 蓝牙音频角色隔离真机通过（见 [WORKLOG.md](WORKLOG.md)）：通过 `50-opd2413-bt-roles.conf` 将 WirePlumber `monitor.bluez.properties` 的 `bluez5.roles` 设为 `[ a2dp_source bap_source hfp_ag hsp_ag ]`；重启 `wireplumber` 无解析报错，`hci0` 广播不再包含 `Audio Sink`（`0000110b`）与 `Handsfree`（`0000111e`）而保留 `Audio Source` / `Handsfree Audio Gateway`；手机在 `5240 MHz / 80 MHz` 保持连接超过 `25 s` 且通过 `p2p0` 访网（`HTTP/1.1 200 OK`）期间，平板 `bluetoothd` 无 `/sep2/fd0` 与 AVRCP 接入、`wpctl` 无蓝牙节点，手机 `A2dpService`/`HeadsetService` 保持断开、`STREAM_MUSIC` 停留在 `speaker(2)`；切回 `auto` 双端清理正常（另附带确认手机深夜 `nightDeepDoze|LcdOff` 会冻结 `local.opd2413.netshare`，唤醒屏幕后即刻自动配对）。
+- 2026-11-15 `7.2.15-24` + `opd2413-netshare 0.1-4` 5 GHz AP 端到端实测完成（见 [WORKLOG.md](WORKLOG.md)）：`iw reg get` 开机及断网期均稳态为 `country CN: DFS-FCC`（`global` 与 `phy#0`）；`mode force` 下与手机配对建成 `5240 MHz / 80 MHz`（对称 `1080.6 MBit/s HE-MCS 10 NSS 2`，`tx retries: 0`），经手机转发公网 `ping`/`HTTPS 200` 及直连 TCP 上传 `725.36 Mbps` / 下载 `783.33 Mbps` 均通过，切回 `auto` 双端清理零残留；无上行断网下可于 `5745 MHz (80 MHz)` 拉起 `p2p0`，同时暴露了 `p2p0` 占 `5745 MHz` 时 `wlp1s0` 连回异频 `5240 MHz` 路由器会在 9 ms 内认证超时的硬件并发局限（`#41`）。
 - 2026-11-14 跨设备自动网络共享阶段 3（`opd2413-netshare-0.1-3.noarch` + Android Companion `opd-netshare.apk`）真机验收通过：完成蓝牙 RFCOMM Profile SDP 信道补全（`"Channel": GLib.Variant("q", 22)`）与硬件过滤 `PendingIntent` BLE 扫描 / `464XLAT` 路由识别修复，实测 `mode force`、`auto` 断网自动触发与恢复释放、`wlan0 <-> 5G 蜂窝`（`rmnet_data3`）在线无缝切换及连接态 `systemctl restart opd-netshare.service` 双端清理均通过；2026-11-15 用户确认手机开启允许后台后已可正常使用（[TECH-DEBT.md](TECH-DEBT.md) `#40` 已缓解，免手动设置所需的 `CompanionDeviceManager` 按需接续）。
 - 2026-11-14 开机灰闪（`#9`）调查与 `2415`–`2417` 补丁已写入 `kernel/opd2413-7.2/patches/`（`-F0` 严格合入）与 [WORKLOG.md](WORKLOG.md)。
 - 2026-11-13 `7.2.15-12.opd2413`（含 `2408`–`2410`）：先经 `2408`+`2409` 实现 Pogo 键盘在 `s2idle` 下通过 `gpio3` 4 簇脉冲过滤按任意键唤醒并屏蔽 10.001 s 脉冲与 22.659 s 电池上报拍频碰撞；再通过 erhai `b30d759d3`（`2410`：`LLCC_ISLAND1` 改用 `res_ways = 0x7fffffff`）修复自 `7.2.15-6`（`2401`）引入的冷启动 30–60 s 内进 `s2idle` 在 `PM: suspend-to-idle` 后触发 `PS_HOLD` 硬件复位的问题。
@@ -36,7 +40,7 @@ M2 剩下的被动观察项：开机提示音毛刺再出现时当场取证；�
 
 ## 当前阻塞
 
-没有全局阻塞（第 2 次冷启动偶发选入口后黑屏自动重启已另立为 `#39` 后续排查）。默认内核 `7.2.15-23.opd2413`（`loader_default: fedora-7.2.15-23.opd2413.conf`），Fedora 45 KDE 正常运行；`7.2.15-22.opd2413` 为保留的上一稳定版回退条目（`-12` 已随 `installonly_limit=2` 卸载）。
+没有全局阻塞（第 2 次冷启动偶发选入口后黑屏自动重启已另立为 `#39` 后续排查）。默认内核 `7.2.15-24.opd2413`（`loader_default: fedora-7.2.15-24.opd2413.conf`），Fedora 45 KDE 正常运行；`7.2.15-23.opd2413` 为保留的上一稳定版回退条目（`-22` 已随 `installonly_limit=2` 卸载）。
 
 已知的坑：
 
@@ -54,15 +58,15 @@ M2 剩下的被动观察项：开机提示音毛刺再出现时当场取证；�
 3. 改了 `device/` 或任何 spec，按 [BUILD.md](BUILD.md) 重新构建、跑离线测试，再拷到平板用 `dnf install ./*.rpm` 装。
 4. 关机会自动重新开机（插着电时）。需要冷启动验证时可以直接经 SSH `systemctl poweroff`，约 40 秒后回来。
 
-## 设备状态（2026-11-14 23:43）
+## 设备状态（2026-11-15 08:20）
 
-- 23:43 运行：Fedora 45 KDE，默认启动内核 `7.2.15-23.opd2413`（`#51`，含 `2415`–`2417`），`systemctl is-system-running = running`，`systemctl --failed = 0`，SELinux `Enforcing`（`ausearch -m avc,user_avc -ts today` 零拒绝），无 `BTF` 警告。跨设备共享守护 `opd-netshare.service`（`opd2413-netshare-0.1-3.noarch`）与 KDE 托盘 `opd-netshare-tray` 运行中，当前收敛于 `mode=auto`、`state=idle`、`bt_powered=false`、无 `p2p0` 接口；配对手机端同样处于干净空闲态（无 `p2p0`、`ip rule` 与 `iptables` 残留）。此前 `7.2.15-23` 上已完成 3 次热重启与 3 次冷启动测试（全程无开机灰闪；仅第 2 次冷启动在引导菜单选入口后出现一次黑屏随后自动重启，第 1/3 次冷启动及全部热重启正常，记为 `#39`），并通过 `3392x2400` 下的 `120 / 60 / 30 Hz` 切换（并恢复 `60 Hz`）、DPMS 熄/亮屏（`bl_power=4 <-> 0`）、Night Light（`available/enabled/running=true`）与 4 s `s2idle` 唤醒复核。
-- 注：测试 `wlp1s0` 断网重连切换时，平板从路由器重新获取的局域网 DHCP 地址已变化；若后续通过 `private/ssh.sh` 连接，需核对实际地址或设置 `OPD_HOST`。
-- systemd-boot：`loader.conf` 默认 `fedora-7.2.15-23.opd2413.conf`；平板已装条目包含 `fedora-7.2.15-23.opd2413.conf`、`fedora-7.2.15-22.opd2413.conf`（`-12` 已随 `installonly_limit=2` 卸载，所有临时 `bisect1`/`nodispcc` 条目已清理）。
+- 08:20 运行：Fedora 45 KDE，本次已由默认条目 `fedora-7.2.15-24.opd2413.conf` 插电冷启动（`46.3 s` 无干预恢复 SSH）自动拉起 **`7.2.15-24.opd2413`**（`systemctl is-system-running = running`、`0 failed`、SELinux `Enforcing`、`0 AVC`；在 `-23` 基础上合入 `m3-wifi-reg.config` 启用 `CONFIG_CFG80211_CERTIFICATION_ONUS` 与 `CONFIG_ATH_REG_DYNAMIC_USER_REG_HINTS`）。跨设备共享守护 `opd-netshare.service`（**`opd2413-netshare-0.1-7.noarch`**）、用户态 `wireplumber.service`（加载 `50-opd2413-bt-roles.conf`）与 `opd-netshare-tray` 运行中，`/tmp` 联调临时日志已清理，当前处于 `mode=auto`、`state=idle`、`bt_powered=false`、无 `p2p0`（注：冷启动第 `3 s` 早于 `bluetoothd` 初始化 `/org/bluez/hci0`〔第 `6 s` 就绪〕时曾产生 1 条 `UnknownObject`，第 `7 s` 因 `wlp1s0` 已就绪跳过开播，仅留作 `Last Error:` 只读历史提示，不影响功能）；配对手机侧已升级最新 `opd-netshare.apk` 并清理 P2P 残留。`iw reg get` 在 `global` 与 `phy#0` 均为 `country CN: DFS-FCC`。
+- 注：测试 `wlp1s0` 断网重连切换时，若路由器重新分配局域网 DHCP 地址且后续经 `private/ssh.sh` 连接，需核对实际地址或设置 `OPD_HOST`。
+- systemd-boot：`loader.conf` 默认已设为 `fedora-7.2.15-24.opd2413.conf`（`pending_next = null`）；平板当前已装条目包含 `fedora-7.2.15-24.opd2413.conf`（默认）、`fedora-7.2.15-23.opd2413.conf`（回退，`-22` 已随 `installonly_limit=2` 卸载）。安装 `-24` 时经 SHA-256 校验 `KSHIM.CHO` 等非 Fedora ESP 文件保持不变。
   ESP `/dev/sda16` 总计 512M、已用 247M、空闲 266M（49 %）。固定路径 `/dtbs/qcom/sm8750-oneplus-pad2pro.dtb` 是 7.2.15 的（与内核 3 相同）。
 - `boot_b` = `07bf1b53…`（fedora1：菜单 ColorOS / Fedora / Fedora boot menu，倒计时 10 s，默认项仍是 ColorOS）；KSHIM.CHO 记住 Fedora。
   上一版 `492f2cdf…` 的整分区回读在主机 `private/bootflow-20261111/boot_b-readonly.img`。
-- 软件包：内核 `kernel-opd2413-7.2.15-23.opd2413`、`kernel-opd2413-7.2.15-22.opd2413`（因 offline 时钟回到 `2026-10-17` 触发 `rpm-sequoia` 拒签 10-18 后构建的系统包且 `/etc/dnf/protected.d/opd2413.conf` 阻止 `installonly_limit=2` 自动淘汰 `-12`，校时并传 `--setopt=protected_packages=''` 后干净安装），以及 `opd2413-device-0.1-14`、`opd2413-audio-0.1-12`、`opd2413-sensors-0.1-1`、`opd2413-netshare-0.1-3`、`opd2413-firmware-16.0.10.600-2`、`showtime`（registry 在 `/var/lib/opd2413/sensors`）。`rpm -ivh --nosignature` 不受 `installonly_limit=2` 自动淘汰。
+- 软件包：内核 `kernel-opd2413-7.2.15-24.opd2413`（当前默认条目）、`kernel-opd2413-7.2.15-23.opd2413`（保留回退条目），以及 `opd2413-device-0.1-14`、`opd2413-audio-0.1-12`、`opd2413-sensors-0.1-1`、`opd2413-netshare-0.1-7`、`wireless-regdb-2026.09.03-1.fc45`、`opd2413-firmware-16.0.10.600-2`、`showtime`（registry 在 `/var/lib/opd2413/sensors`）。`rpm -ivh --nosignature` 不受 `installonly_limit=2` 自动淘汰。
   内核 3（`7.2.6-3`）08:45 经用户同意卸载，它的包仍在主机 `out/rpms/`。
 - 7.3 测试内核、"M3 test" 和 "Log capture" 两个条目、ESP 上的 `opd2413-bootlog/` 已于 11-11 23:29 删除。
 - `/etc/modprobe.d/opd2413-pps.conf` 已删除（11-12）。`/etc/kernel/tries` 已删除。
@@ -103,7 +107,8 @@ M2 剩下的被动观察项：开机提示音毛刺再出现时当场取证；�
 | `out/rpmbuild/RPMS/aarch64/kernel-opd2413-7.2.15-12.opd2413.aarch64.rpm` | 当前默认内核（合入 `2410` 修复冷启动早休眠 `PS_HOLD` 复位）；`out/m3k/pkg-test12/` 是它的容器安装校验 |
 | `out/rpmbuild/RPMS/aarch64/kernel-opd2413-7.2.15-18.opd2413.aarch64.rpm` | 旧测试内核（`2411`–`2413`，手动切 60 Hz 时复现 `CTL_0` 卡死，已从平板卸载） |
 | `out/rpmbuild/RPMS/aarch64/kernel-opd2413-7.2.15-22.opd2413.aarch64.rpm` | 上一版内核，现保留为平板回退条目（`2411`–`2414`，`SHA256: 139a520f...`） |
-| `out/rpmbuild/RPMS/aarch64/kernel-opd2413-7.2.15-23.opd2413.aarch64.rpm` | 当前默认内核（合入 `2415`–`2417` 解除开机灰闪，`SHA256: cbfdd4108e0278b2ea426fc158a994587716e1e17ade72bda77dfc2c2c67deb8`） |
+| `out/rpmbuild/RPMS/aarch64/kernel-opd2413-7.2.15-23.opd2413.aarch64.rpm` | 上一版内核，现保留为平板回退条目（合入 `2415`–`2417` 解除开机灰闪，`SHA256: cbfdd4108e0278b2ea426fc158a994587716e1e17ade72bda77dfc2c2c67deb8`） |
+| `out/rpmbuild/RPMS/aarch64/kernel-opd2413-7.2.15-24.opd2413.aarch64.rpm` | 当前默认内核（`m3-wifi-reg.config` 5 GHz AP 调控域支持，默认条目冷启动复查通过；`out/m3k/pkg-test24` 为安装检验；`SHA256: a8e0dc41...`） |
 | `private/m3-kbdwake-20261113/` | 2026-11-13 Pogo 键盘唤醒排查、4 簇过滤验证、`ramoops-000009-s2idle.txt` 及 `7.2.15-12` 两次冷启动验收日志 |
 | `out/rpmbuild/RPMS/aarch64/opd2413-sensors-0.1-1.aarch64.rpm`、`out/sensors/` | 传感器包及其源码包、构建日志 |
 | `private/sensors-persist-20261102/` | 从 persist 备份导出的传感器 registry（本机数据） |
@@ -112,7 +117,7 @@ M2 剩下的被动观察项：开机提示音毛刺再出现时当场取证；�
 | `out/m3-rpm5/` | 诊断内核 `7.3.3-5.opd2413` 的构建脚本和日志（编译完成，19:50 在打包前中止，没有包） |
 | `out/rpmbuild/RPMS/noarch/opd2413-device-0.1-13.noarch.rpm` | 平板上现在装的设备包（0.1-9 起允许 s2idle，0.1-10 修 boot-select 的条目 id，0.1-11 加键盘 hwdb，0.1-13 VP9 走软解） |
 | `out/rpmbuild/RPMS/noarch/opd2413-firmware-16.0.10.600-2.noarch.rpm` | 平板上的固件包（加 Iris 固件） |
-| `out/rpmbuild/RPMS/noarch/opd2413-netshare-0.1-3.noarch.rpm`、`out/netshare/opd-netshare.apk` | 跨设备自动网络共享平板端 RPM（含 RFCOMM SDP 信道 `22`、daemon/CLI/KDE 托盘/NM/DBus/systemd 配置）与 Android 伴侣 APK（v3 签名） |
+| `out/rpmbuild/RPMS/noarch/opd2413-netshare-0.1-7.noarch.rpm`、`out/netshare/opd-netshare.apk` | 跨设备自动网络共享平板端 RPM（含 `0.1-4` 80 MHz/`CN`/SCC、 `0.1-5` WirePlumber BT Sink/HF 隔离、`0.1-6`/`0.1-7` BT 断电/重配对自愈、`last_wlp_5g_freq` 记忆与 `peer_sta_freq` 跨频段切频）与 Android 伴侣 APK（v3 签名，含 `BOND_BONDED` 重扫、`sta_freq`/`p2p_failed` 上报及 `failCount < 5` / `14 s` 等待） |
 | `out/video/`、`private/m3-video-20261112/` | 视频测试片源、解码记录 |
 | `private/m3-sleep-20261112/` | M3.3 的 pm_test、s2idle、按键挂起证据 |
 | `private/ssh.sh`、`private/scp.sh` | 连平板的 SSH / scp 包装（`OPD_OS=fedora` 用 Fedora 的地址和主机密钥） |
@@ -167,7 +172,7 @@ Armada 下的结论见 [HARDWARE.md](HARDWARE.md)。换了发行版后都要重�
 | 扬声器 | 真机通过 | 用户确认播放、音量调节、静音正常（2026-11-10）；左右与逐颗未单独验 |
 | 麦克风 | 真机通过 | 2026-11-12，7.2.15-10（`2407`）+ opd2413-audio 0.1-12，见 M3-FEATURES M3.5 |
 | 蓝牙 | 真机通过 | 2026-11-12，7.2.15-2 起：音箱、耳机配对/连接/播放（M3.1） |
-| 跨设备网络共享 | 真机通过 | 2026-11-14，`opd2413-netshare-0.1-3` + 手机 Companion APK（已 root，不开启手机便携热点）：BLE 广播唤醒、BlueZ RFCOMM 控制（信道 `22`）、`p2p0`（2.4 GHz `2462 MHz`）私有网桥；实测 `mode force`、`auto` 断网触发与恢复、`wlan0 <-> 5G` 蜂窝无缝切换、连接态重启清理与 SELinux 零拒绝均通过；2026-11-15 用户确认手机开启允许后台后已正常可用（[TECH-DEBT.md](TECH-DEBT.md) `#40` 已缓解） |
+| 跨设备网络共享 | 真机通过（`5240 MHz` 断网记忆、BT 自愈、音频隔离与跨频切频已验） | 2026-11-14，`opd2413-netshare-0.1-3` + Companion APK 全链路（BLE/RFCOMM/`464XLAT`/蜂窝切换/重启清理）通过（`#40` 允许后台缓解）；2026-11-15 `7.2.15-24` + `0.1-4` 验通 `COUNTRY=CN`、`5240 MHz / 80 MHz` SCC（`1080.6 MBit/s`，上传 `725.36 Mbps` / 下载 `783.33 Mbps`、`ping`/`HTTPS 200`）及断网 `5745 MHz / 80 MHz` 拉起；`0.1-5` 经 WirePlumber `bluez5.roles` 剔除 `Sink`/`HF` 防蓝牙音频劫持（控制器保留 `Audio Source`/`Handsfree Audio Gateway` UUID，真无线耳机实际播放待按需复测）；2026-11-15 `0.1-7` + 新版 APK 实机通过蓝牙断电/`rfkill` 自愈、`mode auto` 断开 `wlp1s0` 记忆 `5240 MHz` 建连（`CURL=200`）与无 `#41` 超时平滑重连、强制 `5745 MHz` 起播时按手机 `sta_freq=5240` 同会话切换 `5240 MHz`（`CURL=200`）及音频隔离回归（`5240 -> 2462 MHz` 跳过冲突 5 GHz 由离线单测覆盖；手机 `Dozing` / 后台分别受 ColorOS `OplusProxyWakeLock` 与 `OplusHansManager` 节流，需亮屏唤醒触发，见 `#40`/`#41`） |
 | 休眠 | 真机通过 | 2026-11-12：s2idle，电源键/合盖/RTC 唤醒，挂起时 CX 塌陷约 98 %（M3.3）；2026-11-13 `7.2.15-12` 增补 `2410`（`LLCC_ISLAND1` `res_ways`）修冷启动 30–60 s 内早休眠 `PS_HOLD` 硬件复位，并加 Pogo 键盘空格键唤醒（无调试服务冷启动 21 s 实测通过）；拔线待机耗电未测 |
 | 充电（9 V PD） | 真机通过 | 2026-11-12，7.2.15-3 起（M3.2a）；PPS 快充驱动已装、待电量低于 75 % 实测（M3.2b） |
 | 电量、温控 | 真机通过 | 电量、电流（符号正确）、温度读数正常（M3.2a）；温控未单独验 |
