@@ -2059,3 +2059,30 @@ mpv、Firefox 仍是软解（Fedora `ffmpeg-free` 的专利限制），用户选
 - **设默认与冷启动复查（2026-11-15 12:11）：真机通过**
   - 经用户确认后执行 `boot-select default fedora-7.2.15-28.opd2413.conf`（回读 `/boot/efi/loader/loader.conf` 为 `default fedora-7.2.15-28.opd2413.conf`，保留 `-26` 作回退）。
   - 用户在未插电状态下手动关机再冷启动开机（`uptime -s = 2026-11-15 12:11:28`），SSH 复核通过：`uname -r = 7.2.15-28.opd2413`、`booted_entry = fedora-7.2.15-28.opd2413.conf`、`loader_default = fedora-7.2.15-28.opd2413.conf`、`kshim_remembered = "Fedora"`、`pending_next = null`；`systemctl is-system-running = running`、`--failed` 为空、`getenforce = Enforcing`、`journalctl -b` 零 `avc.*denied`；`opd2413-sensors-rpcd`、`opd2413-sensors-gate`、`iio-sensor-proxy`、`bluetooth`、`opd-netshare` 均为 `active`；`aplay -l` 正常列出 `card 0: OnePlusPad2Pro`；`dmesg` 确认 `bound 3d37000.gmu`、`remote processor adsp is now up`、`[nt36536] Update firmware success!`（`PID=5F95`）且无 Oops / `qsh_process` / `fatal error`。
+
+#### 2026-11-15 相机 SoftISP / 调校补丁与对焦马达排查：`libcamera 0.7.2-5.fc45.opd2413.2`
+
+- **补丁与打包（`packaging/opd2413-libcamera/`）：**
+  - 在 `libcamera-0.7.2` 原有补丁 `0001`–`0002` 基础上新增 7 个补丁 `0101`–`0107`（[libcamera.spec](../packaging/opd2413-libcamera/libcamera.spec)，`Release: 5%{?dist}.opd2413%{?opdrel:.%{opdrel}}`）：
+    - `0101`：`ipa: libipa: camera_sensor_helper: Add sc820cs and sc1300cs`；
+    - `0102`：`libcamera: camera_sensor_properties: Add sc820cs and sc1300cs`；
+    - `0103`：`libcamera: dma_buf_allocator: Prefer SystemHeap before CmaHeap`；
+    - `0104`：`ipa: simple: Run swstats every frame and speed up AGC convergence`；
+    - `0105`：`ipa: simple: debayer_egl: Add radial per-channel Lens Shading Correction`；
+    - `0106`：`pipeline: simple: ipa: simple: Add CameraLens VCM and contrast-detect AF`；
+    - `0107`：`ipa: simple: data: Add initial sc820cs and sc1300cs tuning files`。
+  - 宿主机 `out/rpmbuild/RPMS/aarch64/` 已编出 `libcamera-0.7.2-5.fc45.opd2413.2.aarch64` 全套子包；平板端已实装 `libcamera`、`libcamera-ipa`、`libcamera-tools`、`python3-libcamera`（均 `0.7.2-5.fc45.opd2413.2.aarch64`，配合 `pipewire-plugin-libcamera-1.6.11-1.fc45.aarch64`）。
+- **状态与已知限制：**
+  - 前摄 `sc820cs` 经后续 `opd2413-face` 人脸识别与 GUI 实测，画面清晰度与曝光已满足解锁使用，用户确认够用（**真机通过**）。
+  - 后摄 VCM 马达 `cn3927`（I2C `10-000c`、`ac7b000.cci`）实机 `dmesg` 报 `[    5.182919] i2c-qcom-cci ac7b000.cci: master 1 queue 0 timeout`，`/sys/bus/i2c/devices/10-000c/power/runtime_status = error`（`ac7b000.cci` 为 `suspended`），后摄 `sc1300cs` 物理自动对焦暂不可用，已登记 [TECH-DEBT.md](TECH-DEBT.md#L42-L43) `#42`。
+
+#### 2026-11-15 原生人脸识别解锁与录入向导 RPM：`opd2413-face`（`0.1-1`–`0.1-10`）
+
+- **架构与实现（`packaging/opd2413-face/`）：**
+  1. **后台识别服务 `opd2413-faced`**（[opd2413-faced.py](../packaging/opd2413-face/src/opd2413-faced.py) -> `/usr/libexec/opd2413/opd2413-faced`）：root systemd D-Bus 服务（`org.opd2413.Face1`），经 `python3-libcamera` + `DebayerEGL` + DMA-BUF `mmap`（`DMA_BUF_IOCTL_SYNC`）从 `camera_match = sc820cs`（`1280x960`、`warmup_frames = 8`）取帧，运行 Apache-2.0 OpenCV Zoo YuNet（`face_detection_yunet_2023mar.onnx`）与 SFace（`face_recognition_sface_2021dec.onnx`）；默认 `/etc/opd2413-face.conf` 配置 `default_timeout_ms = 3500`、`cosine_threshold = 0.42`、`liveness = standard`、`required_matches = 2`、`min_face_px = 96`、`min_sharpness = 22.0`、`min_frame_delta = 0.45`、`reject_when_lid_closed = true`。
+  2. **轻量 C PAM 模块与策略**（[pam_opd2413_face.c](../packaging/opd2413-face/src/pam_opd2413_face.c)）：仅依赖 `sd-bus` 与 `pam`（调用方零 Python/相机/ONNX 依赖），默认 `timeout=3500`，检测 `PAM_RHOST` / `SSH_CONNECTION` / `SSH_CLIENT` / `SSH_TTY` 远程会话或未录入用户时直接 `PAM_IGNORE`。随包携带 `authselect` vendor profile `opd2413-face`（接管锁屏 `kde-fingerprint` -> `fingerprint-auth` 与 `sudo`/`polkit-1` 的 `system-auth`，不改 `password-auth`）与 SELinux 模块 `opd2413_face`（放行 `xdm_t`、`policykit_auth_t`、`chkpwd_t`、`local_login_t`、`unconfined_t` 与 `unconfined_service_t` D-Bus 交互）。
+  3. **KDE 锁屏 QML 插件与外壳集成**（`src/qml/facebridge.{cpp,h}`、`data/lockscreen/`）：通过 `org.opd2413.face` `FaceBridge` 与 `SetLockscreenMode`（配合 `LOCKSCREEN_IDLE_WAIT_S = 2.3`）实现“时钟屏保待命 -> 唤醒进入输入态延时扫描 -> `faceStatusPill` 扫描视觉指示 -> 失败后点击重试或密码回退”；`0.1-9` 修复 [LockScreenUi.qml](../packaging/opd2413-face/data/lockscreen/LockScreenUi.qml) 的 `handleMessage(msg)` 空串过滤并新增 `FaceBridge.onEnrolledChanged` 补触发，消除 Plasma 6.8.2 `kscreenlocker_greet` 初始化切换 `Regular` 认证器发射空 `promptChanged` / `infoMessageChanged` / `errorMessageChanged` 时立即触发 `uiVisible = true` 直接打开密码框的问题（日志 `Worker not ready yet` 由 4 次降为 2 次）。
+  4. **Qt GUI 录入向导打包与图标修正**（[opd-face-enroll-gui.py](../packaging/opd2413-face/src/opd-face-enroll-gui.py)、[opd-face-enroll.desktop](../packaging/opd2413-face/data/opd-face-enroll.desktop)、[opd2413-face.spec](../packaging/opd2413-face/opd2413-face.spec)）：`0.1-9` 将桌面脚本正式打包至 `/usr/libexec/opd2413/opd-face-enroll`、`/usr/bin/opd-face-enroll`（`python3 -B` 防写 `__pycache__`、通过 `pkexec ... --worker` 提权执行 4 组姿态录入与实测），新增 `python3-pyside6` 依赖并删除桌面遗留脚本与 root `__pycache__`；`0.1-10` 排查应用无正常图标原因为原用 `edit-image-face-recognize` 仅存于 Breeze `actions/16|22|24` 单色问号方框图标，统一改回 Breeze `[preferences/32]` 彩色笑脸 `face-smile`。
+- **实测验证（2026-11-15）：**
+  - **锁屏、唤醒识别、`sudo`/`polkit` 与向导功能（`0.1-8` / `0.1-9`，真机通过）**：冷启重启后刷脸解锁、`sudo`/`polkit` 自动人脸授权、挡住摄像头退回重试/密码输入、锁屏默认停留在时钟屏保并在唤醒后显示扫描图标解锁、应用启动器打开录入向导与 4 组录入测试均经用户真机实测确认正常；自动 D-Bus 抓包确认锁屏待命 3.5 s 期间仅调 1 次 `SetLockscreenMode(true, false)`、0 次 `Verify`。
+  - **图标修复版本升级（`0.1-10`，真机通过）**：产包 `out/rpmbuild/RPMS/aarch64/opd2413-face-0.1-10.fc45.aarch64.rpm`（SHA-256 `6c32d3eacd16fd89c7e3f4e875d791ed257cf85a929fd10020a3cf5c95e8b0ea`），`desktop-file-validate` clean；平板离线 `dnf upgrade` 替换 `0.1-9` 后 `rpm -V opd2413-face plasma-desktop` 无差异、`/usr/libexec/opd2413/` 无 `__pycache__`、已执行 `kbuildsycoca6` 刷新、`WAYLAND_DEBUG=1` 实测 `wayland-1` 发送 `xdg_toplevel_icon_v1.set_name("face-smile")` 与 7 档位 `wl_buffer`；`opd-face status --user colin` 为 `idle` 且 `enrolled=yes`、`authselect` 为 `opd2413-face with-silent-lastlog with-mdns4`、`lockscreen UI shell overlay: enabled`、`systemctl is-system-running = running`、`--failed = 0`、`ausearch --input-logs -m avc -ts recent = <no matches>`，用户实机确认桌面启动器 `face-smile` 图标显示正常。
