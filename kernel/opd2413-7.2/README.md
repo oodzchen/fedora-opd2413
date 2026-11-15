@@ -61,3 +61,4 @@
 | `7.2.15-18` | 显示与夜览：`2411`（按共享 `hw_ctl` 延后一次 `phys_cleanup`，保持 `phys_0 -> phys_1` 停用顺序）、`2412`（预分配 DSPP 且不因 `ctm` 强制 `mode_changed`）、`2413`（恢复 `60/30 Hz`） |
 | `7.2.15-22` | 显示 `2414`（`dpu_encoder_virt_atomic_disable()` 按 `new_state && new_state->active` 仅对在线 modeset 跳过 `INTF_MODE_VIDEO` 的 `trigger_flush`/`trigger_start`，解决 `-18` 手动 60 Hz 切换卡死与 `-20`/`-21` DPMS 超时互斥；技术债记为 `#36`/`#37`） |
 | `7.2.15-23` | 开机灰闪 `2415`–`2417`（`ktz8866`/`led_bl` 同步真实关断 bootloader 遗留背光，`dispcc-sm8750` 延迟到 `led-backlight` 就绪并关断背光后再注册/停泊 `mdp_clk_src`；TECH-DEBT `#9`） |
+| `7.2.15-24` | 5 GHz 调控域 `m3-wifi-reg.config`（启用 `CONFIG_EXPERT`、`CONFIG_CFG80211_CERTIFICATION_ONUS`、`CONFIG_ATH_REG_DYNAMIC_USER_REG_HINTS`，配合 `/etc/sysconfig/regdomain` `COUNTRY=CN` 支持动态用户调控域提示与非 DFS 5 GHz AP 信道） |
