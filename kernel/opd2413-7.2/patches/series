@@ -107,3 +107,6 @@
 2431-drm-msm-dsi-phy-7nm-program-the-PLL-muxes-on-every-b.patch
 2432-drm-msm-dsi-propagate-clock-failures-and-balance-run.patch
 2433-Revert-drm-panel-nt36536-keep-supplies-on-across-unp.patch
+
+# Boot race fix: q6dsp-lpass-clocks drvdata before clk/provider registration
+2434-ASoC-qcom-qdsp6-set-drvdata-before-registering-clock.patch

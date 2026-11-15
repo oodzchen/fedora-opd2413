@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Kholin <oodzchen@gmail.com>
+Date: Sun, 15 Nov 2026 11:38:30 +0800
+Subject: [PATCH] ASoC: qcom: qdsp6: set drvdata before registering clocks
+
+q6dsp_clock_dev_probe() exposes the LPASS clocks through
+devm_clk_hw_register() and devm_of_clk_add_hw_provider() before calling
+dev_set_drvdata(dev, cc).
+
+If another driver probing in parallel (such as lpass-va-macro requesting
+LPASS_CLK_ID_VA_CORE_MCLK) resolves a clock and calls clk_prepare_enable()
+during the window after devm_of_clk_add_hw_provider() and before
+dev_set_drvdata(), clk_q6dsp_prepare() / clk_vote_q6dsp_block() reads
+dev_get_drvdata(clk->dev) == NULL and dereferences cc->desc (offset 0x348
+on 64-bit). Because clk_prepare_enable() holds the global clk_prepare_lock
+mutex across ops->prepare(), the resulting Oops leaves clk_prepare_lock
+permanently locked and stalls the rest of boot.
+
+Set dev_set_drvdata(dev, cc) as soon as cc is populated, before registering
+any clock hardware or the OF clock provider.
+
+Co-Authored-By: Antigravity <noreply@deepmind.google>
+---
+ sound/soc/qcom/qdsp6/q6dsp-lpass-clocks.c | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/sound/soc/qcom/qdsp6/q6dsp-lpass-clocks.c b/sound/soc/qcom/qdsp6/q6dsp-lpass-clocks.c
+index 03838582a..9b88a3ba0 100644
+--- a/sound/soc/qcom/qdsp6/q6dsp-lpass-clocks.c
++++ b/sound/soc/qcom/qdsp6/q6dsp-lpass-clocks.c
+@@ -144,6 +144,7 @@ int q6dsp_clock_dev_probe(struct platform_device *pdev)
+ 
+ 	cc->desc = desc;
+ 	cc->dev = dev;
++	dev_set_drvdata(dev, cc);
+ 	q6dsp_clks = desc->clks;
+ 
+ 	for (i = 0; i < desc->num_clks; i++) {
+@@ -178,8 +179,6 @@ int q6dsp_clock_dev_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		return ret;
+ 
+-	dev_set_drvdata(dev, cc);
+-
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(q6dsp_clock_dev_probe);
+-- 
+2.52.0
