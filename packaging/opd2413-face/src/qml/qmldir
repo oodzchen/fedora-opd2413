@@ -1,0 +1,3 @@
+module org.opd2413.face
+plugin opd2413faceqml
+classname Opd2413FacePlugin

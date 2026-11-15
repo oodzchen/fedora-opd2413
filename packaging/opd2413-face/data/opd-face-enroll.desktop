@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=OPD2413 Face Unlock Setup
+Name[zh_CN]=人脸解锁录入向导
+GenericName=Face Authentication Setup
+GenericName[zh_CN]=人脸识别设置
+Comment=Enroll and test native face authentication on OPD2413
+Comment[zh_CN]=OPD2413 原生人脸识别录入与实时测试向导
+Exec=/usr/bin/opd-face-enroll
+Icon=face-smile
+Terminal=false
+Categories=Settings;HardwareSettings;Security;
+Keywords=face;unlock;biometric;camera;authentication;

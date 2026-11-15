@@ -1,0 +1,38 @@
+policy_module(opd2413_face, 1.0)
+
+require {
+	type unconfined_service_t;
+	type unconfined_t;
+	type local_login_t;
+	class dbus send_msg;
+}
+
+allow { unconfined_t local_login_t } unconfined_service_t:dbus send_msg;
+allow unconfined_service_t { unconfined_t local_login_t }:dbus send_msg;
+
+optional {
+	require {
+		type xdm_t;
+		class dbus send_msg;
+	}
+	allow xdm_t unconfined_service_t:dbus send_msg;
+	allow unconfined_service_t xdm_t:dbus send_msg;
+}
+
+optional {
+	require {
+		type policykit_auth_t;
+		class dbus send_msg;
+	}
+	allow policykit_auth_t unconfined_service_t:dbus send_msg;
+	allow unconfined_service_t policykit_auth_t:dbus send_msg;
+}
+
+optional {
+	require {
+		type chkpwd_t;
+		class dbus send_msg;
+	}
+	allow chkpwd_t unconfined_service_t:dbus send_msg;
+	allow unconfined_service_t chkpwd_t:dbus send_msg;
+}

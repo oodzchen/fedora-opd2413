@@ -1,0 +1,5 @@
+[D-BUS Service]
+Name=org.opd2413.Face1
+Exec=/usr/libexec/opd2413/opd2413-faced
+User=root
+SystemdService=opd2413-face.service

@@ -1,0 +1,17 @@
+[Unit]
+Description=OPD2413 Native Face Recognition Authentication Service
+Documentation=file:///usr/share/doc/opd2413-face/README.md
+After=systemd-user-sessions.service dbus.service
+
+[Service]
+Type=dbus
+BusName=org.opd2413.Face1
+ExecStart=/usr/libexec/opd2413/opd2413-faced
+Restart=on-failure
+RestartSec=2
+Environment=PYTHONUNBUFFERED=1
+# Run GPU DebayerEGL offscreen on Adreno via EGL surfaceless/GBM without X11/Wayland
+Environment=LIBCAMERA_LOG_LEVELS=*:WARN
+
+[Install]
+WantedBy=multi-user.target
