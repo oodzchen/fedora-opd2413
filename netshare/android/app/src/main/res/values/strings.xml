@@ -1,6 +1,19 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">OPD NetShare</string>
+    <string name="app_subtitle">手机网络共享</string>
     <string name="tile_label">平板网络共享</string>
     <string name="notif_channel_name">跨设备网络共享状态</string>
+
+    <string name="btn_pick_device">选择平板</string>
+    <string name="btn_disconnect">断开连接</string>
+    <string name="btn_check_root">Root 检测</string>
+    <string name="btn_battery">电池白名单</string>
+    <string name="btn_clear_log">清除</string>
+
+    <string name="label_target_device">目标平板</string>
+    <string name="label_target_none">未选择</string>
+    <string name="label_env">运行环境</string>
+    <string name="label_log">运行日志</string>
+    <string name="log_empty">暂无日志</string>
 </resources>

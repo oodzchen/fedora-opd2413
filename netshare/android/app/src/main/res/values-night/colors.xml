@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Surface & Text (Dark) -->
+    <color name="bg_page">#0F141A</color>
+    <color name="bg_card">#181F29</color>
+    <color name="bg_subtle">#232C3A</color>
+    <color name="bg_log">#121820</color>
+    <color name="border_subtle">#2B3647</color>
+    <color name="text_primary">#F3F4F6</color>
+    <color name="text_secondary">#9CA3AF</color>
+    <color name="text_muted">#6B7280</color>
+    <color name="text_log">#D1D5DB</color>
+
+    <!-- Accent & Controls -->
+    <color name="accent_primary">#3B82F6</color>
+    <color name="on_accent_primary">#FFFFFF</color>
+    <color name="ripple_dark">#26FFFFFF</color>
+    <color name="ripple_light">#33FFFFFF</color>
+
+    <!-- Status: DISABLED -->
+    <color name="state_disabled_bg">#1D232C</color>
+    <color name="state_disabled_border">#374151</color>
+    <color name="state_disabled_accent">#9CA3AF</color>
+    <color name="state_disabled_pill_bg">#28303D</color>
+
+    <!-- Status: SCANNING -->
+    <color name="state_scanning_bg">#152238</color>
+    <color name="state_scanning_border">#2563EB</color>
+    <color name="state_scanning_accent">#60A5FA</color>
+    <color name="state_scanning_pill_bg">#1E3A5F</color>
+
+    <!-- Status: CONNECTING -->
+    <color name="state_connecting_bg">#2B1E12</color>
+    <color name="state_connecting_border">#EA580C</color>
+    <color name="state_connecting_accent">#FB923C</color>
+    <color name="state_connecting_pill_bg">#432818</color>
+
+    <!-- Status: CONNECTED -->
+    <color name="state_connected_bg">#12291C</color>
+    <color name="state_connected_border">#16A34A</color>
+    <color name="state_connected_accent">#4ADE80</color>
+    <color name="state_connected_pill_bg">#173B27</color>
+
+    <!-- Status: ERROR -->
+    <color name="state_error_bg">#2E1618</color>
+    <color name="state_error_border">#DC2626</color>
+    <color name="state_error_accent">#F87171</color>
+    <color name="state_error_pill_bg">#451A1E</color>
+
+    <!-- Env Badge -->
+    <color name="badge_ok_bg">#143020</color>
+    <color name="badge_ok_text">#4ADE80</color>
+    <color name="badge_warn_bg">#332411</color>
+    <color name="badge_warn_text">#FBBF24</color>
+    <color name="badge_neutral_bg">#232C3A</color>
+    <color name="badge_neutral_text">#9CA3AF</color>
+</resources>

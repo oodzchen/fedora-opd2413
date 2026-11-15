@@ -12,13 +12,14 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.PackageManager;
-import android.graphics.Typeface;
+import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.PowerManager;
 import android.provider.Settings;
 import android.util.TypedValue;
-import android.view.ViewGroup;
+import android.view.MotionEvent;
+import android.view.View;
 import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
@@ -37,13 +38,40 @@ import java.util.concurrent.TimeUnit;
 public class MainActivity extends Activity {
     private static final int REQ_PERMS = 101;
 
-    private TextView statusView;
-    private TextView targetView;
-    private TextView envView;
+    private static final int ROOT_UNKNOWN = 0;
+    private static final int ROOT_OK = 1;
+    private static final int ROOT_DENIED = 2;
+
+    private LinearLayout statusCard;
+    private View statusDot;
+    private TextView statusTitleView;
+    private TextView statusBadgeView;
+    private TextView statusDetailView;
+    private LinearLayout statusMetaRow;
+    private TextView p2pChip;
+    private TextView upstreamChip;
+
+    private TextView targetNameView;
+    private TextView targetMacView;
+    private Button pickBtn;
+    private Button discBtn;
+
+    private TextView envPermBadge;
+    private TextView envRootBadge;
+    private TextView envBatteryBadge;
+    private Button rootBtn;
+    private Button batBtn;
+
+    private TextView logCountView;
+    private Button clearLogBtn;
+    private ScrollView logScroll;
     private TextView logView;
+    private TextView logEmptyView;
+
     private Switch enableSwitch;
     private boolean updatingSwitch = false;
-    private String rootCheckText = "未检测";
+    private int rootState = ROOT_UNKNOWN;
+    private String lastRenderedLogs = "";
 
     private final BroadcastReceiver stateReceiver = new BroadcastReceiver() {
         @Override
@@ -52,10 +80,29 @@ public class MainActivity extends Activity {
         }
     };
 
+    private static final class StatusVisual {
+        final String title;
+        final String badge;
+        final int bgColor;
+        final int borderColor;
+        final int accentColor;
+        final int pillBgColor;
+
+        StatusVisual(String title, String badge, int bgColor, int borderColor, int accentColor, int pillBgColor) {
+            this.title = title;
+            this.badge = badge;
+            this.bgColor = bgColor;
+            this.borderColor = borderColor;
+            this.accentColor = accentColor;
+            this.pillBgColor = pillBgColor;
+        }
+    }
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        buildLayout();
+        setContentView(R.layout.activity_main);
+        bindViews();
         requestMissingPermissions();
         checkRootAsync(false);
     }
@@ -101,66 +148,48 @@ public class MainActivity extends Activity {
         refreshUi();
     }
 
-    private int dp(int v) {
-        return Math.round(TypedValue.applyDimension(
-                TypedValue.COMPLEX_UNIT_DIP, v, getResources().getDisplayMetrics()));
+    private float dp(float v) {
+        return TypedValue.applyDimension(
+                TypedValue.COMPLEX_UNIT_DIP, v, getResources().getDisplayMetrics());
     }
 
-    private void buildLayout() {
-        ScrollView scroll = new ScrollView(this);
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        int pad = dp(16);
-        root.setPadding(pad, pad, pad, pad);
+    @SuppressLint("ClickableViewAccessibility")
+    private void bindViews() {
+        statusCard = findViewById(R.id.status_card);
+        statusDot = findViewById(R.id.status_dot);
+        statusTitleView = findViewById(R.id.status_title);
+        statusBadgeView = findViewById(R.id.status_badge);
+        statusDetailView = findViewById(R.id.status_detail);
+        statusMetaRow = findViewById(R.id.status_meta_row);
+        p2pChip = findViewById(R.id.p2p_chip);
+        upstreamChip = findViewById(R.id.upstream_chip);
 
-        TextView title = new TextView(this);
-        title.setText("OPD 跨设备网络共享 (手机端)");
-        title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 20);
-        title.setTypeface(null, Typeface.BOLD);
-        root.addView(title);
+        targetNameView = findViewById(R.id.target_name);
+        targetMacView = findViewById(R.id.target_mac);
+        pickBtn = findViewById(R.id.btn_pick_device);
+        discBtn = findViewById(R.id.btn_disconnect);
 
-        statusView = new TextView(this);
-        statusView.setPadding(0, dp(10), 0, dp(6));
-        statusView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
-        root.addView(statusView);
+        envPermBadge = findViewById(R.id.env_perm_badge);
+        envRootBadge = findViewById(R.id.env_root_badge);
+        envBatteryBadge = findViewById(R.id.env_battery_badge);
+        rootBtn = findViewById(R.id.btn_check_root);
+        batBtn = findViewById(R.id.btn_battery);
 
-        targetView = new TextView(this);
-        targetView.setPadding(0, dp(2), 0, dp(6));
-        root.addView(targetView);
+        logCountView = findViewById(R.id.log_count);
+        clearLogBtn = findViewById(R.id.btn_clear_log);
+        logScroll = findViewById(R.id.log_scroll);
+        logView = findViewById(R.id.log_text);
+        logEmptyView = findViewById(R.id.log_empty);
 
-        envView = new TextView(this);
-        envView.setPadding(0, dp(2), 0, dp(10));
-        root.addView(envView);
-
-        enableSwitch = new Switch(this);
-        enableSwitch.setText("自动跨设备网络共享监听");
-        enableSwitch.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
-        enableSwitch.setPadding(0, dp(8), 0, dp(8));
+        enableSwitch = findViewById(R.id.enable_switch);
         enableSwitch.setOnCheckedChangeListener((buttonView, isChecked) -> {
             if (updatingSwitch) {
                 return;
             }
             onToggleChanged(isChecked);
         });
-        root.addView(enableSwitch);
 
-        Button pickBtn = new Button(this);
-        pickBtn.setText("选择已配对平板");
         pickBtn.setOnClickListener(v -> showBondedDevicePicker());
-        root.addView(pickBtn);
-
-        Button rootBtn = new Button(this);
-        rootBtn.setText("检测 Root (KernelSU) 权限");
-        rootBtn.setOnClickListener(v -> checkRootAsync(true));
-        root.addView(rootBtn);
-
-        Button batBtn = new Button(this);
-        batBtn.setText("打开电池优化白名单设置");
-        batBtn.setOnClickListener(v -> openBatterySettings());
-        root.addView(batBtn);
-
-        Button discBtn = new Button(this);
-        discBtn.setText("断开当前 P2P 会话");
         discBtn.setOnClickListener(v -> {
             if (!NetSharePrefs.STATE_DISABLED.equals(NetSharePrefs.getState())) {
                 Intent svc = new Intent(this, NetShareService.class);
@@ -168,25 +197,33 @@ public class MainActivity extends Activity {
                 startService(svc);
             }
         });
-        root.addView(discBtn);
 
-        TextView logHeader = new TextView(this);
-        logHeader.setText("运行日志:");
-        logHeader.setTypeface(null, Typeface.BOLD);
-        logHeader.setPadding(0, dp(12), 0, dp(4));
-        root.addView(logHeader);
+        rootBtn.setOnClickListener(v -> checkRootAsync(true));
+        batBtn.setOnClickListener(v -> openBatterySettings());
 
-        logView = new TextView(this);
-        logView.setTypeface(Typeface.MONOSPACE);
-        logView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
-        logView.setLayoutParams(new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-        ));
-        root.addView(logView);
+        envPermBadge.setOnClickListener(v -> {
+            if (!hasRequiredPermissions()) {
+                requestMissingPermissions();
+            }
+        });
+        envBatteryBadge.setOnClickListener(v -> openBatterySettings());
 
-        scroll.addView(root);
-        setContentView(scroll);
+        clearLogBtn.setOnClickListener(v -> {
+            NetSharePrefs.clearLogs();
+            lastRenderedLogs = "";
+            refreshUi();
+        });
+
+        // Allow independent vertical scrolling inside the embedded log box.
+        logScroll.setOnTouchListener((v, event) -> {
+            int action = event.getActionMasked();
+            if (action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_MOVE) {
+                v.getParent().requestDisallowInterceptTouchEvent(true);
+            } else if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+                v.getParent().requestDisallowInterceptTouchEvent(false);
+            }
+            return false;
+        });
     }
 
     private void onToggleChanged(boolean wantOn) {
@@ -259,7 +296,7 @@ public class MainActivity extends Activity {
         if (bonded == null || bonded.isEmpty()) {
             new AlertDialog.Builder(this)
                     .setTitle("无已配对设备")
-                    .setMessage("请先在系统蓝牙设置中与平板配对，然后再回来选择。")
+                    .setMessage("请先在系统蓝牙设置中与平板配对，再回来选择。")
                     .setPositiveButton("确定", null)
                     .show();
             return;
@@ -290,6 +327,7 @@ public class MainActivity extends Activity {
 
     private void checkRootAsync(boolean showToast) {
         new Thread(() -> {
+            boolean ok = false;
             String resText;
             try {
                 Process p = new ProcessBuilder("su", "-c", "id").redirectErrorStream(true).start();
@@ -301,14 +339,15 @@ public class MainActivity extends Activity {
                         out.append(l);
                     }
                 }
-                boolean ok = p.waitFor(8, TimeUnit.SECONDS) && p.exitValue() == 0 && out.toString().contains("uid=0");
+                ok = p.waitFor(8, TimeUnit.SECONDS) && p.exitValue() == 0 && out.toString().contains("uid=0");
                 resText = ok ? "已授权 (" + out + ")" : "未授权 (" + out + ")";
             } catch (Exception e) {
                 resText = "失败: " + e.getMessage();
             }
-            String finalText = resText;
+            final int nextState = ok ? ROOT_OK : ROOT_DENIED;
+            final String finalText = resText;
             runOnUiThread(() -> {
-                rootCheckText = finalText;
+                rootState = nextState;
                 refreshUi();
                 if (showToast) {
                     Toast.makeText(this, "Root: " + finalText, Toast.LENGTH_LONG).show();
@@ -328,6 +367,93 @@ public class MainActivity extends Activity {
         }
     }
 
+    private StatusVisual resolveStatusVisual(String state) {
+        if (NetSharePrefs.STATE_CONNECTED.equals(state)) {
+            return new StatusVisual(
+                    "已连接",
+                    "CONNECTED",
+                    getColor(R.color.state_connected_bg),
+                    getColor(R.color.state_connected_border),
+                    getColor(R.color.state_connected_accent),
+                    getColor(R.color.state_connected_pill_bg)
+            );
+        }
+        if (NetSharePrefs.STATE_CONNECTING.equals(state)) {
+            return new StatusVisual(
+                    "连接中",
+                    "CONNECTING",
+                    getColor(R.color.state_connecting_bg),
+                    getColor(R.color.state_connecting_border),
+                    getColor(R.color.state_connecting_accent),
+                    getColor(R.color.state_connecting_pill_bg)
+            );
+        }
+        if (NetSharePrefs.STATE_SCANNING.equals(state)) {
+            return new StatusVisual(
+                    "待命中",
+                    "SCANNING",
+                    getColor(R.color.state_scanning_bg),
+                    getColor(R.color.state_scanning_border),
+                    getColor(R.color.state_scanning_accent),
+                    getColor(R.color.state_scanning_pill_bg)
+            );
+        }
+        if (NetSharePrefs.STATE_ERROR.equals(state)) {
+            return new StatusVisual(
+                    "连接异常",
+                    "ERROR",
+                    getColor(R.color.state_error_bg),
+                    getColor(R.color.state_error_border),
+                    getColor(R.color.state_error_accent),
+                    getColor(R.color.state_error_pill_bg)
+            );
+        }
+        return new StatusVisual(
+                "未开启",
+                "IDLE",
+                getColor(R.color.state_disabled_bg),
+                getColor(R.color.state_disabled_border),
+                getColor(R.color.state_disabled_accent),
+                getColor(R.color.state_disabled_pill_bg)
+        );
+    }
+
+    private void applyCardBackground(View view, int fillColor, int strokeColor) {
+        GradientDrawable gd = new GradientDrawable();
+        gd.setShape(GradientDrawable.RECTANGLE);
+        gd.setCornerRadius(dp(14));
+        gd.setColor(fillColor);
+        gd.setStroke(Math.max(1, Math.round(dp(1.5f))), strokeColor);
+        view.setBackground(gd);
+    }
+
+    private void applyDotColor(View view, int color) {
+        GradientDrawable gd = new GradientDrawable();
+        gd.setShape(GradientDrawable.OVAL);
+        gd.setColor(color);
+        view.setBackground(gd);
+    }
+
+    private void stylePill(TextView view, int bgColor, int textColor) {
+        GradientDrawable gd = new GradientDrawable();
+        gd.setShape(GradientDrawable.RECTANGLE);
+        gd.setCornerRadius(dp(999));
+        gd.setColor(bgColor);
+        view.setBackground(gd);
+        view.setTextColor(textColor);
+    }
+
+    private void styleEnvBadge(TextView view, boolean ok, boolean known, String text) {
+        view.setText(text);
+        if (!known) {
+            stylePill(view, getColor(R.color.badge_neutral_bg), getColor(R.color.badge_neutral_text));
+        } else if (ok) {
+            stylePill(view, getColor(R.color.badge_ok_bg), getColor(R.color.badge_ok_text));
+        } else {
+            stylePill(view, getColor(R.color.badge_warn_bg), getColor(R.color.badge_warn_text));
+        }
+    }
+
     private void refreshUi() {
         boolean enabled = NetSharePrefs.isEnabled(this);
         updatingSwitch = true;
@@ -338,20 +464,85 @@ public class MainActivity extends Activity {
         String detail = NetSharePrefs.getDetail();
         String p2p = NetSharePrefs.getP2pIp();
         String up = NetSharePrefs.getUpstream();
-        statusView.setText("状态: " + st + " - " + detail
-                + (p2p.isEmpty() ? "" : ("\nP2P IP: " + p2p))
-                + (up.isEmpty() ? "" : (" | 物理出口: " + up)));
+
+        StatusVisual vis = resolveStatusVisual(st);
+        applyCardBackground(statusCard, vis.bgColor, vis.borderColor);
+        applyDotColor(statusDot, vis.accentColor);
+        statusTitleView.setText(vis.title);
+        statusTitleView.setTextColor(vis.accentColor);
+        statusBadgeView.setText(vis.badge);
+        stylePill(statusBadgeView, vis.pillBgColor, vis.accentColor);
+        statusDetailView.setText(detail.isEmpty() ? vis.title : detail);
+
+        boolean hasP2p = !p2p.isEmpty();
+        boolean hasUp = !up.isEmpty() && !"none".equals(up);
+        if (hasP2p || hasUp) {
+            statusMetaRow.setVisibility(View.VISIBLE);
+            if (hasP2p) {
+                p2pChip.setVisibility(View.VISIBLE);
+                p2pChip.setText("P2P " + p2p);
+                stylePill(p2pChip, vis.pillBgColor, vis.accentColor);
+            } else {
+                p2pChip.setVisibility(View.GONE);
+            }
+            if (hasUp) {
+                upstreamChip.setVisibility(View.VISIBLE);
+                upstreamChip.setText("出口 " + up);
+                stylePill(upstreamChip, vis.pillBgColor, vis.accentColor);
+            } else {
+                upstreamChip.setVisibility(View.GONE);
+            }
+        } else {
+            statusMetaRow.setVisibility(View.GONE);
+        }
+
+        boolean canDisconnect = !NetSharePrefs.STATE_DISABLED.equals(st);
+        discBtn.setEnabled(canDisconnect);
+        discBtn.setAlpha(canDisconnect ? 1.0f : 0.45f);
 
         String mac = NetSharePrefs.getTargetMac(this);
         String name = NetSharePrefs.getTargetName(this);
-        targetView.setText("目标平板: " + (mac.isEmpty() ? "未选择" : (name + " (" + mac + ")")));
+        if (mac.isEmpty()) {
+            targetNameView.setText(R.string.label_target_none);
+            targetMacView.setVisibility(View.GONE);
+        } else {
+            targetNameView.setText(name.isEmpty() ? mac : name);
+            targetMacView.setText(mac);
+            targetMacView.setVisibility(View.VISIBLE);
+        }
+
+        boolean permOk = hasRequiredPermissions();
+        styleEnvBadge(envPermBadge, permOk, true, permOk ? "权限 已授权" : "权限 未授权");
+
+        if (rootState == ROOT_UNKNOWN) {
+            styleEnvBadge(envRootBadge, false, false, "Root 检测中");
+        } else {
+            styleEnvBadge(envRootBadge, rootState == ROOT_OK, true,
+                    rootState == ROOT_OK ? "Root 正常" : "Root 未授权");
+        }
 
         PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
         boolean batExempt = pm != null && pm.isIgnoringBatteryOptimizations(getPackageName());
-        envView.setText("权限: " + (hasRequiredPermissions() ? "已授予" : "未授予")
-                + " | Root: " + rootCheckText
-                + " | 电池白名单: " + (batExempt ? "已放行" : "未放行"));
+        styleEnvBadge(envBatteryBadge, batExempt, true, batExempt ? "电池 已放行" : "电池 受限");
 
-        logView.setText(NetSharePrefs.getLogsText());
+        int count = NetSharePrefs.getLogCount();
+        logCountView.setText(count > 0 ? "(" + count + ")" : "");
+        clearLogBtn.setEnabled(count > 0);
+        clearLogBtn.setAlpha(count > 0 ? 1.0f : 0.45f);
+
+        String logs = NetSharePrefs.getLogsText();
+        String displayLogs = logs.endsWith("\n") ? logs.substring(0, logs.length() - 1) : logs;
+        if (displayLogs.isEmpty()) {
+            logView.setText("");
+            logEmptyView.setVisibility(View.VISIBLE);
+            lastRenderedLogs = "";
+        } else {
+            logEmptyView.setVisibility(View.GONE);
+            if (!displayLogs.equals(lastRenderedLogs)) {
+                lastRenderedLogs = displayLogs;
+                logView.setText(displayLogs);
+                logScroll.post(() -> logScroll.fullScroll(View.FOCUS_DOWN));
+            }
+        }
     }
 }

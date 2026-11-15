@@ -114,4 +114,16 @@ public final class NetSharePrefs {
             return sb.toString();
         }
     }
+
+    public static int getLogCount() {
+        synchronized (LOG_LOCK) {
+            return LOGS.size();
+        }
+    }
+
+    public static void clearLogs() {
+        synchronized (LOG_LOCK) {
+            LOGS.clear();
+        }
+    }
 }

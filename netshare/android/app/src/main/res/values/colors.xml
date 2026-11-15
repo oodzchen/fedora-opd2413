@@ -1,4 +1,59 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <color name="ic_launcher_background">#FFFFFF</color>
+
+    <!-- Surface & Text (Light) -->
+    <color name="bg_page">#F5F7FA</color>
+    <color name="bg_card">#FFFFFF</color>
+    <color name="bg_subtle">#EEF1F6</color>
+    <color name="bg_log">#F8FAFC</color>
+    <color name="border_subtle">#E2E8F0</color>
+    <color name="text_primary">#111827</color>
+    <color name="text_secondary">#4B5563</color>
+    <color name="text_muted">#9CA3AF</color>
+    <color name="text_log">#1F2937</color>
+
+    <!-- Accent & Controls -->
+    <color name="accent_primary">#2563EB</color>
+    <color name="on_accent_primary">#FFFFFF</color>
+    <color name="ripple_dark">#1F000000</color>
+    <color name="ripple_light">#33FFFFFF</color>
+
+    <!-- Status: DISABLED -->
+    <color name="state_disabled_bg">#F1F3F5</color>
+    <color name="state_disabled_border">#D1D5DB</color>
+    <color name="state_disabled_accent">#6B7280</color>
+    <color name="state_disabled_pill_bg">#E5E7EB</color>
+
+    <!-- Status: SCANNING -->
+    <color name="state_scanning_bg">#EDF4FF</color>
+    <color name="state_scanning_border">#93C5FD</color>
+    <color name="state_scanning_accent">#1D4ED8</color>
+    <color name="state_scanning_pill_bg">#DBEAFE</color>
+
+    <!-- Status: CONNECTING -->
+    <color name="state_connecting_bg">#FFF4E5</color>
+    <color name="state_connecting_border">#FDBA74</color>
+    <color name="state_connecting_accent">#C2410C</color>
+    <color name="state_connecting_pill_bg">#FFEDD5</color>
+
+    <!-- Status: CONNECTED -->
+    <color name="state_connected_bg">#E8F7EE</color>
+    <color name="state_connected_border">#86EFAC</color>
+    <color name="state_connected_accent">#15803D</color>
+    <color name="state_connected_pill_bg">#DCFCE7</color>
+
+    <!-- Status: ERROR -->
+    <color name="state_error_bg">#FEF2F2</color>
+    <color name="state_error_border">#FCA5A5</color>
+    <color name="state_error_accent">#B91C1C</color>
+    <color name="state_error_pill_bg">#FEE2E2</color>
+
+    <!-- Env Badge -->
+    <color name="badge_ok_bg">#E8F7EE</color>
+    <color name="badge_ok_text">#15803D</color>
+    <color name="badge_warn_bg">#FEF3C7</color>
+    <color name="badge_warn_text">#B45309</color>
+    <color name="badge_neutral_bg">#EEF1F6</color>
+    <color name="badge_neutral_text">#4B5563</color>
 </resources>
