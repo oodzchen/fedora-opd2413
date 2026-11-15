@@ -44,11 +44,22 @@ install -D -m 0644 %{srcdir}/systemd/opd-netshare.service %{buildroot}%{_unitdir
 install -D -m 0644 %{srcdir}/desktop/opd-netshare.desktop %{buildroot}%{_datadir}/applications/opd-netshare.desktop
 install -D -m 0644 %{srcdir}/desktop/opd-netshare-tray.desktop %{buildroot}%{_sysconfdir}/xdg/autostart/opd-netshare-tray.desktop
 install -D -m 0644 %{srcdir}/wireplumber/50-opd2413-bt-roles.conf %{buildroot}%{_datadir}/wireplumber/wireplumber.conf.d/50-opd2413-bt-roles.conf
+for sz in 48 64 128 256; do
+    install -D -m 0644 %{srcdir}/icons/hicolor/${sz}x${sz}/apps/opd-netshare.png \
+        %{buildroot}%{_datadir}/icons/hicolor/${sz}x${sz}/apps/opd-netshare.png
+done
+for name in tray_black tray_green tray_yellow; do
+    install -D -m 0644 %{srcdir}/icons/tray/${name}.png \
+        %{buildroot}%{_datadir}/opd2413/netshare/icons/tray/${name}.png
+done
 
 %post
 systemctl daemon-reload >/dev/null 2>&1 || :
 systemctl reload dbus.service >/dev/null 2>&1 || :
 systemctl reload NetworkManager.service >/dev/null 2>&1 || :
+touch --no-create %{_datadir}/icons/hicolor >/dev/null 2>&1 || :
+gtk-update-icon-cache -q %{_datadir}/icons/hicolor >/dev/null 2>&1 || :
+update-desktop-database -q %{_datadir}/applications >/dev/null 2>&1 || :
 if [ "$1" -eq 1 ]; then
     systemctl enable opd-netshare.service >/dev/null 2>&1 || :
 elif [ "$1" -ge 2 ]; then
@@ -62,6 +73,9 @@ fi
 
 %postun
 systemctl daemon-reload >/dev/null 2>&1 || :
+touch --no-create %{_datadir}/icons/hicolor >/dev/null 2>&1 || :
+gtk-update-icon-cache -q %{_datadir}/icons/hicolor >/dev/null 2>&1 || :
+update-desktop-database -q %{_datadir}/applications >/dev/null 2>&1 || :
 
 %files
 %dir %{_libexecdir}/opd2413
@@ -77,3 +91,9 @@ systemctl daemon-reload >/dev/null 2>&1 || :
 %{_datadir}/applications/opd-netshare.desktop
 %{_sysconfdir}/xdg/autostart/opd-netshare-tray.desktop
 %{_datadir}/wireplumber/wireplumber.conf.d/50-opd2413-bt-roles.conf
+%{_datadir}/icons/hicolor/*/apps/opd-netshare.png
+%dir %{_datadir}/opd2413
+%dir %{_datadir}/opd2413/netshare
+%dir %{_datadir}/opd2413/netshare/icons
+%dir %{_datadir}/opd2413/netshare/icons/tray
+%{_datadir}/opd2413/netshare/icons/tray/*.png

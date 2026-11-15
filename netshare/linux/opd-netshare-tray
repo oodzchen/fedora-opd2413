@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 import signal
 import sys
 import threading
@@ -13,7 +14,7 @@ gi.require_version("Gio", "2.0")
 from gi.repository import Gio, GLib  # noqa: E402
 
 from PySide6.QtCore import QObject, Qt, Signal  # noqa: E402
-from PySide6.QtGui import QAction, QActionGroup, QColor, QIcon, QPainter, QPixmap  # noqa: E402
+from PySide6.QtGui import QAction, QActionGroup, QIcon, QPainter, QPixmap  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
     QApplication,
     QDialog,
@@ -30,6 +31,9 @@ from PySide6.QtWidgets import (  # noqa: E402
 
 BUS_NAME = "local.opd2413.NetShare"
 OBJ_PATH = "/local/opd2413/NetShare"
+SYSTEM_ICON_DIR = Path("/usr/share/opd2413/netshare/icons")
+SYSTEM_HICOLOR_DIR = Path("/usr/share/icons/hicolor")
+LOCAL_ICON_DIR = Path(__file__).resolve().parent / "icons"
 
 
 def fmt_bytes(n: int) -> str:
@@ -41,20 +45,49 @@ def fmt_bytes(n: int) -> str:
     return f"{val:.1f} GiB"
 
 
-def make_badge_icon(color_hex: str, ring_hex: str = "#ffffff") -> QIcon:
-    pix = QPixmap(64, 64)
-    pix.fill(Qt.GlobalColor.transparent)
-    p = QPainter(pix)
-    p.setRenderHint(QPainter.RenderHint.Antialiasing)
-    p.setPen(Qt.PenStyle.NoPen)
-    p.setBrush(QColor(ring_hex))
-    p.drawEllipse(6, 6, 52, 52)
-    p.setBrush(QColor(color_hex))
-    p.drawEllipse(11, 11, 42, 42)
-    p.setBrush(QColor("#ffffff"))
-    p.drawEllipse(25, 25, 14, 14)
-    p.end()
-    return QIcon(pix)
+def _make_dimmed_icon(pix: QPixmap, opacity: float = 0.40) -> QIcon:
+    """Return a translucent copy of pix so 'off' stays visually distinct from 'idle'."""
+    if pix.isNull():
+        return QIcon()
+    out = QPixmap(pix.size())
+    out.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(out)
+    painter.setOpacity(opacity)
+    painter.drawPixmap(0, 0, pix)
+    painter.end()
+    return QIcon(out)
+
+
+def load_app_icon() -> QIcon:
+    """Load multi-size OPD NetShare application icon, falling back to local checkout."""
+    icon = QIcon()
+    for base in (SYSTEM_HICOLOR_DIR, LOCAL_ICON_DIR / "hicolor"):
+        added = False
+        for sz in (48, 64, 128, 256):
+            p = base / f"{sz}x{sz}/apps/opd-netshare.png"
+            if p.is_file():
+                icon.addFile(str(p))
+                added = True
+        if added:
+            return icon
+    return QIcon.fromTheme("opd-netshare")
+
+
+def load_tray_icons() -> dict[str, QIcon]:
+    """Load state-specific tray PNG icons; derive dimmed 'off' variant from tray_black."""
+    tray_dir = SYSTEM_ICON_DIR / "tray"
+    if not tray_dir.is_dir():
+        tray_dir = LOCAL_ICON_DIR / "tray"
+
+    black_pix = QPixmap(str(tray_dir / "tray_black.png"))
+    green_pix = QPixmap(str(tray_dir / "tray_green.png"))
+    yellow_pix = QPixmap(str(tray_dir / "tray_yellow.png"))
+    return {
+        "connected": QIcon(green_pix),
+        "advertising": QIcon(yellow_pix),
+        "idle": QIcon(black_pix),
+        "off": _make_dimmed_icon(black_pix, 0.40),
+    }
 
 
 class DbusBridge(QObject):
@@ -168,6 +201,9 @@ class StatusDialog(QDialog):
         super().__init__()
         self.bridge = bridge
         self.setWindowTitle("OPD2413 设备网络共享")
+        app = QApplication.instance()
+        if app is not None and not app.windowIcon().isNull():
+            self.setWindowIcon(app.windowIcon())
         self.resize(440, 360)
 
         layout = QVBoxLayout(self)
@@ -265,12 +301,7 @@ class TrayController:
         self.dialog = StatusDialog(self.bridge)
         self.last_state = ""
 
-        self.icons = {
-            "connected": make_badge_icon("#22c55e"),
-            "advertising": make_badge_icon("#f59e0b"),
-            "idle": make_badge_icon("#3b82f6"),
-            "off": make_badge_icon("#6b7280"),
-        }
+        self.icons = load_tray_icons()
 
         self.tray = QSystemTrayIcon(self.icons["idle"], self.app)
         self.menu = QMenu()
@@ -356,6 +387,13 @@ class TrayController:
 def main() -> int:
     signal.signal(signal.SIGINT, signal.SIG_DFL)
     app = QApplication(sys.argv)
+    app.setApplicationName("opd-netshare")
+    app.setApplicationDisplayName("OPD 跨设备网络共享")
+    # Match /usr/share/applications/opd-netshare.desktop so Wayland sets app_id properly.
+    app.setDesktopFileName("opd-netshare")
+    app_icon = load_app_icon()
+    if not app_icon.isNull():
+        app.setWindowIcon(app_icon)
     app.setQuitOnLastWindowClosed(False)
     _ctrl = TrayController(app)
     return app.exec()
