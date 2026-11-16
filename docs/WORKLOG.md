@@ -2219,7 +2219,25 @@ mpv、Firefox 仍是软解（Fedora `ffmpeg-free` 的专利限制），用户选
      - 定位到桌面端多次切换后复现连续组网失败的原因：1）`helper.sh` `cmd_down` 反复调用 `cmd wifip2p deinit` 且 `cmd_up` 仅 `sleep 0.1`，叠加 160 轮轮询超过 `28 s` 触发 `helper timeout` 强杀后未做 `cancel-connect`；2）平板端 `5180 MHz` 遇邻居 BSS 重叠切换主信道至 `5200 MHz` 时仍向手机下发 `5180`；3）候选信道耗尽重置会话时未清空 `failed_freqs`（`180 s` 冷却残留导致下次只试 1 次即中断）。
      - 已修复：平板端读取实际 `iw dev p2p0 info` 信道并在候选耗尽时清空 `failed_freqs`（冷却缩至 `60 s`）；`helper.sh` 去掉 `cmd_down` 的 `deinit`、新增 `ensure_p2p_ready` 与 `cmd_cancel`、以墙钟 `16 s` 上限避免 `helper timeout`；`NetShareService` 增加扫描防抖与超时 `cancel`。重跑 `tests/netshare-daemon-test.py`（4/4 `OK`），编译并经 `pkexec dnf` 安装 `opd2413-netshare-0.1-10.noarch`，同时重编 `out/netshare/opd-netshare.apk`（`114K`，同密钥可覆盖安装）。
   5. **双端连续切换、耗时拆解与锁屏后台验收（2026-11-16 真机通过）**：
-     - 手机覆盖安装新版 APK 后，用户多次切换桌面模式均可稳定恢复连接（`5745 MHz` 一次成功、`IPv6` 同步生效）；耗时拆解确认 BLE+RFCOMM 发现仅 `~1–2 s`、平板按需起 AP `~1 s`，主要耗时约 `11–12 s` 位于 Android `WifiP2pService` 扫频入组与 `~3–4 s` `DhcpClient` 取址（合计约 `15–16 s`）。
+     - 手机覆盖安装新版 APK 后，用户多次切换桌面模式均可稳定恢复连接（`5745 MHz` 一次成功、`IPv6` 同步生效）；初始耗时拆解确认 BLE+RFCOMM 发现仅 `~1–2 s`、平板按需起 AP `~1 s`，而 `RFCOMM hello` 至组网完成仍需约 `15–17 s`（随后经手机端 `adb` + `dumpsys wifip2p` 进一步追查精确定位，见下条）。
      - **锁屏后台对比实测**：未在 ColorOS 最近任务锁卡时，锁屏静置一段时间后仍会被 ColorOS 强制冻结直至打开手机；**将 `OPD NetShare` 在最近任务栏锁定后再次锁屏静置，平板断开再切回 `auto` 模式可在手机不解锁/不打开 App 的情况下后台自动拉起建连**（同步更新 [TECH-DEBT.md](TECH-DEBT.md) `#40` 与 `#41`）。
+
+### `opd2413-netshare-0.1-11` 连接速度根因定位与 P2P ADB 调试联动（2026-11-16，真机通过）
+
+- **上机测试前预期与判据：**
+  1. **设备写入边界**：在平板安装 `android-tools` 后经仅限 P2P 网关的白名单防火墙端口建立手机 `adb` 只读诊断，确认根因并与用户确认修改范围后：重编并覆盖安装 `out/netshare/opd-netshare.apk` 至手机，通过 `pkexec dnf` 升级平板 `opd2413-netshare-0.1-11.noarch`。
+  2. **根因与优化预期**：
+     - 手机端：`get_sta_freq()` 在 `wlan0` 未连接时会回退调用 `/vendor/bin/wpa_cli`，受 ColorOS SELinux 拒绝 `hal_wifi_supplicant_default` 向 `su` (`u:r:ksu:s0`) 回包（`avc: denied { sendto }`）影响每次超时卡死 **10.055 s**（失败重试更卡 20.1 s）；移除 `wpa_cli` 回退并仅在失败分支按需读取 `iw`、`hello` 阶段优先读取 Android `WifiInfo.getFrequency()`、已处 `InactiveState` 时跳过冗余 `cancel-connect`/`remove-group`、通过 `/proc/sys/net/ipv6/conf/p2p0/dad_transmits=0` 消除链路本地地址 `tentative` 等待、借助状态脏标记与 `/dev/.opdlink_v6nat_ok` 缓存省去重复 `iptables`/`ip6tables` 清理与无效 `ip6tables -t nat` 试探，并在 APK 与 `helper.sh` 中集成仅放行 P2P 网关（`192.168.49.1`）的 `adb-on`/`adb-off`/`adb-status` 开关。
+     - 平板端：`dnsmasq` 启动参数增加 `--no-ping` 消除首次 `DHCPDISCOVER` 默认 ICMP ping 探活造成的 **3.005 s** 硬延迟；`_start_ap()` 用 `_drain_proc_log` 触发的 `AP-ENABLED` 事件替换 `0.15 s` 慢轮询与固定 `sleep(0.2)`，并将 `firewall-cmd --zone=trusted` 与 `wpa_supplicant` 启动并行执行。
+  3. **判据**：离线执行 `sh -n helper.sh` 与 `python3 tests/netshare-daemon-test.py`（5/5）全通过；真机双端升级后，`RFCOMM hello` 至 IPv4 + IPv6 全双栈就绪时间由约 `16.9 s` 缩短至 `~2 s` 左右，公网 IPv6 连通与 `5745 MHz / 80 MHz` 链路正常。
+- **离线检验与构建：**
+  - `sh -n netshare/android/app/src/main/assets/helper.sh`、`python3 tests/netshare-daemon-test.py`（`Ran 5 tests in 0.002s OK`）、`./tools/build-netshare-rpm.sh 0.1 11` 与 `bash netshare/android/build-apk.sh`（生成 `out/netshare/opd-netshare.apk` `114K`，v3 签名校验通过）全部一次通过。
+- **实机验证结果（2026-11-16 真机通过，证据位置：`journalctl -u opd-netshare`、手机 `dumpsys wifip2p` / `helper.sh adb-status`）：**
+  1. **耗时对比实测（`RFCOMM hello` -> 双栈就绪，缩短 8.3 倍）**：
+     - 平板 `_start_ap`：`0.93 s` -> **`0.542 s`**（`18:27:33.191 -> 18:27:33.733`）。
+     - P2P 建组至 `DHCPACK`：`17:35` 旧版 `10.7 s (卡死+清理) + 1.55 s (CONNECT) + 3.07 s (DHCP)` -> 本次实测 **`0.694 s`**（`Sent credentials 18:27:33.741 -> DHCPACK 18:27:34.427`；手机 `WifiP2pMetrics` 组网耗时 `459 ms`，`dnsmasq` 在收到 `DHCPDISCOVER` 后 `23 ms` 内即完成 `DHCPACK`）。
+     - IPv4 恢复与 IPv6 双栈总耗时：`RFCOMM hello` 后 **`1.251 s`** 平板即接入 `192.168.49.x` IPv4 网络（`18:27:34.442`），**`2.042 s`** 完成全部 `iptables`/`ip6tables`/路由切换进入双栈可用状态（`18:27:35.233`，含首次写入 `/dev/.opdlink_v6nat_ok=0` 与 `p2p0` `dad_transmits=0`）。
+  2. **功能与连通复核**：`opd-netshare status` 显示 `State: connected`、`5745 MHz`、`576.4 MBit/s 80MHz HE-MCS 5 NSS 2`；`ping -6 -c 2 2400:3200::1` 返回 `0% packet loss`（`62.5 / 66.0 ms`）；手机端 `helper.sh adb-status` 正常响应，APK 新增的顶部环境栏 `P2P ADB` 开关编译并装机就绪。
+
 
 

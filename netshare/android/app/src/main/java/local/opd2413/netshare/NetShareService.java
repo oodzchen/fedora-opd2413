@@ -31,6 +31,8 @@ import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.net.NetworkRequest;
 import android.net.RouteInfo;
+import android.net.TransportInfo;
+import android.net.wifi.WifiInfo;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
@@ -44,10 +46,7 @@ import android.content.ComponentName;
 import org.json.JSONObject;
 
 import java.io.BufferedReader;
-import java.io.File;
-import java.io.FileOutputStream;
 import java.io.IOException;
-import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStreamWriter;
 import java.net.Inet6Address;
@@ -95,6 +94,7 @@ public class NetShareService extends Service {
     private String currentBestV6If = "none";
     private String currentBestTabletV6 = "";
     private boolean currentBestIsWifi = false;
+    private int currentBestWifiFreq = 0;
 
     private volatile boolean scanning = false;
     private volatile boolean burstScanning = false;
@@ -119,18 +119,9 @@ public class NetShareService extends Service {
         String v4Iface = "";
         String tabletV6 = "";
         boolean wifi;
+        int wifiFreq;
         boolean cellular;
         boolean validated;
-    }
-
-    private static final class ExecResult {
-        final int code;
-        final String output;
-
-        ExecResult(int code, String output) {
-            this.code = code;
-            this.output = output;
-        }
     }
 
     private final BroadcastReceiver btStateReceiver = new BroadcastReceiver() {
@@ -506,66 +497,18 @@ public class NetShareService extends Service {
     }
 
     private String extractHelper() {
-        File dst = new File(getFilesDir(), "helper.sh");
-        try (InputStream in = getAssets().open("helper.sh");
-             FileOutputStream out = new FileOutputStream(dst, false)) {
-            byte[] buf = new byte[4096];
-            int n;
-            while ((n = in.read(buf)) > 0) {
-                out.write(buf, 0, n);
-            }
-            out.flush();
-        } catch (IOException e) {
-            log("释放 helper.sh 失败: " + e.getMessage());
-            return "";
+        String p = NetSharePrefs.ensureHelperExtracted(this);
+        if (p.isEmpty()) {
+            log("释放 helper.sh 失败");
         }
-        dst.setReadable(true, false);
-        dst.setExecutable(true, false);
-        return dst.getAbsolutePath();
+        return p;
     }
 
-    private ExecResult runHelper(String... args) {
+    private NetSharePrefs.HelperExecResult runHelper(String... args) {
         if (helperPath.isEmpty()) {
             helperPath = extractHelper();
         }
-        if (helperPath.isEmpty()) {
-            return new ExecResult(1, "helper.sh missing");
-        }
-        StringBuilder cmd = new StringBuilder();
-        cmd.append("/system/bin/sh '").append(helperPath.replace("'", "")).append("'");
-        for (String a : args) {
-            cmd.append(" '").append(a.replace("'", "")).append("'");
-        }
-        try {
-            Process proc = new ProcessBuilder("su", "-c", cmd.toString())
-                    .redirectErrorStream(true)
-                    .start();
-            StringBuilder out = new StringBuilder();
-            Thread reader = new Thread(() -> {
-                try (BufferedReader br = new BufferedReader(
-                        new InputStreamReader(proc.getInputStream(), StandardCharsets.UTF_8))) {
-                    String line;
-                    while ((line = br.readLine()) != null) {
-                        if (out.length() > 0) {
-                            out.append('\n');
-                        }
-                        out.append(line);
-                    }
-                } catch (IOException ignored) {
-                }
-            });
-            reader.start();
-            boolean finished = proc.waitFor(28, TimeUnit.SECONDS);
-            if (!finished) {
-                proc.destroyForcibly();
-                reader.join(1000);
-                return new ExecResult(124, "helper timeout");
-            }
-            reader.join(1000);
-            return new ExecResult(proc.exitValue(), out.toString().trim());
-        } catch (Exception e) {
-            return new ExecResult(1, e.getMessage() == null ? "exec error" : e.getMessage());
-        }
+        return NetSharePrefs.runSuHelper(helperPath, 28, args);
     }
 
     @SuppressLint("MissingPermission")
@@ -824,12 +767,27 @@ public class NetShareService extends Service {
                 p.v4Iface = extractStackedV4(lp);
                 p.tabletV6 = extractTabletV6(lp);
                 p.wifi = caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI);
+                p.wifiFreq = extractWifiFreq(caps);
                 p.cellular = caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR);
                 p.validated = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED);
                 physNets.put(n, p);
             }
             recomputeUpstreamLocked();
         }
+    }
+
+    private static int extractWifiFreq(NetworkCapabilities caps) {
+        if (caps == null || !caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+            return 0;
+        }
+        TransportInfo ti = caps.getTransportInfo();
+        if (ti instanceof WifiInfo) {
+            int freq = ((WifiInfo) ti).getFrequency();
+            if (freq >= 2400 && freq <= 7200) {
+                return freq;
+            }
+        }
+        return 0;
     }
 
     private void updateNetworkRecord(Network network) {
@@ -868,6 +826,7 @@ public class NetShareService extends Service {
             p.v4Iface = extractStackedV4(lp);
             p.tabletV6 = extractTabletV6(lp);
             p.wifi = caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI);
+            p.wifiFreq = extractWifiFreq(caps);
             p.cellular = caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR);
             p.validated = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED);
             physNets.put(network, p);
@@ -890,6 +849,7 @@ public class NetShareService extends Service {
         String bestV6If = "none";
         String bestTabletV6 = "";
         boolean bestIsWifi = false;
+        int bestWifiFreq = 0;
         int bestScore = -1;
         for (PhysNet p : physNets.values()) {
             String candidate = !p.v4Iface.isEmpty() ? p.v4Iface : p.iface;
@@ -919,6 +879,7 @@ public class NetShareService extends Service {
                 bestV6If = !p.tabletV6.isEmpty() ? p.iface : "none";
                 bestTabletV6 = p.tabletV6;
                 bestIsWifi = p.wifi;
+                bestWifiFreq = p.wifiFreq;
             }
         }
         String prev = currentBestUpstream;
@@ -928,6 +889,7 @@ public class NetShareService extends Service {
         currentBestV6If = bestV6If;
         currentBestTabletV6 = bestTabletV6;
         currentBestIsWifi = bestIsWifi;
+        currentBestWifiFreq = bestWifiFreq;
         boolean v4Changed = !best.equals(prev);
         boolean v6Changed = !bestV6If.equals(prevV6If) || !bestTabletV6.equals(prevV6Ip);
         boolean needRetryActiveNone = p2pActive && !"none".equals(best)
@@ -946,7 +908,7 @@ public class NetShareService extends Service {
                     if (!p2pActive) {
                         return;
                     }
-                    ExecResult res = runHelper(
+                    NetSharePrefs.HelperExecResult res = runHelper(
                             "switch",
                             target,
                             targetV6If,
@@ -1002,6 +964,12 @@ public class NetShareService extends Service {
     private boolean isCurrentUpstreamWifi() {
         synchronized (netLock) {
             return currentBestIsWifi;
+        }
+    }
+
+    private int currentWifiFreq() {
+        synchronized (netLock) {
+            return currentBestWifiFreq;
         }
     }
 
@@ -1061,13 +1029,17 @@ public class NetShareService extends Service {
             refreshAllPhysicalNets();
             int preStaFreq = 0;
             if (isCurrentUpstreamWifi()) {
-                try {
-                    Future<ExecResult> freqFut = helperExecutor.submit(() -> runHelper("sta-freq"));
-                    ExecResult fr = freqFut.get(3, TimeUnit.SECONDS);
-                    if (fr.code == 0 && !fr.output.isEmpty()) {
-                        preStaFreq = Integer.parseInt(fr.output.trim());
+                preStaFreq = currentWifiFreq();
+                if (preStaFreq <= 0) {
+                    try {
+                        Future<NetSharePrefs.HelperExecResult> freqFut =
+                                helperExecutor.submit(() -> runHelper("sta-freq"));
+                        NetSharePrefs.HelperExecResult fr = freqFut.get(3, TimeUnit.SECONDS);
+                        if (fr.code == 0 && !fr.output.isEmpty()) {
+                            preStaFreq = Integer.parseInt(fr.output.trim());
+                        }
+                    } catch (Exception ignored) {
                     }
-                } catch (Exception ignored) {
                 }
             }
             JSONObject hello = new JSONObject();
@@ -1119,9 +1091,9 @@ public class NetShareService extends Service {
                             + (tabletV6.isEmpty() ? "" : ", v6=" + tabletV6) + ")");
 
                     final String v6IpArg = tabletV6.isEmpty() ? "none" : tabletV6;
-                    Future<ExecResult> fut = helperExecutor.submit(
+                    Future<NetSharePrefs.HelperExecResult> fut = helperExecutor.submit(
                             () -> runHelper("up", ssid, psk, String.valueOf(freq), upstream, v6If, v6IpArg, tabletLl));
-                    ExecResult res = fut.get(32, TimeUnit.SECONDS);
+                    NetSharePrefs.HelperExecResult res = fut.get(32, TimeUnit.SECONDS);
 
                     if (wl != null && wl.isHeld()) {
                         wl.release();
@@ -1234,8 +1206,8 @@ public class NetShareService extends Service {
                 }
             }
             try {
-                Future<ExecResult> downFut = helperExecutor.submit(() -> runHelper("down"));
-                ExecResult d = downFut.get(15, TimeUnit.SECONDS);
+                Future<NetSharePrefs.HelperExecResult> downFut = helperExecutor.submit(() -> runHelper("down"));
+                NetSharePrefs.HelperExecResult d = downFut.get(15, TimeUnit.SECONDS);
                 if (d.code == 0) {
                     log("已清理 P2P 与防火墙规则");
                 } else {

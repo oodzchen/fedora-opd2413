@@ -4,11 +4,19 @@ import android.content.Context;
 import android.content.SharedPreferences;
 import android.util.Log;
 
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
 import java.util.ArrayDeque;
 import java.util.Date;
 import java.util.Locale;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 
 public final class NetSharePrefs {
     public static final UUID ADV_UUID = UUID.fromString("e4a10001-6f2d-4c8a-9b1e-4f8a2d000001");
@@ -126,6 +134,88 @@ public final class NetSharePrefs {
     public static void clearLogs() {
         synchronized (LOG_LOCK) {
             LOGS.clear();
+        }
+    }
+
+    public static final class HelperExecResult {
+        public final int code;
+        public final String output;
+
+        public HelperExecResult(int code, String output) {
+            this.code = code;
+            this.output = output;
+        }
+    }
+
+    private static final Object HELPER_LOCK = new Object();
+
+    public static String ensureHelperExtracted(Context ctx) {
+        synchronized (HELPER_LOCK) {
+            Context app = ctx.getApplicationContext();
+            File filesDir = app.getFilesDir();
+            File tmp = new File(filesDir, "helper.sh.tmp");
+            File dst = new File(filesDir, "helper.sh");
+            try (InputStream in = app.getAssets().open("helper.sh");
+                 FileOutputStream out = new FileOutputStream(tmp, false)) {
+                byte[] buf = new byte[4096];
+                int n;
+                while ((n = in.read(buf)) > 0) {
+                    out.write(buf, 0, n);
+                }
+                out.flush();
+            } catch (IOException e) {
+                Log.e("OPDNetShare", "extract helper.sh failed", e);
+                return "";
+            }
+            tmp.setReadable(true, false);
+            tmp.setExecutable(true, false);
+            if (!tmp.renameTo(dst)) {
+                return "";
+            }
+            dst.setReadable(true, false);
+            dst.setExecutable(true, false);
+            return dst.getAbsolutePath();
+        }
+    }
+
+    public static HelperExecResult runSuHelper(String helperPath, long timeoutSec, String... args) {
+        if (helperPath == null || helperPath.isEmpty()) {
+            return new HelperExecResult(1, "helper.sh missing");
+        }
+        StringBuilder cmd = new StringBuilder();
+        cmd.append("/system/bin/sh '").append(helperPath.replace("'", "")).append("'");
+        for (String a : args) {
+            cmd.append(" '").append(a.replace("'", "")).append("'");
+        }
+        try {
+            Process proc = new ProcessBuilder("su", "-c", cmd.toString())
+                    .redirectErrorStream(true)
+                    .start();
+            StringBuilder out = new StringBuilder();
+            Thread reader = new Thread(() -> {
+                try (BufferedReader br = new BufferedReader(
+                        new InputStreamReader(proc.getInputStream(), StandardCharsets.UTF_8))) {
+                    String line;
+                    while ((line = br.readLine()) != null) {
+                        if (out.length() > 0) {
+                            out.append('\n');
+                        }
+                        out.append(line);
+                    }
+                } catch (IOException ignored) {
+                }
+            });
+            reader.start();
+            boolean finished = proc.waitFor(timeoutSec, TimeUnit.SECONDS);
+            if (!finished) {
+                proc.destroyForcibly();
+                reader.join(1000);
+                return new HelperExecResult(124, "helper timeout");
+            }
+            reader.join(1000);
+            return new HelperExecResult(proc.exitValue(), out.toString().trim());
+        } catch (Exception e) {
+            return new HelperExecResult(1, e.getMessage() == null ? "exec error" : e.getMessage());
         }
     }
 }

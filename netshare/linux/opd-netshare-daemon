@@ -781,38 +781,55 @@ class NetShareDaemon:
             WPAS_CONF.write_text(conf, encoding="utf-8")
             os.chmod(WPAS_CONF, 0o600)
 
-            # Do NOT pass -B/-f/-P: wpa_supplicant 2.11 on F45 segfaults with -B/-f/-P.
-            self.wpas_proc = subprocess.Popen(
-                ["/usr/sbin/wpa_supplicant", "-i", AP_IFACE, "-D", "nl80211", "-c", str(WPAS_CONF)],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
+            ap_ready_event = threading.Event()
+            # Add p2p0 to firewalld trusted zone while wpa_supplicant brings up the AP (HT_SCAN).
+            fw_pool = ThreadPoolExecutor(max_workers=1)
+            fw_fut = fw_pool.submit(
+                run_cmd,
+                ["firewall-cmd", "--zone=trusted", f"--add-interface={AP_IFACE}"],
             )
-            threading.Thread(target=self._drain_proc_log, args=("wpa_supplicant", self.wpas_proc), daemon=True).start()
+            try:
+                # Do NOT pass -B/-f/-P: wpa_supplicant 2.11 on F45 segfaults with -B/-f/-P.
+                self.wpas_proc = subprocess.Popen(
+                    ["/usr/sbin/wpa_supplicant", "-i", AP_IFACE, "-D", "nl80211", "-c", str(WPAS_CONF)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+                threading.Thread(
+                    target=self._drain_proc_log,
+                    args=("wpa_supplicant", self.wpas_proc, ap_ready_event),
+                    daemon=True,
+                ).start()
 
-            deadline = time.monotonic() + 8.0
-            ap_up = False
-            actual_freq: int | None = None
-            while time.monotonic() < deadline:
-                if self.wpas_proc.poll() is not None:
-                    raise RuntimeError("wpa_supplicant exited unexpectedly")
-                info = run_cmd(["iw", "dev", AP_IFACE, "info"])
-                if "type AP" in info.stdout and "channel " in info.stdout:
-                    m = re.search(r"channel\s+\d+\s+\((\d+)\s+MHz\)", info.stdout)
-                    if m:
-                        actual_freq = int(m.group(1))
-                    ap_up = True
-                    break
-                time.sleep(0.15)
-            if not ap_up:
-                raise RuntimeError("Timed out waiting for p2p0 AP enable")
-            if actual_freq is not None and actual_freq != self.freq:
-                log(f"AP actual primary freq shifted {self.freq} -> {actual_freq} MHz")
-                self.freq = actual_freq
-            time.sleep(0.2)
+                deadline = time.monotonic() + 8.0
+                ap_up = False
+                actual_freq: int | None = None
+                while time.monotonic() < deadline:
+                    if self.wpas_proc.poll() is not None:
+                        raise RuntimeError("wpa_supplicant exited unexpectedly")
+                    ap_ready_event.wait(timeout=min(0.15, max(0.0, deadline - time.monotonic())))
+                    info = run_cmd(["iw", "dev", AP_IFACE, "info"])
+                    if "type AP" in info.stdout and "channel " in info.stdout:
+                        m = re.search(r"channel\s+\d+\s+\((\d+)\s+MHz\)", info.stdout)
+                        if m:
+                            actual_freq = int(m.group(1))
+                        ap_up = True
+                        break
+                    if ap_ready_event.is_set():
+                        time.sleep(0.03)
+                if not ap_up:
+                    raise RuntimeError("Timed out waiting for p2p0 AP enable")
+                if actual_freq is not None and actual_freq != self.freq:
+                    log(f"AP actual primary freq shifted {self.freq} -> {actual_freq} MHz")
+                    self.freq = actual_freq
 
-            run_cmd(["ip", "addr", "replace", AP_CIDR, "dev", AP_IFACE], check=True)
-            run_cmd(["firewall-cmd", "--zone=trusted", f"--add-interface={AP_IFACE}"], check=True)
+                run_cmd(["ip", "addr", "replace", AP_CIDR, "dev", AP_IFACE], check=True)
+                fw_res = fw_fut.result(timeout=8.0)
+                if fw_res.returncode != 0:
+                    raise RuntimeError(f"firewall-cmd failed: {fw_res.stderr.strip() or fw_res.stdout.strip()}")
+            finally:
+                fw_pool.shutdown(wait=True)
 
             # Bind strictly to p2p0 / 192.168.49.1, no DNS port, no default gateway/DNS option to phone.
             self.dnsmasq_proc = subprocess.Popen(
@@ -828,6 +845,7 @@ class NetShareDaemon:
                     "--no-resolv",
                     "--port=0",
                     "--leasefile-ro",
+                    "--no-ping",
                     "--log-dhcp",
                     "--log-facility=-",
                 ],
@@ -838,13 +856,20 @@ class NetShareDaemon:
             threading.Thread(target=self._watch_dnsmasq, args=(self.dnsmasq_proc,), daemon=True).start()
             log(f"Started AP {self.ssid} on {AP_IFACE} freq={self.freq} MHz")
 
-    def _drain_proc_log(self, tag: str, proc: subprocess.Popen[str]) -> None:
+    def _drain_proc_log(
+        self,
+        tag: str,
+        proc: subprocess.Popen[str],
+        ready_event: threading.Event | None = None,
+    ) -> None:
         if not proc.stdout:
             return
         for line in proc.stdout:
             s = line.rstrip()
             if s:
                 log(f"{tag}: {s}")
+                if ready_event is not None and ("AP-ENABLED" in s or "AP-DISABLED" in s):
+                    ready_event.set()
 
     def _watch_dnsmasq(self, proc: subprocess.Popen[str]) -> None:
         if not proc.stdout:

@@ -158,6 +158,17 @@ class NetShareDaemonTests(unittest.TestCase):
             self.assertIn(["ip", "-6", "route", "del", "default", "dev", "p2p0"], cmds)
             self.assertIn(["ip", "-6", "addr", "del", "2409:8900:aaaa:bbbb:0:2413:49:1/128", "dev", "p2p0"], cmds)
 
+    def test_drain_proc_log_signals_ap_enabled(self) -> None:
+        import io
+
+        d = object.__new__(mod.NetShareDaemon)
+        ev = threading.Event()
+        proc = mock.Mock()
+        proc.stdout = io.StringIO("p2p0: interface state UNINITIALIZED->HT_SCAN\np2p0: AP-ENABLED\n")
+        d._drain_proc_log("wpa_supplicant", proc, ev)
+        self.assertTrue(ev.is_set())
+        self.assertIn("--no-ping", DAEMON_PATH.read_text(encoding="utf-8"))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

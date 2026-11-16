@@ -14,6 +14,9 @@ STATE_V6_OUT_IF="/dev/.opdlink_v6_out_if"
 STATE_V6_TABLE="/dev/.opdlink_v6_table_id"
 STATE_V6_ADDR="/dev/.opdlink_v6_addr"
 STATE_TABLET_LL="/dev/.opdlink_tablet_ll"
+STATE_V4_DIRTY="/dev/.opdlink_v4_dirty"
+STATE_V6_DIRTY="/dev/.opdlink_v6_dirty"
+STATE_V6NAT="/dev/.opdlink_v6nat_ok"
 
 log_err() {
     echo "ERR: $*" >&2
@@ -98,8 +101,8 @@ resolve_upstream() {
     return 1
 }
 
-find_p2p_ip() {
-    ip -o -4 addr show 2>/dev/null | while read -r _idx ifc _fam cidr _rest; do
+scan_p2p_ip_lines() {
+    while read -r _idx ifc _fam cidr _rest; do
         case "$cidr" in
             192.168.49.*)
                 echo "$ifc ${cidr%%/*}"
@@ -107,6 +110,21 @@ find_p2p_ip() {
                 ;;
         esac
     done
+    return 1
+}
+
+find_p2p_ip() {
+    res="$(ip -o -4 addr show dev p2p0 2>/dev/null | scan_p2p_ip_lines || true)"
+    if [ -n "$res" ]; then
+        echo "$res"
+        return 0
+    fi
+    res="$(ip -o -4 addr show 2>/dev/null | scan_p2p_ip_lines || true)"
+    if [ -n "$res" ]; then
+        echo "$res"
+        return 0
+    fi
+    return 1
 }
 
 find_table_v6_def_dev() {
@@ -169,29 +187,27 @@ find_p2p_v6_ll() {
 wait_p2p_v6_ll() {
     ifc="$1"
     j=0
-    while [ "$j" -lt 10 ]; do
+    while [ "$j" -lt 20 ]; do
         ll="$(find_p2p_v6_ll "$ifc" || true)"
         if [ -n "$ll" ]; then
             echo "$ll"
             return 0
         fi
         j=$((j + 1))
-        sleep 0.1
+        sleep 0.05
     done
     return 1
 }
 
 get_sta_freq() {
-    f=""
+    # Do not fall back to wpa_cli: SELinux blocks hal_wifi_supplicant_default replies
+    # to su contexts and makes every wpa_cli call hang for ~10s until timeout.
     if command -v iw >/dev/null 2>&1; then
         f="$(iw dev wlan0 link 2>/dev/null | sed -n 's/.*freq:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)"
-    fi
-    if [ -z "$f" ] && command -v wpa_cli >/dev/null 2>&1; then
-        f="$(wpa_cli -i wlan0 status 2>/dev/null | sed -n 's/^freq=\([0-9][0-9]*\).*/\1/p' | head -n1)"
-    fi
-    if [ -n "$f" ] && [ "$f" -ge 2400 ] 2>/dev/null; then
-        echo "$f"
-        return 0
+        if [ -n "$f" ] && [ "$f" -ge 2400 ] 2>/dev/null; then
+            echo "$f"
+            return 0
+        fi
     fi
     return 1
 }
@@ -211,6 +227,17 @@ clear_rules_and_chains() {
     $IPT -t nat -D tetherctrl_nat_POSTROUTING -j opdlink_nat >/dev/null 2>&1 || true
     $IPT -t nat -F opdlink_nat >/dev/null 2>&1 || true
     $IPT -t nat -X opdlink_nat >/dev/null 2>&1 || true
+    rm -f "$STATE_V4_DIRTY"
+}
+
+v4_rules_maybe_dirty() {
+    if [ -f "$STATE_V4_DIRTY" ]; then
+        return 0
+    fi
+    if [ -f "$STATE_OUT_IF" ] && [ "$(cat "$STATE_OUT_IF" 2>/dev/null || echo none)" != "none" ]; then
+        return 0
+    fi
+    return 1
 }
 
 apply_nat() {
@@ -220,7 +247,9 @@ apply_nat() {
     resolved="$(resolve_upstream "$upstream_req" || true)"
     if [ -z "$resolved" ]; then
         # No physical upstream yet: keep P2P link alive without stale NAT rules
-        clear_rules_and_chains
+        if v4_rules_maybe_dirty; then
+            clear_rules_and_chains
+        fi
         echo "none" > "$STATE_OUT_IF"
         echo "" > "$STATE_TABLE"
         echo "none"
@@ -230,7 +259,10 @@ apply_nat() {
     out_if="${resolved%% *}"
     table_id="${resolved##* }"
 
-    clear_rules_and_chains
+    if v4_rules_maybe_dirty; then
+        clear_rules_and_chains
+    fi
+    : > "$STATE_V4_DIRTY"
 
     $IPT -N opdlink_fwd >/dev/null 2>&1 || true
     $IPT -F opdlink_fwd
@@ -281,6 +313,17 @@ clear_v6_rules_and_chains() {
     $IP6T -t mangle -D FORWARD -j opdlink_mangle6 >/dev/null 2>&1 || true
     $IP6T -t mangle -F opdlink_mangle6 >/dev/null 2>&1 || true
     $IP6T -t mangle -X opdlink_mangle6 >/dev/null 2>&1 || true
+    rm -f "$STATE_V6_DIRTY"
+}
+
+v6_rules_maybe_dirty() {
+    if [ -f "$STATE_V6_DIRTY" ]; then
+        return 0
+    fi
+    if [ -f "$STATE_V6_OUT_IF" ] && [ "$(cat "$STATE_V6_OUT_IF" 2>/dev/null || echo none)" != "none" ]; then
+        return 0
+    fi
+    return 1
 }
 
 apply_v6() {
@@ -289,10 +332,11 @@ apply_v6() {
     tablet_v6="$3"
     tablet_ll="$4"
 
-    clear_v6_rules_and_chains
-
     if [ -z "$v6_upstream_req" ] || [ "$v6_upstream_req" = "none" ] \
         || [ -z "$tablet_v6" ] || [ "$tablet_v6" = "none" ]; then
+        if v6_rules_maybe_dirty; then
+            clear_v6_rules_and_chains
+        fi
         echo "none" > "$STATE_V6_OUT_IF"
         echo "" > "$STATE_V6_TABLE"
         echo "" > "$STATE_V6_ADDR"
@@ -302,12 +346,20 @@ apply_v6() {
 
     resolved="$(resolve_v6_upstream "$v6_upstream_req" || true)"
     if [ -z "$resolved" ]; then
+        if v6_rules_maybe_dirty; then
+            clear_v6_rules_and_chains
+        fi
         echo "none" > "$STATE_V6_OUT_IF"
         echo "" > "$STATE_V6_TABLE"
         echo "" > "$STATE_V6_ADDR"
         echo "none"
         return 0
     fi
+
+    if v6_rules_maybe_dirty; then
+        clear_v6_rules_and_chains
+    fi
+    : > "$STATE_V6_DIRTY"
 
     v6_out_if="${resolved%% *}"
     v6_table_id="${resolved##* }"
@@ -340,15 +392,22 @@ apply_v6() {
     fi
 
     nat6_ok=0
-    if $IP6T -t nat -N opdlink_nat6 >/dev/null 2>&1 || $IP6T -t nat -L opdlink_nat6 -n >/dev/null 2>&1; then
-        if $IP6T -t nat -F opdlink_nat6 >/dev/null 2>&1 \
-            && $IP6T -t nat -A opdlink_nat6 -s "${tablet_v6}/128" -o "$v6_out_if" -j MASQUERADE >/dev/null 2>&1 \
-            && $IP6T -t nat -I POSTROUTING 1 -j opdlink_nat6 >/dev/null 2>&1; then
-            nat6_ok=1
+    v6nat_cached="$(cat "$STATE_V6NAT" 2>/dev/null || true)"
+    if [ "$v6nat_cached" != "0" ]; then
+        if $IP6T -t nat -N opdlink_nat6 >/dev/null 2>&1 || $IP6T -t nat -L opdlink_nat6 -n >/dev/null 2>&1; then
+            if $IP6T -t nat -F opdlink_nat6 >/dev/null 2>&1 \
+                && $IP6T -t nat -A opdlink_nat6 -s "${tablet_v6}/128" -o "$v6_out_if" -j MASQUERADE >/dev/null 2>&1 \
+                && $IP6T -t nat -I POSTROUTING 1 -j opdlink_nat6 >/dev/null 2>&1; then
+                nat6_ok=1
+                echo 1 > "$STATE_V6NAT" 2>/dev/null || true
+            else
+                $IP6T -t nat -D POSTROUTING -j opdlink_nat6 >/dev/null 2>&1 || true
+                $IP6T -t nat -F opdlink_nat6 >/dev/null 2>&1 || true
+                $IP6T -t nat -X opdlink_nat6 >/dev/null 2>&1 || true
+                echo 0 > "$STATE_V6NAT" 2>/dev/null || true
+            fi
         else
-            $IP6T -t nat -D POSTROUTING -j opdlink_nat6 >/dev/null 2>&1 || true
-            $IP6T -t nat -F opdlink_nat6 >/dev/null 2>&1 || true
-            $IP6T -t nat -X opdlink_nat6 >/dev/null 2>&1 || true
+            echo 0 > "$STATE_V6NAT" 2>/dev/null || true
         fi
     fi
 
@@ -400,6 +459,11 @@ cmd_down() {
 }
 
 ensure_p2p_ready() {
+    if [ -d /proc/sys/net/ipv6/conf/p2p0 ]; then
+        echo 0 > /proc/sys/net/ipv6/conf/p2p0/disable_ipv6 2>/dev/null || true
+        echo 0 > /proc/sys/net/ipv6/conf/p2p0/dad_transmits 2>/dev/null || true
+        echo 0 > /proc/sys/net/ipv6/conf/p2p0/accept_dad 2>/dev/null || true
+    fi
     st="$(get_p2p_cur_state || true)"
     case "$st" in
         ""|P2pDisabledState|P2pDisablingState|P2pEnablingState)
@@ -416,21 +480,23 @@ ensure_p2p_ready() {
             done
             ;;
     esac
-    cmd wifip2p cancel-connect >/dev/null 2>&1 || true
-    cmd wifip2p remove-group >/dev/null 2>&1 || true
-    w=0
-    while [ "$w" -lt 10 ]; do
-        st="$(get_p2p_cur_state || true)"
-        case "$st" in
-            OngoingGroupRemovalState|GroupCreatedState)
-                sleep 0.15
-                ;;
-            *)
-                break
-                ;;
-        esac
-        w=$((w + 1))
-    done
+    if [ "$st" != "InactiveState" ]; then
+        cmd wifip2p cancel-connect >/dev/null 2>&1 || true
+        cmd wifip2p remove-group >/dev/null 2>&1 || true
+        w=0
+        while [ "$w" -lt 10 ]; do
+            st="$(get_p2p_cur_state || true)"
+            case "$st" in
+                OngoingGroupRemovalState|GroupCreatedState)
+                    sleep 0.12
+                    ;;
+                *)
+                    break
+                    ;;
+            esac
+            w=$((w + 1))
+        done
+    fi
 }
 
 cmd_up() {
@@ -447,14 +513,17 @@ cmd_up() {
         exit 2
     fi
 
-    sta_freq="$(get_sta_freq || true)"
-
-    clear_rules_and_chains
-    clear_v6_rules_and_chains
+    if v4_rules_maybe_dirty; then
+        clear_rules_and_chains
+    fi
+    if v6_rules_maybe_dirty; then
+        clear_v6_rules_and_chains
+    fi
     ensure_p2p_ready
 
     if ! conn_out="$(cmd wifip2p connect-with-config "$ssid" "$psk" "$freq" false 2>&1)"; then
-        log_err "wifip2p connect-with-config failed (sta_freq=${sta_freq:-0}): ${conn_out}"
+        sta_freq="$(get_sta_freq || echo 0)"
+        log_err "wifip2p connect-with-config failed (sta_freq=${sta_freq}): ${conn_out}"
         cmd_cancel
         exit 1
     fi
@@ -464,7 +533,7 @@ cmd_up() {
     early_fail=""
     start_s="$(date +%s 2>/dev/null || echo 0)"
     i=0
-    while [ "$i" -lt 90 ]; do
+    while [ "$i" -lt 140 ]; do
         p2p_info="$(find_p2p_ip || true)"
         if [ -n "$p2p_info" ]; then
             break
@@ -477,14 +546,14 @@ cmd_up() {
         if [ "$elapsed" -ge 16 ]; then
             break
         fi
-        if [ "$i" -ge 3 ] && [ $((i % 4)) -eq 0 ]; then
+        if [ "$i" -ge 8 ] && [ $((i % 8)) -eq 0 ]; then
             cur_state="$(get_p2p_cur_state || true)"
             case "$cur_state" in
                 GroupNegotiationState|ProvisionDiscoveryState|OngoingGroupRemovalState|FrequencyConflictState)
                     seen_negotiating=1
                     ;;
                 InactiveState|P2pDisabledState)
-                    if [ "$seen_negotiating" -eq 1 ] || [ "$elapsed" -ge 5 ] || [ "$i" -ge 18 ]; then
+                    if [ "$seen_negotiating" -eq 1 ] || [ "$elapsed" -ge 5 ] || [ "$i" -ge 35 ]; then
                         early_fail="$cur_state"
                         break
                     fi
@@ -492,15 +561,19 @@ cmd_up() {
             esac
         fi
         i=$((i + 1))
-        sleep 0.18
+        if [ "$i" -le 25 ]; then
+            sleep 0.06
+        else
+            sleep 0.15
+        fi
     done
 
     if [ -z "$p2p_info" ]; then
-        sta_freq="$(get_sta_freq || echo "${sta_freq:-0}")"
+        sta_freq="$(get_sta_freq || echo 0)"
         if [ -n "$early_fail" ]; then
-            log_err "p2p group formation failed (state=${early_fail}, freq=${freq}, sta_freq=${sta_freq:-0})"
+            log_err "p2p group formation failed (state=${early_fail}, freq=${freq}, sta_freq=${sta_freq})"
         else
-            log_err "timed out waiting for 192.168.49.x on p2p (freq=${freq}, sta_freq=${sta_freq:-0})"
+            log_err "timed out waiting for 192.168.49.x on p2p (freq=${freq}, sta_freq=${sta_freq})"
         fi
         cmd_cancel
         exit 1
@@ -512,6 +585,8 @@ cmd_up() {
 
     iw dev "$p2p_if" set power_save off >/dev/null 2>&1 || true
     echo 0 > "/proc/sys/net/ipv4/conf/${p2p_if}/rp_filter" 2>/dev/null || true
+    echo 0 > "/proc/sys/net/ipv6/conf/${p2p_if}/dad_transmits" 2>/dev/null || true
+    echo 0 > "/proc/sys/net/ipv6/conf/${p2p_if}/accept_dad" 2>/dev/null || true
 
     if [ ! -f "$STATE_IPFWD" ]; then
         cat /proc/sys/net/ipv4/ip_forward > "$STATE_IPFWD"
@@ -565,6 +640,52 @@ cmd_sta_freq() {
     echo "${f:-0}"
 }
 
+clear_adb_fw() {
+    while $IPT -D INPUT -p tcp --dport 5555 -j opdlink_adb >/dev/null 2>&1; do :; done
+    $IPT -F opdlink_adb >/dev/null 2>&1 || true
+    $IPT -X opdlink_adb >/dev/null 2>&1 || true
+    while $IP6T -D INPUT -p tcp --dport 5555 -j opdlink_adb6 >/dev/null 2>&1; do :; done
+    $IP6T -F opdlink_adb6 >/dev/null 2>&1 || true
+    $IP6T -X opdlink_adb6 >/dev/null 2>&1 || true
+}
+
+cmd_adb_on() {
+    clear_adb_fw
+    $IPT -N opdlink_adb >/dev/null 2>&1 || true
+    $IPT -F opdlink_adb
+    $IPT -A opdlink_adb -i p2p+ -s 192.168.49.1 -j ACCEPT
+    $IPT -A opdlink_adb -j DROP
+    $IPT -I INPUT 1 -p tcp --dport 5555 -j opdlink_adb
+
+    $IP6T -N opdlink_adb6 >/dev/null 2>&1 || true
+    $IP6T -F opdlink_adb6
+    $IP6T -A opdlink_adb6 -j DROP
+    $IP6T -I INPUT 1 -p tcp --dport 5555 -j opdlink_adb6
+
+    setprop service.adb.tcp.port 5555
+    stop adbd
+    start adbd
+    echo "OK adb-on"
+}
+
+cmd_adb_off() {
+    setprop service.adb.tcp.port -1
+    stop adbd
+    start adbd
+    clear_adb_fw
+    echo "OK adb-off"
+}
+
+cmd_adb_status() {
+    port="$(getprop service.adb.tcp.port 2>/dev/null || true)"
+    running="$(getprop init.svc.adbd 2>/dev/null || true)"
+    fw="off"
+    if $IPT -C INPUT -p tcp --dport 5555 -j opdlink_adb >/dev/null 2>&1; then
+        fw="p2p-only"
+    fi
+    echo "port=${port:-unset} adbd=${running:-unknown} fw=${fw}"
+}
+
 case "${1:-}" in
     up)
         shift
@@ -587,8 +708,17 @@ case "${1:-}" in
     sta-freq)
         cmd_sta_freq
         ;;
+    adb-on)
+        cmd_adb_on
+        ;;
+    adb-off)
+        cmd_adb_off
+        ;;
+    adb-status)
+        cmd_adb_status
+        ;;
     *)
-        log_err "usage: helper.sh {up <ssid> <psk> <freq> <upstream> [v6_upstream] [tablet_v6] [tablet_ll]|switch <upstream> [v6_upstream] [tablet_v6] [tablet_ll]|down|status|sta-freq}"
+        log_err "usage: helper.sh {up <ssid> <psk> <freq> <upstream> [v6_upstream] [tablet_v6] [tablet_ll]|switch <upstream> [v6_upstream] [tablet_v6] [tablet_ll]|down|status|sta-freq|adb-on|adb-off|adb-status}"
         exit 2
         ;;
 esac

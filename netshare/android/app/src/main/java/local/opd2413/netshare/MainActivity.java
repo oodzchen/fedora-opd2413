@@ -52,6 +52,10 @@ public class MainActivity extends Activity {
     private static final int ROOT_OK = 1;
     private static final int ROOT_DENIED = 2;
 
+    private static final int ADB_UNKNOWN = 0;
+    private static final int ADB_ON = 1;
+    private static final int ADB_OFF = 2;
+
     private LinearLayout statusCard;
     private View statusDot;
     private TextView statusTitleView;
@@ -73,6 +77,7 @@ public class MainActivity extends Activity {
     private Button rootBtn;
     private Button batBtn;
     private Button cdmBtn;
+    private Button p2pAdbBtn;
 
     private TextView logCountView;
     private Button clearLogBtn;
@@ -83,6 +88,8 @@ public class MainActivity extends Activity {
     private Switch enableSwitch;
     private boolean updatingSwitch = false;
     private int rootState = ROOT_UNKNOWN;
+    private int adbP2pState = ADB_UNKNOWN;
+    private boolean adbBusy = false;
     private String lastRenderedLogs = "";
 
     private final BroadcastReceiver stateReceiver = new BroadcastReceiver() {
@@ -117,6 +124,7 @@ public class MainActivity extends Activity {
         bindViews();
         requestMissingPermissions();
         checkRootAsync(false);
+        checkAdbAsync();
     }
 
     @Override
@@ -128,6 +136,7 @@ public class MainActivity extends Activity {
                 Context.RECEIVER_NOT_EXPORTED
         );
         ensureServiceRunningIfEnabled();
+        checkAdbAsync();
         refreshUi();
     }
 
@@ -193,6 +202,7 @@ public class MainActivity extends Activity {
         rootBtn = findViewById(R.id.btn_check_root);
         batBtn = findViewById(R.id.btn_battery);
         cdmBtn = findViewById(R.id.btn_companion);
+        p2pAdbBtn = findViewById(R.id.btn_p2p_adb);
 
         logCountView = findViewById(R.id.log_count);
         clearLogBtn = findViewById(R.id.btn_clear_log);
@@ -217,9 +227,13 @@ public class MainActivity extends Activity {
             }
         });
 
-        rootBtn.setOnClickListener(v -> checkRootAsync(true));
+        rootBtn.setOnClickListener(v -> {
+            checkRootAsync(true);
+            checkAdbAsync();
+        });
         batBtn.setOnClickListener(v -> openBatterySettings());
         cdmBtn.setOnClickListener(v -> requestCompanionAssociation());
+        p2pAdbBtn.setOnClickListener(v -> toggleAdbAsync());
 
         envPermBadge.setOnClickListener(v -> {
             if (!hasRequiredPermissions()) {
@@ -373,6 +387,60 @@ public class MainActivity extends Activity {
                 if (showToast) {
                     Toast.makeText(this, "Root: " + finalText, Toast.LENGTH_LONG).show();
                 }
+            });
+        }).start();
+    }
+
+    private static int parseAdbStatusState(NetSharePrefs.HelperExecResult st) {
+        if (st == null || st.code != 0 || st.output == null) {
+            return ADB_UNKNOWN;
+        }
+        boolean portOn = st.output.contains("port=5555");
+        boolean fwOn = st.output.contains("fw=p2p-only");
+        return (portOn && fwOn) ? ADB_ON : ADB_OFF;
+    }
+
+    private void checkAdbAsync() {
+        new Thread(() -> {
+            String path = NetSharePrefs.ensureHelperExtracted(this);
+            int next = parseAdbStatusState(NetSharePrefs.runSuHelper(path, 8, "adb-status"));
+            runOnUiThread(() -> {
+                adbP2pState = next;
+                refreshUi();
+            });
+        }).start();
+    }
+
+    private void toggleAdbAsync() {
+        if (adbBusy) {
+            return;
+        }
+        final boolean wantOn = adbP2pState != ADB_ON;
+        adbBusy = true;
+        refreshUi();
+        new Thread(() -> {
+            String path = NetSharePrefs.ensureHelperExtracted(this);
+            NetSharePrefs.HelperExecResult r =
+                    NetSharePrefs.runSuHelper(path, 10, wantOn ? "adb-on" : "adb-off");
+            boolean ok = r.code == 0;
+            int next = parseAdbStatusState(NetSharePrefs.runSuHelper(path, 8, "adb-status"));
+            if (ok) {
+                NetSharePrefs.appendLog(wantOn
+                        ? "已开启 P2P ADB (TCP 5555，仅限 192.168.49.1)"
+                        : "已关闭 P2P ADB 监听并清理防火墙规则");
+            } else {
+                NetSharePrefs.appendLog("切换 P2P ADB 失败: " + r.output);
+            }
+            runOnUiThread(() -> {
+                adbBusy = false;
+                adbP2pState = next;
+                refreshUi();
+                Toast.makeText(
+                        this,
+                        ok ? (wantOn ? "已开启 P2P ADB (仅限 192.168.49.1)" : "已关闭 P2P ADB")
+                                : ("切换失败: " + r.output),
+                        Toast.LENGTH_SHORT
+                ).show();
             });
         }).start();
     }
@@ -690,6 +758,18 @@ public class MainActivity extends Activity {
         boolean cdmOk = isCompanionAssociated(mac);
         styleEnvBadge(envCdmBadge, cdmOk, !mac.isEmpty(),
                 mac.isEmpty() ? "伴侣 未选" : (cdmOk ? "伴侣 已关联" : "伴侣 未关联"));
+
+        p2pAdbBtn.setEnabled(!adbBusy);
+        p2pAdbBtn.setAlpha(adbBusy ? 0.55f : 1.0f);
+        if (adbBusy) {
+            p2pAdbBtn.setText("P2P ADB: ...");
+        } else if (adbP2pState == ADB_ON) {
+            p2pAdbBtn.setText(R.string.btn_p2p_adb_on);
+            p2pAdbBtn.setTextColor(getColor(R.color.badge_ok_text));
+        } else {
+            p2pAdbBtn.setText(R.string.btn_p2p_adb_off);
+            p2pAdbBtn.setTextColor(getColor(R.color.text_primary));
+        }
 
         int count = NetSharePrefs.getLogCount();
         logCountView.setText(count > 0 ? "(" + count + ")" : "");
