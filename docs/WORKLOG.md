@@ -2300,4 +2300,29 @@ mpv、Firefox 仍是软解（Fedora `ffmpeg-free` 的专利限制），用户选
   3. `packaging/opd2413-face/data/lockscreen/LockScreenUi.qml`：新增 `onLidClosedChanged`：合盖（`lidClosed===true`）立即停表、归零 `faceTriedThisOpen=false`、`uiVisible=false` 并 `FaceBridge.resetState()`；开盖（`lidClosed===false`）时在未解锁态复位 `faceTriedThisOpen=false` 与状态，主动展示锁屏提示并在 `260 ms` 后自动拉起新一轮人脸识别（`armScan()` 也增加 `!FaceBridge.lidClosed` 守卫）。
   4. `./tools/build-face-rpm.sh --local 0.1 11` 编出 `out/rpmbuild/RPMS/aarch64/opd2413-face-0.1-11.fc45.aarch64.rpm` 并经 `pkexec dnf upgrade -y` 装机及重启 `opd2413-face.service`（`active`）；`cmp -s` 确认 `/usr/local/share/plasma/.../LockScreenUi.qml` 已随 `%posttrans` 更新一致，`PySide6` 离线 QML 加载验证 `FaceBridge.lidClosed===false` 通过（`FACEBRIDGE_QML_OK`）；并同步将 `TECH-DEBT #44` 中的 `opd2413-face` 直装项清除。待用户实测「开盖未解锁→合盖→再开盖」闭环确认。
 
+### P0 收口：合盖服务并入 `opd2413-device` RPM、修复固件数测试校验与 NTP 时钟同步（2026-11-16，离线构建通过，待用户确认后装机验证）
+2304: 
+- **离线改动与排查：**
+  1. **合盖输入屏蔽与延迟休眠并入 RPM**（[opd2413-device.spec](../packaging/opd2413-device/opd2413-device.spec)）：新增 `Requires: python3-gobject-base`，将 `device/libexec/{lid-input,lid-suspend}` 安装至 `/usr/libexec/opd2413/`，将 `device/systemd/opd2413-lid-input.service` 与 `opd2413-lid-suspend.service` 分别安装至 `/usr/lib/systemd/system/`（静态链接到 `multi-user.target.wants/`）与 `/usr/lib/systemd/user/`（静态链接到 `graphical-session.target.wants/`）。编出 `out/rpmbuild/RPMS/noarch/opd2413-device-0.1-15.noarch.rpm`（SHA-256 `1fc4415f8852aecd216cd0fa04004ffdbcfc38a5970507393b431dda146beec6`）；`rpm -qlp`、`rpm -qpR`、`py_compile` 及 `tests/ufs-guard-test.sh` 均通过。
+  2. **修复离线安装测试的固件数断言**（[tests/package-install-test.sh](../tests/package-install-test.sh#L75-L78)、[docs/BUILD.md](BUILD.md)）：将期望早期固件数由 `66` 更新为 `67`（补齐 `opd2413-firmware 16.0.10.600-2` 新增的 `vpu35_4v.mbn`）；`bash -n tests/package-install-test.sh` 通过。
+  3. **NTP 不同步根因排查（只读）**：平板实测 `chronyc tracking` 为 `Not synchronised`、`2.fedora.pool.ntp.org` 8 个境外节点全部 `Reach=0`；路由与 UDP 123 探活确认非 CN 节点经本机 TUN 代理表出站时 UDP 123 超时，而直连的国内 NTP 服务器（`ntp.aliyun.com`、`ntp1.aliyun.com`、`ntp.tencent.com`、`time2.cloud.tencent.com`）均在 UDP 123 返回正常 `48 B` 响应。
+- **上机写入范围与判据：**
+  1. **设备写入范围（仅 `ARMADA_ROOT`，不碰 ESP / `boot_b` / Android 分区）**：
+     - 停用并清理此前直装的 `/etc/systemd/system/opd2413-lid-input.service`（及 `multi-user.target.wants` 软链）、`/usr/libexec/opd2413/lid-input`、`~/.local/libexec/opd2413-lid-suspend`、`~/.config/systemd/user/opd2413-lid-suspend.service`（及 `graphical-session.target.wants` 软链）；
+     - 安装 `out/rpmbuild/RPMS/noarch/opd2413-device-0.1-15.noarch.rpm`（`pkexec dnf --disablerepo='*' upgrade -y`），`systemctl daemon-reload` 与 `systemctl --user daemon-reload` 并重启两个服务；
+     - 更新 `/etc/chrony.conf`，保留原有配置结构并替换 `pool 2.fedora.pool.ntp.org iburst` 为 `ntp.aliyun.com` / `ntp1.aliyun.com` / `ntp.tencent.com` / `time2.cloud.tencent.com`（`iburst`），重启 `chronyd.service`。
+  2. **验收判据**：
+     - `rpm -q opd2413-device` 为 `0.1-15` 且 `rpm -V opd2413-device` 无缺失/篡改；原直装路径已清除；`opd2413-lid-input.service`（系统级）与 `opd2413-lid-suspend.service`（用户级）均处于 `active (running)` 且指向 `/usr/lib/systemd/{system,user}/` 与 `/usr/libexec/opd2413/`；
+     - `chronyc tracking` `Leap status` 变为 `Normal`，`chronyc sources` 至少 3 个国内源达到非零 `Reach` 并选出主同步源（`*`）；
+     - 经一次冷启动验证（因涉及系统级 systemd unit 变动），确认上述服务与 `chronyd` 在开机后自动就绪、`systemctl --failed` 为空、SELinux `Enforcing` 无新增 AVC。
+- **实机验证结果（2026-11-16，运行态已通过，待下一次冷启动复核 systemd 静态自启）：**
+  1. **清理与装包（`opd2413-device-0.1-15.noarch`）**：停止并清除旧直装 `/etc/systemd/system/opd2413-lid-input.service`、`/usr/libexec/opd2413/lid-input`、`~/.local/libexec/opd2413-lid-suspend` 与 `~/.config/systemd/user/opd2413-lid-suspend.service`（含各自 `.wants` 软链）；经 `pkexec dnf --disablerepo="*" upgrade -y` 成功升级至 `opd2413-device-0.1-15.noarch`，`rpm -V opd2413-device` 零输出通过；新文件路径及 SELinux 上下文确认分别为 `/usr/libexec/opd2413/{lid-input,lid-suspend}`（`bin_t`）与 `/usr/lib/systemd/{system/opd2413-lid-input,user/opd2413-lid-suspend}.service`（`systemd_unit_file_t`）及对应静态 `.wants` 软链。
+  2. **服务状态**：`opd2413-lid-input.service`（系统级，`PID 26584`）与 `opd2413-lid-suspend.service`（用户级，`PID 26613`）均处于 `active (running)`，`watching /dev/input/event...` 与 `watching lid events (delay=600s, lid currently open)` 正常。
+  3. **NTP 同步**：更新 `/etc/chrony.conf`（注释原境外 `pool 2.fedora.pool.ntp.org iburst`，加入 `ntp.aliyun.com`、`ntp1.aliyun.com`、`ntp.tencent.com`、`time2.cloud.tencent.com` `iburst`）并重启 `chronyd.service`；6 s 后 `chronyc tracking` 为 `Leap status: Normal`、`Stratum: 3`、`Reference ID: 6FE6BDAE (111.230.189.174)`、`System time: 0.000170632 s slow`，`chronyc sources -v` 4 源全部 `Reach=17`（`^* 111.230.189.174` 为主源）。
+  4. **整机健康度**：`systemctl is-system-running = running`，`systemctl --failed` 为 `0 loaded units listed`，SELinux `Enforcing` 无 `lid-input`/`lid-suspend`/`chronyd` 相关 AVC 拒绝（`chronyc` 仅读父 shell `/proc/<pid>` 触发无害拒绝）。待下一次插电冷启动后确认静态启用的两项合盖服务与 `chronyd` 自动就绪。
+- **重启/冷启动复核（2026-11-16 22:38:00 开机，真机通过）：**
+  - 用户完成重启（`uptime -s = 2026-11-16 22:38:00`、`uname -r = 7.2.15-29.opd2413`）：系统级 `opd2413-lid-input.service`（`/usr/lib/systemd/system/`、`PID 2218`）于 `22:38:08` 自动拉起、用户级 `opd2413-lid-suspend.service`（`/usr/lib/systemd/user/`、`PID 4222`）于 `22:38:22` 自动拉起，均呈 `active (running)`；
+  - `chronyc tracking` 开机后自动同步为 `Leap status: Normal`（Stratum 3、`0.000903192 s slow`），4 源 `Reach` 为 `37/37/67/57`（`^* 223.4.249.80`）；
+  - `systemctl is-system-running = running`、`systemctl --failed` 为 `0 loaded units listed`、`Enforcing` 零相关 AVC。
+
 

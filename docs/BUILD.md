@@ -90,7 +90,7 @@ tests/qemu-esp-boot.sh private/esp-20261110/esp-sda16.img out/pkg-test/esp out/q
 | 测试 | 验证什么 | 通过标志 |
 |---|---|---|
 | `ufs-guard-test.sh` | Android 分区被置为只读，`ARMADA*` 三个分区保持可写 | 打印一行总结，退出码 0 |
-| `package-install-test.sh` | 在干净的 Fedora 45 aarch64 里装四个包后，ESP 布局、启动条目、initramfs 里的 66 个设备固件、Fedora 内核被排除；以及 initramfs 缺固件时内核安装被拒绝 | `PASS: package install` |
+| `package-install-test.sh` | 在干净的 Fedora 45 aarch64 里装四个包后，ESP 布局、启动条目、initramfs 里的 67 个设备固件、Fedora 内核被排除；以及 initramfs 缺固件时内核安装被拒绝 | `PASS: package install` |
 | `qemu-esp-boot.sh` | 平板同款 U-Boot 读取"真实 ESP 副本 + 上一个测试产出的 Fedora 文件"，systemd-boot 启动 Fedora 条目的内核 | `PASS: systemd-boot started the Fedora entry's kernel` |
 
 注意：

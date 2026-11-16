@@ -17,14 +17,16 @@ Requires:       diffutils
 Requires:       coreutils
 Requires:       gawk
 Requires:       python3
+Requires:       python3-gobject-base
 
 %description
 What a stock Fedora needs to run on the OnePlus Pad 2 Pro next to Android:
 the udev guard that keeps Android's partitions read-only, the dracut module
 that puts device firmware into the initramfs, kernel-install settings for the
-ESP layout the boot chain expects, a dnf exclude for Fedora's own kernel, and
-a unit that keeps every pstore (ramoops) record of a failed boot, and
-boot-select, which picks the next kShimC menu entry and kernel without the menus.
+ESP layout the boot chain expects, a dnf exclude for Fedora's own kernel,
+a unit that keeps every pstore (ramoops) record of a failed boot,
+boot-select (which picks the next kShimC menu entry and kernel without the menus),
+and the lid-close input-inhibit and delayed-suspend helpers.
 
 %prep
 
@@ -35,6 +37,8 @@ install -D -m 0755 %{srcdir}/libexec/ufs-guard %{buildroot}/usr/libexec/opd2413/
 install -D -m 0755 %{srcdir}/libexec/early-firmware %{buildroot}/usr/libexec/opd2413/early-firmware
 install -D -m 0755 %{srcdir}/libexec/boot-select %{buildroot}/usr/libexec/opd2413/boot-select
 install -D -m 0755 %{srcdir}/libexec/pstore-keep %{buildroot}/usr/libexec/opd2413/pstore-keep
+install -D -m 0755 %{srcdir}/libexec/lid-input %{buildroot}/usr/libexec/opd2413/lid-input
+install -D -m 0755 %{srcdir}/libexec/lid-suspend %{buildroot}/usr/libexec/opd2413/lid-suspend
 install -D -m 0644 %{srcdir}/udev/90-opd2413-ufs-guard.rules %{buildroot}/usr/lib/udev/rules.d/90-opd2413-ufs-guard.rules
 install -D -m 0644 %{srcdir}/udev/90-opd2413-pogo-keyboard.hwdb %{buildroot}/usr/lib/udev/hwdb.d/90-opd2413-pogo-keyboard.hwdb
 install -D -m 0644 %{srcdir}/environment.d/60-opd2413-video.conf %{buildroot}/usr/lib/environment.d/60-opd2413-video.conf
@@ -56,6 +60,12 @@ mkdir -p %{buildroot}/usr/lib/systemd/system/sysinit.target.wants
 ln -s ../opd2413-pstore-keep.service %{buildroot}/usr/lib/systemd/system/sysinit.target.wants/opd2413-pstore-keep.service
 install -D -m 0644 %{srcdir}/systemd/opd2413-boot-restore.service %{buildroot}/usr/lib/systemd/system/opd2413-boot-restore.service
 ln -s ../opd2413-boot-restore.service %{buildroot}/usr/lib/systemd/system/sysinit.target.wants/opd2413-boot-restore.service
+install -D -m 0644 %{srcdir}/systemd/opd2413-lid-input.service %{buildroot}/usr/lib/systemd/system/opd2413-lid-input.service
+mkdir -p %{buildroot}/usr/lib/systemd/system/multi-user.target.wants
+ln -s ../opd2413-lid-input.service %{buildroot}/usr/lib/systemd/system/multi-user.target.wants/opd2413-lid-input.service
+install -D -m 0644 %{srcdir}/systemd/opd2413-lid-suspend.service %{buildroot}/usr/lib/systemd/user/opd2413-lid-suspend.service
+mkdir -p %{buildroot}/usr/lib/systemd/user/graphical-session.target.wants
+ln -s ../opd2413-lid-suspend.service %{buildroot}/usr/lib/systemd/user/graphical-session.target.wants/opd2413-lid-suspend.service
 
 %files
 /usr/libexec/opd2413
@@ -74,4 +84,8 @@ ln -s ../opd2413-boot-restore.service %{buildroot}/usr/lib/systemd/system/sysini
 /usr/lib/systemd/system/sysinit.target.wants/opd2413-pstore-keep.service
 /usr/lib/systemd/system/opd2413-boot-restore.service
 /usr/lib/systemd/system/sysinit.target.wants/opd2413-boot-restore.service
+/usr/lib/systemd/system/opd2413-lid-input.service
+/usr/lib/systemd/system/multi-user.target.wants/opd2413-lid-input.service
+/usr/lib/systemd/user/opd2413-lid-suspend.service
+/usr/lib/systemd/user/graphical-session.target.wants/opd2413-lid-suspend.service
 /etc/kernel/install.d/51-dracut-rescue.install

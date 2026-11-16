@@ -72,10 +72,10 @@ done
 cmp -s "${esp}/dtbs/qcom/sm8750-oneplus-pad2pro.dtb" "${esp}/fedora/${kver}/sm8750-oneplus-pad2pro.dtb" \
     || bad "fixed-path DTB differs from the entry DTB"
 
-# Every device firmware file must be inside the initramfs: 62 stock files, the
-# audio topology and three Adreno microcode files.
+# Every device firmware file must be inside the initramfs: 63 stock files (incl.
+# vpu35_4v.mbn), the audio topology and three Adreno microcode files.
 need=${out}/early-firmware.txt
-[ "$(wc -l < "${need}")" = 66 ] || bad "expected 66 early firmware files, the helper lists $(wc -l < "${need}")"
+[ "$(wc -l < "${need}")" = 67 ] || bad "expected 67 early firmware files, the helper lists $(wc -l < "${need}")"
 missing=0
 while read -r path; do
     grep -qE "[[:space:]]${path#/}\$" "${out}/initrd-list.txt" || { bad "initramfs lacks ${path}"; missing=$((missing + 1)); }
