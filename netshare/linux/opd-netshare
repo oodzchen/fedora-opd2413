@@ -85,6 +85,7 @@ def main(argv: list[str]) -> int:
         print(f"BT Powered:    {st['bt_powered']}")
         print(f"Peer MAC:      {st['peer_mac'] or '-'}")
         print(f"Peer IP:       {st['peer_ip'] or '-'}")
+        print(f"Local IPv6:    {st.get('v6_ip') or '-'}")
         print(f"AP SSID/Freq:  {st['ssid'] or '-'} ({st['freq']} MHz)")
         print(f"TX Bitrate:    {st['tx_bitrate'] or '-'}")
         print(f"RX / TX Bytes: {st['rx_bytes']} / {st['tx_bytes']}")

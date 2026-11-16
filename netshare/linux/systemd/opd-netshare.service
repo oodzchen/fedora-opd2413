@@ -12,7 +12,8 @@ TimeoutStopSec=10
 ExecStopPost=-/usr/bin/pkill -f "^/usr/sbin/wpa_supplicant .*/run/opd-netshare/wpa_supplicant.conf"
 ExecStopPost=-/usr/bin/pkill -f "^(/usr/sbin/|/usr/bin/)?dnsmasq .*--interface=p2p0 "
 ExecStopPost=-/usr/bin/resolvectl revert p2p0
-ExecStopPost=-/usr/bin/env ip route del default dev p2p0
+ExecStopPost=-/usr/bin/env ip -4 route del default dev p2p0
+ExecStopPost=-/usr/bin/env ip -6 route del default dev p2p0
 ExecStopPost=-/usr/bin/firewall-cmd --zone=trusted --remove-interface=p2p0
 ExecStopPost=-/usr/bin/env iw dev p2p0 del
 ExecStopPost=-/usr/bin/rm -rf /run/opd-netshare

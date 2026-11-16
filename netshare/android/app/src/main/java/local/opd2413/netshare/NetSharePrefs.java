@@ -19,6 +19,8 @@ public final class NetSharePrefs {
     public static final String ACTION_DISCONNECT_SESSION = "local.opd2413.netshare.DISCONNECT_SESSION";
     public static final String ACTION_STATE_CHANGED = "local.opd2413.netshare.STATE_CHANGED";
     public static final String ACTION_BLE_MATCH = "local.opd2413.netshare.BLE_MATCH";
+    public static final String ACTION_COMPANION_APPEARED = "local.opd2413.netshare.COMPANION_APPEARED";
+    public static final String EXTRA_COMPANION_MAC = "companion_mac";
 
     private static final String PREF_NAME = "opd_netshare";
     private static final String KEY_ENABLED = "enabled";

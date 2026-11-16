@@ -27,9 +27,11 @@ if [ -n "${JAVA_HOME:-}" ] && [ -x "${JAVA_HOME}/bin/javac" ]; then
 elif command -v javac >/dev/null 2>&1; then
     JAVAC="$(command -v javac)"
     KEYTOOL="$(command -v keytool)"
+    export JAVA_HOME="$(dirname "$(dirname "$(readlink -f "${JAVAC}")")")"
 elif [ -x "/usr/lib/jvm/temurin-21-jdk/bin/javac" ]; then
     JAVAC="/usr/lib/jvm/temurin-21-jdk/bin/javac"
     KEYTOOL="/usr/lib/jvm/temurin-21-jdk/bin/keytool"
+    export JAVA_HOME="/usr/lib/jvm/temurin-21-jdk"
 else
     echo "javac not found; install JDK 17+ or set JAVA_HOME" >&2
     exit 1

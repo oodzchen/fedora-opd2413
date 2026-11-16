@@ -9,6 +9,7 @@
     <string name="btn_disconnect">断开连接</string>
     <string name="btn_check_root">Root 检测</string>
     <string name="btn_battery">电池白名单</string>
+    <string name="btn_companion">伴侣关联</string>
     <string name="btn_clear_log">清除</string>
 
     <string name="label_target_device">目标平板</string>

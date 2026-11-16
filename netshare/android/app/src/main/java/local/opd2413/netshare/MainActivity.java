@@ -7,14 +7,22 @@ import android.app.AlertDialog;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothManager;
+import android.bluetooth.le.ScanFilter;
+import android.companion.AssociationInfo;
+import android.companion.AssociationRequest;
+import android.companion.BluetoothDeviceFilter;
+import android.companion.BluetoothLeDeviceFilter;
+import android.companion.CompanionDeviceManager;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.IntentSender;
 import android.content.pm.PackageManager;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.ParcelUuid;
 import android.os.PowerManager;
 import android.provider.Settings;
 import android.util.TypedValue;
@@ -32,11 +40,13 @@ import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
 public class MainActivity extends Activity {
     private static final int REQ_PERMS = 101;
+    private static final int REQ_COMPANION = 102;
 
     private static final int ROOT_UNKNOWN = 0;
     private static final int ROOT_OK = 1;
@@ -59,8 +69,10 @@ public class MainActivity extends Activity {
     private TextView envPermBadge;
     private TextView envRootBadge;
     private TextView envBatteryBadge;
+    private TextView envCdmBadge;
     private Button rootBtn;
     private Button batBtn;
+    private Button cdmBtn;
 
     private TextView logCountView;
     private Button clearLogBtn;
@@ -120,10 +132,15 @@ public class MainActivity extends Activity {
     }
 
     private void ensureServiceRunningIfEnabled() {
+        String mac = NetSharePrefs.getTargetMac(this);
+        String st = NetSharePrefs.getState();
         if (NetSharePrefs.isEnabled(this)
-                && !NetSharePrefs.getTargetMac(this).isEmpty()
+                && !mac.isEmpty()
                 && hasRequiredPermissions()
-                && NetSharePrefs.STATE_DISABLED.equals(NetSharePrefs.getState())) {
+                && (NetSharePrefs.STATE_DISABLED.equals(st) || NetSharePrefs.STATE_SCANNING.equals(st))) {
+            if (isCompanionAssociated(mac)) {
+                startCompanionPresence(mac);
+            }
             Intent svc = new Intent(this, NetShareService.class);
             svc.setAction(NetSharePrefs.ACTION_START_LISTEN);
             try {
@@ -172,8 +189,10 @@ public class MainActivity extends Activity {
         envPermBadge = findViewById(R.id.env_perm_badge);
         envRootBadge = findViewById(R.id.env_root_badge);
         envBatteryBadge = findViewById(R.id.env_battery_badge);
+        envCdmBadge = findViewById(R.id.env_cdm_badge);
         rootBtn = findViewById(R.id.btn_check_root);
         batBtn = findViewById(R.id.btn_battery);
+        cdmBtn = findViewById(R.id.btn_companion);
 
         logCountView = findViewById(R.id.log_count);
         clearLogBtn = findViewById(R.id.btn_clear_log);
@@ -200,6 +219,7 @@ public class MainActivity extends Activity {
 
         rootBtn.setOnClickListener(v -> checkRootAsync(true));
         batBtn.setOnClickListener(v -> openBatterySettings());
+        cdmBtn.setOnClickListener(v -> requestCompanionAssociation());
 
         envPermBadge.setOnClickListener(v -> {
             if (!hasRequiredPermissions()) {
@@ -207,6 +227,7 @@ public class MainActivity extends Activity {
             }
         });
         envBatteryBadge.setOnClickListener(v -> openBatterySettings());
+        envCdmBadge.setOnClickListener(v -> requestCompanionAssociation());
 
         clearLogBtn.setOnClickListener(v -> {
             NetSharePrefs.clearLogs();
@@ -354,6 +375,147 @@ public class MainActivity extends Activity {
                 }
             });
         }).start();
+    }
+
+    private boolean isCompanionAssociated(String targetMac) {
+        if (targetMac == null || targetMac.isEmpty()) {
+            return false;
+        }
+        CompanionDeviceManager cdm = getSystemService(CompanionDeviceManager.class);
+        if (cdm == null) {
+            return false;
+        }
+        try {
+            List<AssociationInfo> list = cdm.getMyAssociations();
+            if (list == null) {
+                return false;
+            }
+            for (AssociationInfo info : list) {
+                if (info != null && info.getDeviceMacAddress() != null) {
+                    String mac = info.getDeviceMacAddress().toString().trim().toUpperCase(Locale.ROOT);
+                    if (targetMac.equals(mac)) {
+                        return true;
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return false;
+    }
+
+    @SuppressLint("MissingPermission")
+    private void startCompanionPresence(String mac) {
+        if (mac == null || mac.isEmpty() || !hasRequiredPermissions()) {
+            return;
+        }
+        CompanionDeviceManager cdm = getSystemService(CompanionDeviceManager.class);
+        if (cdm == null) {
+            return;
+        }
+        try {
+            cdm.startObservingDevicePresence(mac);
+            NetSharePrefs.appendLog("CDM 已开启设备出现后台监听: " + mac);
+        } catch (Exception e) {
+            NetSharePrefs.appendLog("CDM 开启监听失败: " + e.getMessage());
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private void requestCompanionAssociation() {
+        if (!hasRequiredPermissions()) {
+            requestMissingPermissions();
+            Toast.makeText(this, "请先授予蓝牙权限", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        String targetMac = NetSharePrefs.getTargetMac(this);
+        if (targetMac.isEmpty()) {
+            Toast.makeText(this, "请先选择目标平板", Toast.LENGTH_SHORT).show();
+            showBondedDevicePicker();
+            return;
+        }
+        CompanionDeviceManager cdm = getSystemService(CompanionDeviceManager.class);
+        if (cdm == null) {
+            Toast.makeText(this, "系统不支持 CompanionDeviceManager", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if (isCompanionAssociated(targetMac)) {
+            startCompanionPresence(targetMac);
+            refreshUi();
+            Toast.makeText(this, "已关联系统伴侣设备，后台监听已刷新", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        BluetoothDeviceFilter btFilter = new BluetoothDeviceFilter.Builder()
+                .setAddress(targetMac)
+                .build();
+        BluetoothLeDeviceFilter bleFilter = new BluetoothLeDeviceFilter.Builder()
+                .setScanFilter(new ScanFilter.Builder()
+                        .setServiceUuid(new ParcelUuid(NetSharePrefs.ADV_UUID))
+                        .build())
+                .build();
+        AssociationRequest req = new AssociationRequest.Builder()
+                .addDeviceFilter(btFilter)
+                .addDeviceFilter(bleFilter)
+                .setSingleDevice(true)
+                .build();
+        Toast.makeText(this, "正在请求系统伴侣设备关联...", Toast.LENGTH_SHORT).show();
+        cdm.associate(req, getMainExecutor(), new CompanionDeviceManager.Callback() {
+            @Override
+            public void onAssociationPending(IntentSender intentSender) {
+                try {
+                    startIntentSenderForResult(intentSender, REQ_COMPANION, null, 0, 0, 0);
+                } catch (IntentSender.SendIntentException e) {
+                    Toast.makeText(MainActivity.this, "弹出关联确认失败: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                }
+            }
+
+            @Override
+            public void onAssociationCreated(AssociationInfo associationInfo) {
+                String mac = (associationInfo != null && associationInfo.getDeviceMacAddress() != null)
+                        ? associationInfo.getDeviceMacAddress().toString().trim().toUpperCase(Locale.ROOT)
+                        : targetMac;
+                startCompanionPresence(mac);
+                if (NetSharePrefs.isEnabled(MainActivity.this)) {
+                    Intent svc = new Intent(MainActivity.this, NetShareService.class);
+                    svc.setAction(NetSharePrefs.ACTION_START_LISTEN);
+                    startForegroundService(svc);
+                }
+                refreshUi();
+                Toast.makeText(MainActivity.this, "系统伴侣关联成功", Toast.LENGTH_SHORT).show();
+            }
+
+            @Override
+            public void onFailure(CharSequence error) {
+                String msg = error == null ? "未发现平板广播" : error.toString();
+                NetSharePrefs.appendLog("CDM 关联失败: " + msg);
+                new AlertDialog.Builder(MainActivity.this)
+                        .setTitle("伴侣关联未找到设备")
+                        .setMessage("系统在扫描周期内未收到平板广播 (" + msg + ")。\n\n请先在平板上开启「立即互联」（或断开平板 Wi-Fi 使其处于待连广播状态），再点击「伴侣关联」。")
+                        .setPositiveButton("知道了", null)
+                        .show();
+                refreshUi();
+            }
+        });
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQ_COMPANION && resultCode == RESULT_OK) {
+            String targetMac = NetSharePrefs.getTargetMac(this);
+            AssociationInfo info = data != null
+                    ? data.getParcelableExtra(CompanionDeviceManager.EXTRA_ASSOCIATION, AssociationInfo.class)
+                    : null;
+            String mac = (info != null && info.getDeviceMacAddress() != null)
+                    ? info.getDeviceMacAddress().toString().trim().toUpperCase(Locale.ROOT)
+                    : targetMac;
+            startCompanionPresence(mac);
+            if (NetSharePrefs.isEnabled(this)) {
+                Intent svc = new Intent(this, NetShareService.class);
+                svc.setAction(NetSharePrefs.ACTION_START_LISTEN);
+                startForegroundService(svc);
+            }
+            refreshUi();
+        }
     }
 
     private void openBatterySettings() {
@@ -524,6 +686,10 @@ public class MainActivity extends Activity {
         PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
         boolean batExempt = pm != null && pm.isIgnoringBatteryOptimizations(getPackageName());
         styleEnvBadge(envBatteryBadge, batExempt, true, batExempt ? "电池 已放行" : "电池 受限");
+
+        boolean cdmOk = isCompanionAssociated(mac);
+        styleEnvBadge(envCdmBadge, cdmOk, !mac.isEmpty(),
+                mac.isEmpty() ? "伴侣 未选" : (cdmOk ? "伴侣 已关联" : "伴侣 未关联"));
 
         int count = NetSharePrefs.getLogCount();
         logCountView.setText(count > 0 ? "(" + count + ")" : "");

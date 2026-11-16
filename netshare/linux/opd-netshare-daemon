@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import configparser
+import ipaddress
 import json
 import os
 import re
@@ -47,6 +48,7 @@ AP_CIDR = "192.168.49.1/24"
 DHCP_START = "192.168.49.100"
 DHCP_END = "192.168.49.150"
 DNS_SERVERS = ["223.5.5.5", "119.29.29.29"]
+DNS6_SERVERS = ["2400:3200::1", "2402:4e00::"]
 
 METRIC_AUTO_FALLBACK = 700
 METRIC_OVERRIDE_WIFI = 550
@@ -132,6 +134,41 @@ def random_credentials() -> tuple[str, str]:
     return f"DIRECT-op-{suffix}", psk
 
 
+def get_iface_v6_ll(iface: str = AP_IFACE) -> str:
+    """Return non-tentative link-local IPv6 address (without /prefix) on iface, or ''."""
+    res = run_cmd(["ip", "-6", "-o", "addr", "show", "dev", iface, "scope", "link"])
+    for line in res.stdout.splitlines():
+        if "tentative" in line:
+            continue
+        m = re.search(r"\binet6\s+(fe80:[0-9a-fA-F:]+)/\d+", line)
+        if m:
+            try:
+                addr = ipaddress.IPv6Address(m.group(1))
+                if addr.is_link_local:
+                    return str(addr)
+            except ValueError:
+                pass
+    return ""
+
+
+def normalize_v6_addr(raw: str, *, require_link_local: bool = False) -> str:
+    """Validate and canonicalize an IPv6 address string, returning '' if invalid."""
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    if "%" in text:
+        text = text.split("%", 1)[0]
+    try:
+        addr = ipaddress.IPv6Address(text)
+    except ValueError:
+        return ""
+    if require_link_local:
+        return str(addr) if addr.is_link_local else ""
+    if addr.is_link_local or addr.is_loopback or addr.is_multicast or addr.is_unspecified:
+        return ""
+    return str(addr)
+
+
 def probe_wlp1s0_internet() -> tuple[bool, bool]:
     """Return (wlp1s0_has_default_route, wlp1s0_internet_ok) bound directly to wlp1s0."""
     res = run_cmd(["ip", "-4", "route", "show", "dev", "wlp1s0"])
@@ -143,7 +180,7 @@ def probe_wlp1s0_internet() -> tuple[bool, bool]:
     for host, port in (("223.5.5.5", 53), ("119.29.29.29", 53)):
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
-            sock.settimeout(2.0)
+            sock.settimeout(1.2)
             sock.setsockopt(socket.SOL_SOCKET, so_bindtodevice, b"wlp1s0\x00")
             sock.connect((host, port))
             return True, True
@@ -334,14 +371,18 @@ class NetShareDaemon:
         self.freq = 2462
         self.peer_mac = ""
         self.peer_ip = ""
+        self.p2p_v6_ip = ""
+        self.p2p_v6_ll = ""
         self.active_metric = METRIC_AUTO_FALLBACK
 
+        self.ap_lock = threading.RLock()
         self.wpas_proc: subprocess.Popen[str] | None = None
         self.dnsmasq_proc: subprocess.Popen[str] | None = None
         self.rfcomm_sock: socket.socket | None = None
         self.rfcomm_thread: threading.Thread | None = None
         self.adv_registered = False
         self.profile_registered = False
+        self.ap_started_for_session = False
 
         self.wlp_ok_streak = 0
         self.wlp_down_streak = 0
@@ -363,6 +404,7 @@ class NetShareDaemon:
         self._register_dbus_objects()
         self._subscribe_logind_sleep()
         self._subscribe_bluez_signals()
+        self._subscribe_nm_signals()
 
         threading.Thread(target=self._wlp_probe_loop, daemon=True).start()
         GLib.timeout_add_seconds(3, self._tick)
@@ -403,7 +445,8 @@ class NetShareDaemon:
         tmp.replace(CONFIG_PATH)
 
     def cleanup_stale_system_state(self) -> None:
-        run_cmd(["ip", "route", "del", "default", "dev", AP_IFACE])
+        run_cmd(["ip", "-4", "route", "del", "default", "dev", AP_IFACE])
+        run_cmd(["ip", "-6", "route", "del", "default", "dev", AP_IFACE])
         run_cmd(["firewall-cmd", "--zone=trusted", f"--remove-interface={AP_IFACE}"])
         run_cmd(["pkill", "-f", rf"^/usr/sbin/wpa_supplicant .*{WPAS_CONF}"])
         run_cmd(["pkill", "-f", rf"^(/usr/sbin/|/usr/bin/)?dnsmasq .*--interface={AP_IFACE} "])
@@ -650,123 +693,150 @@ class NetShareDaemon:
 
     # ---------------- AP + DHCP + Route lifecycle ----------------
 
-    def _start_ap(self, freq_override: int | None = None) -> None:
-        if self.wpas_proc is not None:
-            return
-        RUN_DIR.mkdir(parents=True, exist_ok=True)
-        WPAS_CTRL_DIR.mkdir(parents=True, exist_ok=True)
-        os.chmod(RUN_DIR, 0o700)
-        os.chmod(WPAS_CTRL_DIR, 0o700)
+    def _configure_p2p0_v6_sysctl(self) -> None:
+        sysctls = {
+            f"/proc/sys/net/ipv6/conf/{AP_IFACE}/disable_ipv6": "0",
+            f"/proc/sys/net/ipv6/conf/{AP_IFACE}/accept_ra": "0",
+            f"/proc/sys/net/ipv6/conf/{AP_IFACE}/use_tempaddr": "0",
+            f"/proc/sys/net/ipv6/conf/{AP_IFACE}/dad_transmits": "0",
+            f"/proc/sys/net/ipv6/conf/{AP_IFACE}/accept_dad": "0",
+        }
+        for path, val in sysctls.items():
+            try:
+                Path(path).write_text(val, encoding="utf-8")
+            except OSError:
+                pass
 
-        self.ssid, self.psk = random_credentials()
-        wlp_freq = get_wlp1s0_freq()
-        if wlp_freq is None:
-            ensure_regdomain_cn_unassociated()
+    def _start_ap(self, freq_override: int | None = None, peer_sta_freq: int | None = None) -> None:
+        with self.ap_lock:
+            if self.wpas_proc is not None:
+                return
+            RUN_DIR.mkdir(parents=True, exist_ok=True)
+            WPAS_CTRL_DIR.mkdir(parents=True, exist_ok=True)
+            os.chmod(RUN_DIR, 0o700)
+            os.chmod(WPAS_CTRL_DIR, 0o700)
+
+            self.ssid, self.psk = random_credentials()
+            self.p2p_v6_ip = ""
+            self.p2p_v6_ll = ""
             wlp_freq = get_wlp1s0_freq()
-        phy_country = get_phy_country()
-        if freq_override is not None:
-            self.freq = freq_override
-        else:
-            with self.lock:
-                pref_5g = self.last_wlp_5g_freq
-                failed = dict(self.failed_freqs)
-            self.freq = pick_ap_candidates(
-                wlp_freq,
-                get_ap_allowed_5g_freqs(),
-                preferred_5g=pref_5g,
-                failed_freqs=failed,
-            )[0]
+            if wlp_freq is None:
+                ensure_regdomain_cn_unassociated()
+                wlp_freq = get_wlp1s0_freq()
+            phy_country = get_phy_country()
+            if freq_override is not None:
+                self.freq = freq_override
+            else:
+                with self.lock:
+                    pref_5g = peer_sta_freq if (peer_sta_freq is not None and peer_sta_freq >= 5000) else self.last_wlp_5g_freq
+                    failed = dict(self.failed_freqs)
+                self.freq = pick_ap_candidates(
+                    wlp_freq,
+                    get_ap_allowed_5g_freqs(),
+                    preferred_5g=pref_5g,
+                    failed_freqs=failed,
+                    peer_sta_freq=peer_sta_freq,
+                )[0]
 
-        run_cmd(["iw", "dev", AP_IFACE, "del"])
-        res = run_cmd(["iw", "phy", "phy0", "interface", "add", AP_IFACE, "type", "__ap"])
-        if res.returncode != 0:
-            raise RuntimeError(f"iw interface add failed: {res.stderr.strip()}")
-        run_cmd(["ip", "link", "set", AP_IFACE, "up"], check=True)
+            run_cmd(["iw", "dev", AP_IFACE, "del"])
+            res = run_cmd(["iw", "phy", "phy0", "interface", "add", AP_IFACE, "type", "__ap"])
+            if res.returncode != 0:
+                raise RuntimeError(f"iw interface add failed: {res.stderr.strip()}")
+            self._configure_p2p0_v6_sysctl()
+            run_cmd(["ip", "link", "set", AP_IFACE, "up"], check=True)
 
-        header_lines = [
-            f"ctrl_interface={WPAS_CTRL_DIR}",
-            "ap_scan=2",
-            "p2p_disabled=1",
-        ]
-        # Never inject a country change while wlp1s0 is associated (WCN7860 firmware crash risk).
-        if wlp_freq is None and phy_country != "CN":
-            header_lines.append("country=CN")
+            header_lines = [
+                f"ctrl_interface={WPAS_CTRL_DIR}",
+                "ap_scan=2",
+                "p2p_disabled=1",
+            ]
+            # Never inject a country change while wlp1s0 is associated (WCN7860 firmware crash risk).
+            if wlp_freq is None and phy_country != "CN":
+                header_lines.append("country=CN")
 
-        net_lines = [
-            f'    ssid="{self.ssid}"',
-            "    mode=2",
-            f"    frequency={self.freq}",
-            "    beacon_int=100",
-            "    key_mgmt=WPA-PSK",
-            "    proto=RSN",
-            "    pairwise=CCMP",
-            "    group=CCMP",
-            f'    psk="{self.psk}"',
-        ]
-        if self.freq >= 5000:
-            net_lines.extend(["    vht=1", "    he=1"])
-            if self.freq in FREQ_80_MAP:
-                ht40, cf1 = FREQ_80_MAP[self.freq]
-                net_lines.extend(
-                    [
-                        f"    ht40={ht40}",
-                        "    max_oper_chwidth=1",
-                        f"    vht_center_freq1={cf1}",
-                    ]
-                )
+            net_lines = [
+                f'    ssid="{self.ssid}"',
+                "    mode=2",
+                f"    frequency={self.freq}",
+                "    beacon_int=100",
+                "    key_mgmt=WPA-PSK",
+                "    proto=RSN",
+                "    pairwise=CCMP",
+                "    group=CCMP",
+                f'    psk="{self.psk}"',
+            ]
+            if self.freq >= 5000:
+                net_lines.extend(["    vht=1", "    he=1"])
+                if self.freq in FREQ_80_MAP:
+                    ht40, cf1 = FREQ_80_MAP[self.freq]
+                    net_lines.extend(
+                        [
+                            f"    ht40={ht40}",
+                            "    max_oper_chwidth=1",
+                            f"    vht_center_freq1={cf1}",
+                        ]
+                    )
 
-        conf = "\n".join(header_lines) + "\nnetwork={\n" + "\n".join(net_lines) + "\n}\n"
-        WPAS_CONF.write_text(conf, encoding="utf-8")
-        os.chmod(WPAS_CONF, 0o600)
+            conf = "\n".join(header_lines) + "\nnetwork={\n" + "\n".join(net_lines) + "\n}\n"
+            WPAS_CONF.write_text(conf, encoding="utf-8")
+            os.chmod(WPAS_CONF, 0o600)
 
-        # Do NOT pass -B/-f/-P: wpa_supplicant 2.11 on F45 segfaults with -B/-f/-P.
-        self.wpas_proc = subprocess.Popen(
-            ["/usr/sbin/wpa_supplicant", "-i", AP_IFACE, "-D", "nl80211", "-c", str(WPAS_CONF)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-        threading.Thread(target=self._drain_proc_log, args=("wpa_supplicant", self.wpas_proc), daemon=True).start()
+            # Do NOT pass -B/-f/-P: wpa_supplicant 2.11 on F45 segfaults with -B/-f/-P.
+            self.wpas_proc = subprocess.Popen(
+                ["/usr/sbin/wpa_supplicant", "-i", AP_IFACE, "-D", "nl80211", "-c", str(WPAS_CONF)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            threading.Thread(target=self._drain_proc_log, args=("wpa_supplicant", self.wpas_proc), daemon=True).start()
 
-        deadline = time.monotonic() + 8.0
-        ap_up = False
-        while time.monotonic() < deadline:
-            if self.wpas_proc.poll() is not None:
-                raise RuntimeError("wpa_supplicant exited unexpectedly")
-            info = run_cmd(["iw", "dev", AP_IFACE, "info"])
-            if "type AP" in info.stdout and "channel " in info.stdout:
-                ap_up = True
-                break
-            time.sleep(0.25)
-        if not ap_up:
-            raise RuntimeError("Timed out waiting for p2p0 AP enable")
+            deadline = time.monotonic() + 8.0
+            ap_up = False
+            actual_freq: int | None = None
+            while time.monotonic() < deadline:
+                if self.wpas_proc.poll() is not None:
+                    raise RuntimeError("wpa_supplicant exited unexpectedly")
+                info = run_cmd(["iw", "dev", AP_IFACE, "info"])
+                if "type AP" in info.stdout and "channel " in info.stdout:
+                    m = re.search(r"channel\s+\d+\s+\((\d+)\s+MHz\)", info.stdout)
+                    if m:
+                        actual_freq = int(m.group(1))
+                    ap_up = True
+                    break
+                time.sleep(0.15)
+            if not ap_up:
+                raise RuntimeError("Timed out waiting for p2p0 AP enable")
+            if actual_freq is not None and actual_freq != self.freq:
+                log(f"AP actual primary freq shifted {self.freq} -> {actual_freq} MHz")
+                self.freq = actual_freq
+            time.sleep(0.2)
 
-        run_cmd(["ip", "addr", "replace", AP_CIDR, "dev", AP_IFACE], check=True)
-        run_cmd(["firewall-cmd", "--zone=trusted", f"--add-interface={AP_IFACE}"], check=True)
+            run_cmd(["ip", "addr", "replace", AP_CIDR, "dev", AP_IFACE], check=True)
+            run_cmd(["firewall-cmd", "--zone=trusted", f"--add-interface={AP_IFACE}"], check=True)
 
-        # Bind strictly to p2p0 / 192.168.49.1, no DNS port, no default gateway/DNS option to phone.
-        self.dnsmasq_proc = subprocess.Popen(
-            [
-                "/usr/sbin/dnsmasq",
-                "-k",
-                f"--interface={AP_IFACE}",
-                "--bind-interfaces",
-                f"--listen-address={AP_GW_IP}",
-                f"--dhcp-range={DHCP_START},{DHCP_END},255.255.255.0,12h",
-                "--dhcp-option=3",
-                "--dhcp-option=6",
-                "--no-resolv",
-                "--port=0",
-                "--leasefile-ro",
-                "--log-dhcp",
-                "--log-facility=-",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-        threading.Thread(target=self._watch_dnsmasq, args=(self.dnsmasq_proc,), daemon=True).start()
-        log(f"Started AP {self.ssid} on {AP_IFACE} freq={self.freq} MHz")
+            # Bind strictly to p2p0 / 192.168.49.1, no DNS port, no default gateway/DNS option to phone.
+            self.dnsmasq_proc = subprocess.Popen(
+                [
+                    "/usr/sbin/dnsmasq",
+                    "-k",
+                    f"--interface={AP_IFACE}",
+                    "--bind-interfaces",
+                    f"--listen-address={AP_GW_IP}",
+                    f"--dhcp-range={DHCP_START},{DHCP_END},255.255.255.0,12h",
+                    "--dhcp-option=3",
+                    "--dhcp-option=6",
+                    "--no-resolv",
+                    "--port=0",
+                    "--leasefile-ro",
+                    "--log-dhcp",
+                    "--log-facility=-",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            threading.Thread(target=self._watch_dnsmasq, args=(self.dnsmasq_proc,), daemon=True).start()
+            log(f"Started AP {self.ssid} on {AP_IFACE} freq={self.freq} MHz")
 
     def _drain_proc_log(self, tag: str, proc: subprocess.Popen[str]) -> None:
         if not proc.stdout:
@@ -809,58 +879,174 @@ class NetShareDaemon:
                 return
         self._evaluate_state()
 
-    def _on_dhcp_lease_cb(self, peer_ip: str) -> bool:
-        self._submit_worker(self._apply_peer_route_if_active, peer_ip)
+    def _on_dhcp_lease_cb(
+        self,
+        peer_ip: str,
+        v6_ll: str | None = None,
+        v6_ip: str | None = None,
+        v6_out: str | None = None,
+    ) -> bool:
+        self._submit_worker(self._apply_peer_route_if_active, peer_ip, v6_ll, v6_ip, v6_out)
         return False
 
-    def _apply_peer_route_if_active(self, peer_ip: str) -> None:
+    def _apply_peer_route_if_active(
+        self,
+        peer_ip: str,
+        v6_ll: str | None = None,
+        v6_ip: str | None = None,
+        v6_out: str | None = None,
+    ) -> None:
         with self.lock:
             if self.state == "idle":
                 return
-        self._apply_peer_route(peer_ip)
+        self._apply_peer_route(peer_ip, v6_ll=v6_ll, v6_ip=v6_ip, v6_out=v6_out)
 
-    def _apply_peer_route(self, peer_ip: str) -> None:
-        with self.lock:
-            self.peer_ip = peer_ip
-            self.failed_freqs.pop(self.freq, None)
-            # Beat dead/captive Wi-Fi (metric 600) or explicit Force mode; otherwise stay fallback 700.
-            metric = METRIC_OVERRIDE_WIFI if (self.mode == "force" or (self.wlp_has_def and not self.wlp_net_ok)) else METRIC_AUTO_FALLBACK
-            self.active_metric = metric
-        run_cmd(["ip", "route", "replace", "default", "via", peer_ip, "dev", AP_IFACE, "proto", "static", "src", AP_GW_IP, "metric", str(metric)])
-        run_cmd(["resolvectl", "dns", AP_IFACE, *DNS_SERVERS])
-        run_cmd(["resolvectl", "default-route", AP_IFACE, "true"])
+    def _apply_peer_route(
+        self,
+        peer_ip: str,
+        v6_ll: str | None = None,
+        v6_ip: str | None = None,
+        v6_out: str | None = None,
+    ) -> None:
+        with self.ap_lock:
+            if self.wpas_proc is None:
+                return
+            with self.lock:
+                self.peer_ip = peer_ip
+                self.failed_freqs.pop(self.freq, None)
+                # Beat dead/captive Wi-Fi (metric 600) or explicit Force mode; otherwise stay fallback 700.
+                metric = (
+                    METRIC_OVERRIDE_WIFI
+                    if (self.mode == "force" or (self.wlp_has_def and not self.wlp_net_ok))
+                    else METRIC_AUTO_FALLBACK
+                )
+                self.active_metric = metric
+
+            run_cmd(
+                [
+                    "ip",
+                    "-4",
+                    "route",
+                    "replace",
+                    "default",
+                    "via",
+                    peer_ip,
+                    "dev",
+                    AP_IFACE,
+                    "proto",
+                    "static",
+                    "src",
+                    AP_GW_IP,
+                    "metric",
+                    str(metric),
+                ]
+            )
+
+            dns_servers = list(DNS_SERVERS)
+            v6_summary = ""
+            if v6_ll is not None or v6_ip is not None or v6_out is not None:
+                clean_ll = normalize_v6_addr(v6_ll or "", require_link_local=True)
+                clean_ip = normalize_v6_addr(v6_ip or "", require_link_local=False)
+                out_ok = str(v6_out or "").strip() not in ("", "none")
+                if clean_ll and clean_ip and out_ok:
+                    old_v6 = self.p2p_v6_ip
+                    if old_v6 and old_v6 != clean_ip:
+                        run_cmd(["ip", "-6", "addr", "del", f"{old_v6}/128", "dev", AP_IFACE])
+                    run_cmd(["ip", "-6", "addr", "replace", f"{clean_ip}/128", "dev", AP_IFACE, "nodad"])
+                    run_cmd(
+                        [
+                            "ip",
+                            "-6",
+                            "route",
+                            "replace",
+                            "default",
+                            "via",
+                            clean_ll,
+                            "dev",
+                            AP_IFACE,
+                            "proto",
+                            "static",
+                            "src",
+                            clean_ip,
+                            "metric",
+                            str(metric),
+                        ]
+                    )
+                    self.p2p_v6_ip = clean_ip
+                    self.p2p_v6_ll = clean_ll
+                    dns_servers.extend(DNS6_SERVERS)
+                    v6_summary = f", v6={clean_ip} via {clean_ll}"
+                else:
+                    run_cmd(["ip", "-6", "route", "del", "default", "dev", AP_IFACE])
+                    if self.p2p_v6_ip:
+                        run_cmd(["ip", "-6", "addr", "del", f"{self.p2p_v6_ip}/128", "dev", AP_IFACE])
+                    self.p2p_v6_ip = ""
+                    self.p2p_v6_ll = ""
+            elif self.p2p_v6_ip and self.p2p_v6_ll:
+                run_cmd(
+                    [
+                        "ip",
+                        "-6",
+                        "route",
+                        "replace",
+                        "default",
+                        "via",
+                        self.p2p_v6_ll,
+                        "dev",
+                        AP_IFACE,
+                        "proto",
+                        "static",
+                        "src",
+                        self.p2p_v6_ip,
+                        "metric",
+                        str(metric),
+                    ]
+                )
+                dns_servers.extend(DNS6_SERVERS)
+                v6_summary = f", v6={self.p2p_v6_ip} via {self.p2p_v6_ll}"
+
+            run_cmd(["resolvectl", "dns", AP_IFACE, *dns_servers])
+            run_cmd(["resolvectl", "default-route", AP_IFACE, "true"])
+
         with self.lock:
             self.state = "connected"
             self.station_missing_ticks = 0
             self.last_error = ""
         self._unregister_adv()
-        log(f"Connected via phone {peer_ip} (metric={metric})")
+        log(f"Connected via phone {peer_ip} (metric={metric}{v6_summary})")
         self._emit_status()
 
     def _stop_ap_and_routes(self) -> None:
-        run_cmd(["resolvectl", "revert", AP_IFACE])
-        run_cmd(["ip", "route", "del", "default", "dev", AP_IFACE])
-        run_cmd(["firewall-cmd", "--zone=trusted", f"--remove-interface={AP_IFACE}"])
+        with self.ap_lock:
+            run_cmd(["resolvectl", "revert", AP_IFACE])
+            run_cmd(["ip", "-4", "route", "del", "default", "dev", AP_IFACE])
+            run_cmd(["ip", "-6", "route", "del", "default", "dev", AP_IFACE])
+            if self.p2p_v6_ip:
+                run_cmd(["ip", "-6", "addr", "del", f"{self.p2p_v6_ip}/128", "dev", AP_IFACE])
+            run_cmd(["firewall-cmd", "--zone=trusted", f"--remove-interface={AP_IFACE}"])
 
-        with self.lock:
-            procs = (self.dnsmasq_proc, self.wpas_proc)
-            self.dnsmasq_proc = None
-            self.wpas_proc = None
+            with self.lock:
+                procs = (self.dnsmasq_proc, self.wpas_proc)
+                self.dnsmasq_proc = None
+                self.wpas_proc = None
 
-        for proc in procs:
-            if proc is not None and proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=3.0)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
+            for proc in procs:
+                if proc is not None and proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=3.0)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
 
-        run_cmd(["iw", "dev", AP_IFACE, "del"])
-        shutil.rmtree(RUN_DIR, ignore_errors=True)
-        with self.lock:
-            self.ssid = ""
-            self.psk = ""
-            self.peer_ip = ""
+            run_cmd(["iw", "dev", AP_IFACE, "del"])
+            shutil.rmtree(RUN_DIR, ignore_errors=True)
+            with self.lock:
+                self.ssid = ""
+                self.psk = ""
+                self.peer_ip = ""
+                self.p2p_v6_ip = ""
+                self.p2p_v6_ll = ""
+                self.ap_started_for_session = False
 
     def _close_rfcomm(self, send_stop: bool) -> None:
         with self.lock:
@@ -912,27 +1098,20 @@ class NetShareDaemon:
                     self.wlp_net_ok = True
                     self.wlp_ok_streak = 2
                     self.wlp_down_streak = 0
-                log("wlp1s0 already has internet before advertising; skipping AP startup")
+                log("wlp1s0 already has internet before advertising; skipping BLE wakeup")
                 self._emit_status()
                 return
         if not self._ensure_bt_powered(True):
             self._emit_status()
             return
         try:
-            try:
-                self._start_ap()
-            except Exception as ap_exc:
-                if self.freq >= 5000:
-                    log(f"5 GHz AP startup failed on {self.freq} MHz ({ap_exc}); falling back to 2462 MHz")
-                    self._stop_ap_and_routes()
-                    self._start_ap(freq_override=2462)
-                else:
-                    raise
             self._register_profile()
             with self.lock:
                 self.state = "advertising"
+                self.ap_started_for_session = False
                 self.last_error = ""
             self._register_adv()
+            log("Advertising BLE wakeup (on-demand AP deferred until peer connects)")
         except Exception as exc:
             with self.lock:
                 self.last_error = str(exc)
@@ -943,6 +1122,7 @@ class NetShareDaemon:
     # ---------------- RFCOMM connection thread ----------------
 
     def _send_start_payload(self, sock: socket.socket, mac: str) -> None:
+        v6_ll = get_iface_v6_ll(AP_IFACE)
         with self.lock:
             payload = json.dumps(
                 {
@@ -951,11 +1131,45 @@ class NetShareDaemon:
                     "psk": self.psk,
                     "freq": self.freq,
                     "gw": AP_GW_IP,
+                    "v6_ll": v6_ll,
                 },
                 separators=(",", ":"),
             )
         sock.sendall((payload + "\n").encode("utf-8"))
-        log(f"Sent session credentials over RFCOMM to {mac} (freq={self.freq} MHz)")
+        log(f"Sent session credentials over RFCOMM to {mac} (freq={self.freq} MHz, v6_ll={v6_ll or '-'})")
+
+    def _wait_for_peer_hello(self, sock: socket.socket) -> tuple[int | None, bytes]:
+        """Wait briefly for peer hello JSON containing sta_freq before spinning up AP."""
+        buf = b""
+        deadline = time.monotonic() + 0.45
+        while time.monotonic() < deadline:
+            with self.lock:
+                if self.rfcomm_sock is not sock or self.shutting_down or self.state == "idle":
+                    return None, buf
+            rem = max(0.05, deadline - time.monotonic())
+            sock.settimeout(rem)
+            try:
+                chunk = sock.recv(1024)
+            except socket.timeout:
+                break
+            if not chunk:
+                return None, b""
+            buf += chunk
+            if b"\n" in buf:
+                line, rest = buf.split(b"\n", 1)
+                text = line.decode("utf-8", errors="replace").strip()
+                if text:
+                    try:
+                        msg = json.loads(text)
+                        if msg.get("event") == "hello":
+                            sta = int(msg.get("sta_freq") or 0)
+                            log(f"RFCOMM hello received (sta_freq={sta})")
+                            return (sta if sta >= 2412 else None), rest
+                    except (json.JSONDecodeError, TypeError, ValueError):
+                        pass
+                # Non-hello line: push back for normal loop processing.
+                return None, line + b"\n" + rest
+        return None, buf
 
     def _handle_rfcomm_client(self, sock: socket.socket, mac: str) -> None:
         try:
@@ -966,21 +1180,35 @@ class NetShareDaemon:
                 self.rfcomm_sock = sock
                 self.peer_mac = mac
                 self.rfcomm_had_lease = False
+                self.ap_started_for_session = False
                 self.last_keepalive = time.monotonic()
+
+            peer_sta_freq, buf = self._wait_for_peer_hello(sock)
+            with self.ap_lock:
+                with self.lock:
+                    if self.rfcomm_sock is not sock or self.shutting_down or self.state == "idle":
+                        return
+                try:
+                    self._start_ap(peer_sta_freq=peer_sta_freq)
+                except Exception as ap_exc:
+                    if self.freq >= 5000:
+                        log(f"5 GHz AP startup failed on {self.freq} MHz ({ap_exc}); falling back to 2462 MHz")
+                        self._stop_ap_and_routes()
+                        self._start_ap(freq_override=2462)
+                    else:
+                        raise
+                with self.lock:
+                    self.ap_started_for_session = True
+            self._emit_status()
+
             sock.settimeout(2.0)
             self._send_start_payload(sock, mac)
 
-            buf = b""
             while True:
                 with self.lock:
                     if self.rfcomm_sock is not sock:
                         break
                 try:
-                    chunk = sock.recv(1024)
-                    if not chunk:
-                        log(f"RFCOMM EOF from {mac}")
-                        break
-                    buf += chunk
                     while b"\n" in buf:
                         line, buf = buf.split(b"\n", 1)
                         text = line.decode("utf-8", errors="replace").strip()
@@ -1006,14 +1234,33 @@ class NetShareDaemon:
                                 sta_freq = 0
                             self._submit_worker(self._handle_peer_p2p_failed, sock, mac, failed_freq, sta_freq)
                             continue
-                        if msg.get("ip") and str(msg["ip"]).startswith("192.168.49."):
-                            with self.lock:
-                                self.rfcomm_had_lease = True
-                            GLib.idle_add(self._on_dhcp_lease_cb, str(msg["ip"]))
+                        if evt == "upstream_update" or (
+                            msg.get("ip") and str(msg["ip"]).startswith("192.168.49.")
+                        ):
+                            ip_str = str(msg.get("ip") or "")
+                            if not ip_str.startswith("192.168.49."):
+                                with self.lock:
+                                    ip_str = self.peer_ip
+                            if ip_str.startswith("192.168.49."):
+                                with self.lock:
+                                    self.rfcomm_had_lease = True
+                                v6_ll = str(msg.get("v6_ll", "")) if ("v6_ll" in msg or "v6_ip" in msg or "v6_out" in msg) else None
+                                v6_ip = str(msg.get("v6_ip", "")) if ("v6_ll" in msg or "v6_ip" in msg or "v6_out" in msg) else None
+                                v6_out = str(msg.get("v6_out", "")) if ("v6_ll" in msg or "v6_ip" in msg or "v6_out" in msg) else None
+                                GLib.idle_add(self._on_dhcp_lease_cb, ip_str, v6_ll, v6_ip, v6_out)
+                    chunk = sock.recv(1024)
+                    if not chunk:
+                        log(f"RFCOMM EOF from {mac}")
+                        break
+                    buf += chunk
                 except socket.timeout:
                     continue
         except OSError as exc:
             log(f"RFCOMM error ({mac}): {exc}")
+        except Exception as exc:
+            log(f"RFCOMM session failed ({mac}): {exc}")
+            with self.lock:
+                self.last_error = str(exc)
         GLib.idle_add(self._on_peer_disconnect_cb, sock, "rfcomm disconnected")
 
     def _handle_peer_p2p_failed(self, sock: socket.socket, mac: str, failed_freq: int, sta_freq: int) -> None:
@@ -1023,7 +1270,7 @@ class NetShareDaemon:
                 return
             eff_failed = failed_freq if failed_freq >= 2412 else self.freq
             if eff_failed >= 2412:
-                self.failed_freqs[eff_failed] = now + 180.0
+                self.failed_freqs[eff_failed] = now + 60.0
             pref_5g = sta_freq if sta_freq >= 5000 else self.last_wlp_5g_freq
             peer_sta = sta_freq if sta_freq >= 2412 else None
             failed_copy = dict(self.failed_freqs)
@@ -1042,8 +1289,10 @@ class NetShareDaemon:
         next_freq = next((c for c in candidates if failed_copy.get(c, 0.0) <= now), None)
         if next_freq is None or next_freq == eff_failed:
             log(f"All AP candidate channels exhausted (last={eff_failed} MHz, sta_freq={sta_freq}); resetting session")
+            with self.lock:
+                self.failed_freqs.clear()
             self._teardown_session(send_stop=True, keep_bt_on=keep_bt)
-            GLib.timeout_add_seconds(3, self._evaluate_state_cb)
+            GLib.timeout_add_seconds(2, self._evaluate_state_cb)
             return
 
         log(f"Phone P2P failed on {eff_failed} MHz (sta_freq={sta_freq}); switching session AP to {next_freq} MHz")
@@ -1061,6 +1310,7 @@ class NetShareDaemon:
             with self.lock:
                 if self.rfcomm_sock is not sock or self.shutting_down:
                     return
+                self.ap_started_for_session = True
                 self.state = "advertising"
                 self.last_error = ""
             self._send_start_payload(sock, mac)
@@ -1080,17 +1330,22 @@ class NetShareDaemon:
         with self.lock:
             matched = self.rfcomm_sock is sock or self.state == "connected"
             keep_bt = self.mode != "off"
-            pre_lease_fail = matched and (not self.rfcomm_had_lease) and self.freq >= 2412
+            pre_lease_fail = (
+                matched
+                and self.ap_started_for_session
+                and (not self.rfcomm_had_lease)
+                and self.freq >= 2412
+            )
             failed_freq = self.freq
             if pre_lease_fail and failed_freq >= 2412:
-                self.failed_freqs[failed_freq] = time.monotonic() + 120.0
+                self.failed_freqs[failed_freq] = time.monotonic() + 60.0
         if matched:
             if pre_lease_fail:
                 log(f"Peer link ended before DHCP lease on {failed_freq} MHz ({reason}); cooling channel")
             else:
                 log(f"Peer link ended: {reason}")
             self._teardown_session(send_stop=False, keep_bt_on=keep_bt)
-            GLib.timeout_add_seconds(3, self._evaluate_state_cb)
+            GLib.timeout_add(1000, self._evaluate_state_cb)
 
     # ---------------- Periodic monitor ----------------
 
@@ -1128,7 +1383,9 @@ class NetShareDaemon:
                 self.wlp_net_ok = net_ok
             if changed:
                 self._schedule_eval()
-            time.sleep(4)
+            with self.lock:
+                fast = self.mode == "auto" and self.state == "idle" and not self.wlp_net_ok
+            time.sleep(2.0 if fast else 3.0)
 
     def _evaluate_state_cb(self) -> bool:
         self._schedule_eval()
@@ -1249,6 +1506,7 @@ class NetShareDaemon:
             st = self.state
             peer_mac = self.peer_mac
             peer_ip = self.peer_ip
+            v6_ip = self.p2p_v6_ip
             ssid = self.ssid
             freq = self.freq
             last_error = self.last_error
@@ -1259,6 +1517,7 @@ class NetShareDaemon:
             "state": GLib.Variant("s", st),
             "peer_mac": GLib.Variant("s", peer_mac),
             "peer_ip": GLib.Variant("s", peer_ip),
+            "v6_ip": GLib.Variant("s", v6_ip),
             "ssid": GLib.Variant("s", ssid),
             "freq": GLib.Variant("u", freq if st != "idle" else 0),
             "tx_bitrate": GLib.Variant("s", bitrate),
@@ -1366,6 +1625,27 @@ class NetShareDaemon:
             if advertising:
                 self._submit_worker(self._ensure_adv_and_profile_healthy)
 
+    def _subscribe_nm_signals(self) -> None:
+        self.bus.signal_subscribe(
+            "org.freedesktop.NetworkManager",
+            "org.freedesktop.NetworkManager",
+            "StateChanged",
+            "/org/freedesktop/NetworkManager",
+            None,
+            Gio.DBusSignalFlags.NONE,
+            self._on_nm_state_changed,
+        )
+
+    def _on_nm_state_changed(self, _conn, _sender, _path, _iface, _sig, _params: GLib.Variant) -> None:
+        self._submit_worker(self._nm_probe_and_eval)
+
+    def _nm_probe_and_eval(self) -> None:
+        has_def, net_ok = probe_wlp1s0_internet()
+        with self.lock:
+            self.wlp_has_def = has_def
+            self.wlp_net_ok = net_ok
+        self._evaluate_state()
+
     def _on_prepare_for_sleep(self, _conn, _sender, _path, _iface, _sig, params: GLib.Variant) -> None:
         going_down = bool(params.unpack()[0])
         with self.lock:
@@ -1380,7 +1660,7 @@ class NetShareDaemon:
                 self._submit_worker(self._teardown_session, True, False)
         else:
             log("System resumed; re-evaluating network share state")
-            GLib.timeout_add_seconds(2, self._evaluate_state_cb)
+            GLib.timeout_add(300, self._evaluate_state_cb)
 
     def _on_main_call(self, _conn, _sender, _path, _iface, method: str, params: GLib.Variant, inv: Gio.DBusMethodInvocation) -> None:
         if method == "GetStatus":

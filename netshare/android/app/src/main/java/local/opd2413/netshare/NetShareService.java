@@ -14,7 +14,10 @@ import android.bluetooth.BluetoothSocket;
 import android.bluetooth.le.BluetoothLeScanner;
 import android.bluetooth.le.ScanCallback;
 import android.bluetooth.le.ScanFilter;
+import android.bluetooth.le.ScanResult;
 import android.bluetooth.le.ScanSettings;
+import android.companion.AssociationInfo;
+import android.companion.CompanionDeviceManager;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
@@ -22,6 +25,7 @@ import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.content.pm.ServiceInfo;
 import android.net.ConnectivityManager;
+import android.net.LinkAddress;
 import android.net.LinkProperties;
 import android.net.Network;
 import android.net.NetworkCapabilities;
@@ -46,9 +50,12 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStreamWriter;
+import java.net.Inet6Address;
+import java.net.InetAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
@@ -66,6 +73,7 @@ public class NetShareService extends Service {
 
     private static final Pattern SAFE_TOKEN = Pattern.compile("^[A-Za-z0-9._-]{1,64}$");
     private static final Pattern SAFE_PSK = Pattern.compile("^[A-Za-z0-9._-]{8,63}$");
+    private static final Pattern SAFE_V6 = Pattern.compile("^[0-9a-fA-F:]{2,64}$");
     private static final Pattern STA_FREQ_PAT = Pattern.compile("sta_freq=(\\d+)");
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
@@ -75,26 +83,41 @@ public class NetShareService extends Service {
     private BluetoothManager btManager;
     private BluetoothAdapter btAdapter;
     private BluetoothLeScanner bleScanner;
+    private CompanionDeviceManager companionManager;
     private ConnectivityManager connManager;
     private NotificationManager notifManager;
     private PowerManager powerManager;
 
     private final Object netLock = new Object();
+    private final Object writerLock = new Object();
     private final Map<Network, PhysNet> physNets = new LinkedHashMap<>();
     private String currentBestUpstream = "none";
+    private String currentBestV6If = "none";
+    private String currentBestTabletV6 = "";
+    private boolean currentBestIsWifi = false;
 
     private volatile boolean scanning = false;
+    private volatile boolean burstScanning = false;
     private volatile boolean connecting = false;
     private volatile boolean p2pActive = false;
     private volatile String activeOutIf = "";
     private volatile String activeP2pIp = "";
+    private volatile String activeV6OutIf = "none";
+    private volatile String activeV6Ip = "";
+    private volatile String activeV6Ll = "";
+    private volatile String activeTabletLl = "none";
     private volatile long lastAttemptMs = 0L;
+    private volatile long lastScanRestartMs = 0L;
+    private volatile String lastCompanionObservedMac = "";
     private volatile BluetoothSocket activeSocket = null;
+    private volatile OutputStreamWriter activeWriter = null;
     private String helperPath = "";
+    private final Runnable stopBurstScanTask = this::stopBurstBleScan;
 
     private static final class PhysNet {
         String iface = "";
         String v4Iface = "";
+        String tabletV6 = "";
         boolean wifi;
         boolean cellular;
         boolean validated;
@@ -154,7 +177,40 @@ public class NetShareService extends Service {
                 } else if (bond == BluetoothDevice.BOND_BONDED) {
                     lastAttemptMs = 0L;
                 }
+            } else if (Intent.ACTION_SCREEN_ON.equals(action) || Intent.ACTION_USER_PRESENT.equals(action)) {
+                if (Intent.ACTION_USER_PRESENT.equals(action)) {
+                    lastAttemptMs = 0L;
+                }
+                if (NetSharePrefs.isEnabled(NetShareService.this) && !isSessionBusy()) {
+                    log("屏幕唤醒/解锁，刷新 BLE 扫描以快速发现平板");
+                    restartBleScanAndBurst();
+                }
             }
+        }
+    };
+
+    private final ScanCallback burstScanCallback = new ScanCallback() {
+        @SuppressLint("MissingPermission")
+        @Override
+        public void onScanResult(int callbackType, ScanResult result) {
+            if (result == null) {
+                return;
+            }
+            BluetoothDevice dev = result.getDevice();
+            if (dev == null || dev.getAddress() == null) {
+                return;
+            }
+            String cleanMac = dev.getAddress().trim().toUpperCase(Locale.ROOT);
+            String targetMac = NetSharePrefs.getTargetMac(NetShareService.this);
+            if (!targetMac.isEmpty() && targetMac.equals(cleanMac)) {
+                stopBurstBleScan();
+                handleMatchedDevice(dev);
+            }
+        }
+
+        @Override
+        public void onScanFailed(int errorCode) {
+            burstScanning = false;
         }
     };
 
@@ -225,12 +281,13 @@ public class NetShareService extends Service {
         }
         long now = SystemClock.elapsedRealtime();
         long elapsed = now - lastAttemptMs;
-        if (lastAttemptMs != 0L && elapsed < 10_000L) {
+        if (lastAttemptMs != 0L && elapsed < 4_000L) {
             log("距上次 RFCOMM 尝试仅 " + elapsed + "ms，退避等待");
             return;
         }
         lastAttemptMs = now;
         connecting = true;
+        stopBurstBleScan();
         updateStatus(NetSharePrefs.STATE_CONNECTING, "发现平板唤醒广播，正在建立控制通道...", "", "");
         log("检测到平板 BLE 广播，连接 RFCOMM: " + cleanMac);
         netExecutor.execute(() -> runRfcommSession(dev));
@@ -241,6 +298,7 @@ public class NetShareService extends Service {
         super.onCreate();
         btManager = (BluetoothManager) getSystemService(Context.BLUETOOTH_SERVICE);
         btAdapter = btManager != null ? btManager.getAdapter() : null;
+        companionManager = getSystemService(CompanionDeviceManager.class);
         connManager = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
         notifManager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
         powerManager = (PowerManager) getSystemService(Context.POWER_SERVICE);
@@ -256,6 +314,8 @@ public class NetShareService extends Service {
 
         IntentFilter btFilter = new IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED);
         btFilter.addAction(BluetoothDevice.ACTION_BOND_STATE_CHANGED);
+        btFilter.addAction(Intent.ACTION_SCREEN_ON);
+        btFilter.addAction(Intent.ACTION_USER_PRESENT);
         registerReceiver(
                 btStateReceiver,
                 btFilter,
@@ -297,6 +357,27 @@ public class NetShareService extends Service {
             handleMatchedDevice(dev);
             return START_STICKY;
         }
+        if (NetSharePrefs.ACTION_COMPANION_APPEARED.equals(action)) {
+            if (!NetSharePrefs.isEnabled(this)) {
+                stopEverythingAndExit();
+                return START_NOT_STICKY;
+            }
+            String mac = intent != null ? intent.getStringExtra(NetSharePrefs.EXTRA_COMPANION_MAC) : "";
+            if ((mac == null || mac.isEmpty())) {
+                mac = NetSharePrefs.getTargetMac(this);
+            }
+            if (btAdapter != null && mac != null && !mac.isEmpty() && hasBtPermissions()) {
+                try {
+                    BluetoothDevice dev = btAdapter.getRemoteDevice(mac);
+                    handleMatchedDevice(dev);
+                } catch (IllegalArgumentException ignored) {
+                }
+            }
+            if (!isSessionBusy() && !scanning) {
+                startBleScan();
+            }
+            return START_STICKY;
+        }
 
         if (!NetSharePrefs.isEnabled(this)) {
             stopEverythingAndExit();
@@ -312,8 +393,9 @@ public class NetShareService extends Service {
             updateStatus(NetSharePrefs.STATE_ERROR, "未选择目标平板，请在主界面选择已配对平板", "", "");
             return START_STICKY;
         }
+        ensureCompanionPresence();
         if (!isSessionBusy()) {
-            startBleScan();
+            restartBleScanAndBurst();
         }
         return START_STICKY;
     }
@@ -487,6 +569,106 @@ public class NetShareService extends Service {
     }
 
     @SuppressLint("MissingPermission")
+    private void ensureCompanionPresence() {
+        if (companionManager == null || !hasBtPermissions()) {
+            return;
+        }
+        String targetMac = NetSharePrefs.getTargetMac(this);
+        if (targetMac.isEmpty()) {
+            return;
+        }
+        try {
+            List<AssociationInfo> list = companionManager.getMyAssociations();
+            if (list == null) {
+                return;
+            }
+            for (AssociationInfo info : list) {
+                if (info == null || info.getDeviceMacAddress() == null) {
+                    continue;
+                }
+                String mac = info.getDeviceMacAddress().toString().trim().toUpperCase(Locale.ROOT);
+                if (targetMac.equals(mac)) {
+                    companionManager.startObservingDevicePresence(mac);
+                    if (!mac.equals(lastCompanionObservedMac)) {
+                        lastCompanionObservedMac = mac;
+                        log("已启用 CDM 系统伴侣后台监听: " + mac);
+                    }
+                    return;
+                }
+            }
+        } catch (Exception e) {
+            log("CDM 伴侣监听启用失败: " + e.getMessage());
+        }
+    }
+
+    private synchronized void restartBleScanAndBurst() {
+        long now = SystemClock.elapsedRealtime();
+        if (scanning && burstScanning && (now - lastScanRestartMs) < 1_500L) {
+            return;
+        }
+        lastScanRestartMs = now;
+        stopBleScan();
+        startBleScan();
+        startBurstBleScan(20_000L);
+    }
+
+    @SuppressLint("MissingPermission")
+    private synchronized void startBurstBleScan(long durationMs) {
+        if (!NetSharePrefs.isEnabled(this) || isSessionBusy() || !hasBtPermissions()) {
+            return;
+        }
+        if (btAdapter == null || !btAdapter.isEnabled()) {
+            return;
+        }
+        BluetoothLeScanner scanner = bleScanner != null ? bleScanner : btAdapter.getBluetoothLeScanner();
+        if (scanner == null) {
+            return;
+        }
+        if (burstScanning) {
+            mainHandler.removeCallbacks(stopBurstScanTask);
+            mainHandler.postDelayed(stopBurstScanTask, durationMs);
+            return;
+        }
+        ScanFilter filter = new ScanFilter.Builder()
+                .setServiceUuid(new ParcelUuid(NetSharePrefs.ADV_UUID))
+                .build();
+        ScanSettings settings = new ScanSettings.Builder()
+                .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+                .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
+                .setMatchMode(ScanSettings.MATCH_MODE_AGGRESSIVE)
+                .setLegacy(false)
+                .build();
+        try {
+            scanner.startScan(Collections.singletonList(filter), settings, burstScanCallback);
+            burstScanning = true;
+            mainHandler.removeCallbacks(stopBurstScanTask);
+            mainHandler.postDelayed(stopBurstScanTask, durationMs);
+            log("启动低延迟突击 BLE 扫描 (" + (durationMs / 1000L) + "s)");
+        } catch (Exception e) {
+            burstScanning = false;
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private synchronized void stopBurstBleScan() {
+        mainHandler.removeCallbacks(stopBurstScanTask);
+        if (!burstScanning) {
+            return;
+        }
+        burstScanning = false;
+        if (btAdapter == null || !btAdapter.isEnabled() || !hasBtPermissions()) {
+            return;
+        }
+        BluetoothLeScanner scanner = bleScanner != null ? bleScanner : btAdapter.getBluetoothLeScanner();
+        if (scanner != null) {
+            try {
+                scanner.stopScan(burstScanCallback);
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    @SuppressLint("MissingPermission")
     private synchronized void startBleScan() {
         if (!NetSharePrefs.isEnabled(this)) {
             return;
@@ -539,6 +721,7 @@ public class NetShareService extends Service {
     @SuppressLint("MissingPermission")
     private synchronized void stopBleScan() {
         scanning = false;
+        stopBurstBleScan();
         if (btAdapter == null || !btAdapter.isEnabled() || !hasBtPermissions()) {
             return;
         }
@@ -556,6 +739,60 @@ public class NetShareService extends Service {
             String routeIf = ri != null ? ri.getInterface() : null;
             if (routeIf != null && routeIf.startsWith("v4-") && SAFE_TOKEN.matcher(routeIf).matches()) {
                 return routeIf;
+            }
+        }
+        return "";
+    }
+
+    private String extractTabletV6(LinkProperties lp) {
+        boolean hasV6Default = false;
+        for (RouteInfo ri : lp.getRoutes()) {
+            if (ri != null && ri.isDefaultRoute()
+                    && ri.getDestination() != null
+                    && ri.getDestination().getAddress() instanceof Inet6Address) {
+                hasV6Default = true;
+                break;
+            }
+        }
+        if (!hasV6Default) {
+            return "";
+        }
+        for (LinkAddress la : lp.getLinkAddresses()) {
+            if (la == null) {
+                continue;
+            }
+            InetAddress addr = la.getAddress();
+            if (!(addr instanceof Inet6Address)) {
+                continue;
+            }
+            if (addr.isLinkLocalAddress() || addr.isLoopbackAddress()
+                    || addr.isMulticastAddress() || addr.isSiteLocalAddress()) {
+                continue;
+            }
+            byte[] b = addr.getAddress();
+            if (b == null || b.length != 16) {
+                continue;
+            }
+            // Global Unicast 2000::/3 only (excludes ULA fc00::/7) so OS & Tailscale prefer IPv6.
+            if ((b[0] & 0xe0) != 0x20) {
+                continue;
+            }
+            byte[] out = new byte[16];
+            System.arraycopy(b, 0, out, 0, 8);
+            out[8] = 0x00;
+            out[9] = 0x00;
+            out[10] = 0x24;
+            out[11] = 0x13;
+            out[12] = 0x00;
+            out[13] = 0x49;
+            out[14] = 0x00;
+            out[15] = 0x01;
+            try {
+                String host = InetAddress.getByAddress(out).getHostAddress();
+                if (host != null && SAFE_V6.matcher(host).matches()) {
+                    return host;
+                }
+            } catch (Exception ignored) {
             }
         }
         return "";
@@ -585,6 +822,7 @@ public class NetShareService extends Service {
                 PhysNet p = new PhysNet();
                 p.iface = ifc;
                 p.v4Iface = extractStackedV4(lp);
+                p.tabletV6 = extractTabletV6(lp);
                 p.wifi = caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI);
                 p.cellular = caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR);
                 p.validated = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED);
@@ -628,6 +866,7 @@ public class NetShareService extends Service {
             PhysNet p = new PhysNet();
             p.iface = ifc;
             p.v4Iface = extractStackedV4(lp);
+            p.tabletV6 = extractTabletV6(lp);
             p.wifi = caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI);
             p.cellular = caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR);
             p.validated = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED);
@@ -636,12 +875,25 @@ public class NetShareService extends Service {
         }
     }
 
+    private void writeJsonLine(OutputStreamWriter w, JSONObject obj) throws IOException {
+        if (w == null || obj == null) {
+            return;
+        }
+        synchronized (writerLock) {
+            w.write(obj.toString() + "\n");
+            w.flush();
+        }
+    }
+
     private void recomputeUpstreamLocked() {
         String best = "none";
+        String bestV6If = "none";
+        String bestTabletV6 = "";
+        boolean bestIsWifi = false;
         int bestScore = -1;
         for (PhysNet p : physNets.values()) {
             String candidate = !p.v4Iface.isEmpty() ? p.v4Iface : p.iface;
-            if (!SAFE_TOKEN.matcher(candidate).matches()) {
+            if (!SAFE_TOKEN.matcher(candidate).matches() || !SAFE_TOKEN.matcher(p.iface).matches()) {
                 continue;
             }
             int score = 0;
@@ -650,6 +902,9 @@ public class NetShareService extends Service {
             }
             if (!p.v4Iface.isEmpty()) {
                 score += 5;
+            }
+            if (!p.tabletV6.isEmpty()) {
+                score += 3;
             }
             if (p.wifi) {
                 score += 30;
@@ -661,32 +916,75 @@ public class NetShareService extends Service {
             if (score > bestScore) {
                 bestScore = score;
                 best = candidate;
+                bestV6If = !p.tabletV6.isEmpty() ? p.iface : "none";
+                bestTabletV6 = p.tabletV6;
+                bestIsWifi = p.wifi;
             }
         }
         String prev = currentBestUpstream;
+        String prevV6If = currentBestV6If;
+        String prevV6Ip = currentBestTabletV6;
         currentBestUpstream = best;
+        currentBestV6If = bestV6If;
+        currentBestTabletV6 = bestTabletV6;
+        currentBestIsWifi = bestIsWifi;
+        boolean v4Changed = !best.equals(prev);
+        boolean v6Changed = !bestV6If.equals(prevV6If) || !bestTabletV6.equals(prevV6Ip);
         boolean needRetryActiveNone = p2pActive && !"none".equals(best)
                 && ("none".equals(activeOutIf) || activeOutIf.isEmpty());
-        if (!best.equals(prev) || needRetryActiveNone) {
-            if (!best.equals(prev)) {
-                log("物理网络出口变化: " + prev + " -> " + best);
+        if (v4Changed || v6Changed || needRetryActiveNone) {
+            if (v4Changed || v6Changed) {
+                log("物理网络出口变化: " + prev + " -> " + best
+                        + (bestTabletV6.isEmpty() ? " (无IPv6)" : " (IPv6=" + bestTabletV6 + ")"));
             }
             if (p2pActive) {
                 final String target = best;
+                final String targetV6If = bestV6If;
+                final String targetV6Ip = bestTabletV6;
+                final String targetTabletLl = activeTabletLl;
                 helperExecutor.execute(() -> {
                     if (!p2pActive) {
                         return;
                     }
-                    ExecResult res = runHelper("switch", target);
+                    ExecResult res = runHelper(
+                            "switch",
+                            target,
+                            targetV6If,
+                            targetV6Ip.isEmpty() ? "none" : targetV6Ip,
+                            targetTabletLl.isEmpty() ? "none" : targetTabletLl
+                    );
                     if (res.code == 0 && res.output.startsWith("OK switch ")) {
-                        activeOutIf = res.output.substring("OK switch ".length()).trim();
-                        log("已切换物理出口 -> " + activeOutIf);
+                        String[] parts = res.output.split("\\s+");
+                        String outIf = parts.length >= 3 ? parts[2] : target;
+                        String v6Ll = (parts.length >= 4 && !"none".equals(parts[3])) ? parts[3] : "";
+                        String v6Out = (parts.length >= 5 && !"none".equals(parts[4])) ? parts[4] : "none";
+                        String v6Ip = (!"none".equals(v6Out) && !v6Ll.isEmpty() && !targetV6Ip.isEmpty())
+                                ? targetV6Ip : "";
+                        activeOutIf = outIf;
+                        activeV6Ll = v6Ll;
+                        activeV6OutIf = v6Out;
+                        activeV6Ip = v6Ip;
+                        log("已切换物理出口 -> " + outIf + (v6Ip.isEmpty() ? "" : " (v6=" + v6Ip + ")"));
                         updateStatus(
                                 NetSharePrefs.STATE_CONNECTED,
-                                "已连接共享 (" + activeP2pIp + " -> " + activeOutIf + ")",
+                                "已连接共享 (" + activeP2pIp + " -> " + outIf + (v6Ip.isEmpty() ? "" : ", IPv6") + ")",
                                 activeP2pIp,
-                                activeOutIf
+                                outIf
                         );
+                        OutputStreamWriter w = activeWriter;
+                        if (w != null) {
+                            try {
+                                JSONObject upd = new JSONObject();
+                                upd.put("event", "upstream_update");
+                                upd.put("ip", activeP2pIp);
+                                upd.put("upstream", outIf);
+                                upd.put("v6_ll", v6Ll);
+                                upd.put("v6_ip", v6Ip);
+                                upd.put("v6_out", v6Out);
+                                writeJsonLine(w, upd);
+                            } catch (Exception ignored) {
+                            }
+                        }
                     } else {
                         log("切换物理出口失败: " + res.output);
                     }
@@ -698,6 +996,12 @@ public class NetShareService extends Service {
     private String currentUpstreamLabel() {
         synchronized (netLock) {
             return currentBestUpstream;
+        }
+    }
+
+    private boolean isCurrentUpstreamWifi() {
+        synchronized (netLock) {
+            return currentBestIsWifi;
         }
     }
 
@@ -720,6 +1024,7 @@ public class NetShareService extends Service {
         BluetoothSocket sock = null;
         PowerManager.WakeLock wl = null;
         boolean everConnected = false;
+        boolean cleanStop = false;
         Runnable waitFallbackTimeout = null;
         try {
             if (powerManager != null) {
@@ -751,6 +1056,24 @@ public class NetShareService extends Service {
             BufferedReader br = new BufferedReader(
                     new InputStreamReader(sock.getInputStream(), StandardCharsets.UTF_8));
             OutputStreamWriter writer = new OutputStreamWriter(sock.getOutputStream(), StandardCharsets.UTF_8);
+            activeWriter = writer;
+
+            refreshAllPhysicalNets();
+            int preStaFreq = 0;
+            if (isCurrentUpstreamWifi()) {
+                try {
+                    Future<ExecResult> freqFut = helperExecutor.submit(() -> runHelper("sta-freq"));
+                    ExecResult fr = freqFut.get(3, TimeUnit.SECONDS);
+                    if (fr.code == 0 && !fr.output.isEmpty()) {
+                        preStaFreq = Integer.parseInt(fr.output.trim());
+                    }
+                } catch (Exception ignored) {
+                }
+            }
+            JSONObject hello = new JSONObject();
+            hello.put("event", "hello");
+            hello.put("sta_freq", preStaFreq);
+            writeJsonLine(writer, hello);
 
             int failCount = 0;
             String line;
@@ -771,6 +1094,8 @@ public class NetShareService extends Service {
                     String ssid = obj.optString("ssid", "");
                     String psk = obj.optString("psk", "");
                     int freq = obj.optInt("freq", 2462);
+                    String tabletLlRaw = obj.optString("v6_ll", "");
+                    String tabletLl = SAFE_V6.matcher(tabletLlRaw).matches() ? tabletLlRaw : "none";
                     if (!SAFE_TOKEN.matcher(ssid).matches()
                             || !SAFE_PSK.matcher(psk).matches()
                             || freq < 2412 || freq > 5885) {
@@ -781,11 +1106,21 @@ public class NetShareService extends Service {
                         wl.acquire(35_000L);
                     }
                     refreshAllPhysicalNets();
-                    String upstream = currentUpstreamLabel();
-                    log("正在拉起 P2P 连接 (" + ssid + ", freq=" + freq + ", upstream=" + upstream + ")");
+                    String upstream;
+                    String v6If;
+                    String tabletV6;
+                    synchronized (netLock) {
+                        upstream = currentBestUpstream;
+                        v6If = currentBestV6If;
+                        tabletV6 = currentBestTabletV6;
+                    }
+                    activeTabletLl = tabletLl;
+                    log("正在拉起 P2P 连接 (" + ssid + ", freq=" + freq + ", upstream=" + upstream
+                            + (tabletV6.isEmpty() ? "" : ", v6=" + tabletV6) + ")");
 
+                    final String v6IpArg = tabletV6.isEmpty() ? "none" : tabletV6;
                     Future<ExecResult> fut = helperExecutor.submit(
-                            () -> runHelper("up", ssid, psk, String.valueOf(freq), upstream));
+                            () -> runHelper("up", ssid, psk, String.valueOf(freq), upstream, v6If, v6IpArg, tabletLl));
                     ExecResult res = fut.get(32, TimeUnit.SECONDS);
 
                     if (wl != null && wl.isHeld()) {
@@ -793,6 +1128,12 @@ public class NetShareService extends Service {
                     }
 
                     if (res.code != 0 || !res.output.startsWith("OK ")) {
+                        if (res.code == 124) {
+                            try {
+                                helperExecutor.submit(() -> runHelper("cancel")).get(5, TimeUnit.SECONDS);
+                            } catch (Exception ignored) {
+                            }
+                        }
                         failCount++;
                         int staFreq = parseStaFreq(res.output);
                         log("P2P 拉起失败 (#" + failCount + ", freq=" + freq + ", staFreq=" + staFreq + "): " + res.output);
@@ -807,16 +1148,14 @@ public class NetShareService extends Service {
                             failEvt.put("event", "p2p_failed");
                             failEvt.put("freq", freq);
                             failEvt.put("sta_freq", staFreq);
-                            writer.write(failEvt.toString() + "\n");
-                            writer.flush();
+                            writeJsonLine(writer, failEvt);
                             mainHandler.postDelayed(waitFallbackTimeout, 14_000L);
                             continue;
                         }
                         updateStatus(NetSharePrefs.STATE_ERROR, "P2P 拉起失败: " + res.output, "", "");
                         try {
-                            writer.write("{\"event\":\"stop_request\"}\n");
-                            writer.flush();
-                        } catch (IOException ignored) {
+                            writeJsonLine(writer, new JSONObject("{\"event\":\"stop_request\"}"));
+                        } catch (Exception ignored) {
                         }
                         break;
                     }
@@ -824,27 +1163,38 @@ public class NetShareService extends Service {
                     String[] parts = res.output.split("\\s+");
                     String ip = parts.length >= 2 ? parts[1] : "";
                     String outIf = parts.length >= 3 ? parts[2] : upstream;
+                    String v6Ll = (parts.length >= 4 && !"none".equals(parts[3])) ? parts[3] : "";
+                    String v6Out = (parts.length >= 5 && !"none".equals(parts[4])) ? parts[4] : "none";
+                    String v6Ip = (!"none".equals(v6Out) && !v6Ll.isEmpty() && !tabletV6.isEmpty()) ? tabletV6 : "";
+
                     activeP2pIp = ip;
                     activeOutIf = outIf;
+                    activeV6Ll = v6Ll;
+                    activeV6OutIf = v6Out;
+                    activeV6Ip = v6Ip;
                     p2pActive = true;
                     everConnected = true;
 
                     updateStatus(
                             NetSharePrefs.STATE_CONNECTED,
-                            "已连接共享 (" + ip + " -> " + outIf + ")",
+                            "已连接共享 (" + ip + " -> " + outIf + (v6Ip.isEmpty() ? "" : ", IPv6") + ")",
                             ip,
                             outIf
                     );
-                    log("P2P 共享已就绪: IP=" + ip + ", 物理出口=" + outIf);
+                    log("P2P 共享已就绪: IP=" + ip + ", 物理出口=" + outIf
+                            + (v6Ip.isEmpty() ? "" : ", IPv6=" + v6Ip));
 
                     JSONObject reply = new JSONObject();
                     reply.put("ip", ip);
                     reply.put("upstream", outIf);
-                    writer.write(reply.toString() + "\n");
-                    writer.flush();
+                    reply.put("v6_ll", v6Ll);
+                    reply.put("v6_ip", v6Ip);
+                    reply.put("v6_out", v6Out);
+                    writeJsonLine(writer, reply);
                 } else if ("ping".equals(cmd)) {
                     // Keepalive received from daemon
                 } else if ("stop".equals(cmd)) {
+                    cleanStop = true;
                     log("收到平板停止指令，正在释放 P2P 共享");
                     break;
                 }
@@ -861,14 +1211,21 @@ public class NetShareService extends Service {
                 } catch (Exception ignored) {
                 }
             }
-            if (!everConnected) {
-                // Allow prompt retry on handshake failure without 10s lockout (2s anti-spin floor)
-                lastAttemptMs = SystemClock.elapsedRealtime() - 8_000L;
+            if (cleanStop) {
+                lastAttemptMs = 0L;
+            } else if (!everConnected) {
+                // Allow prompt retry on handshake failure without 4s lockout (2s anti-spin floor)
+                lastAttemptMs = SystemClock.elapsedRealtime() - 2_000L;
             }
             connecting = false;
             p2pActive = false;
             activeP2pIp = "";
             activeOutIf = "";
+            activeV6Ll = "";
+            activeV6OutIf = "none";
+            activeV6Ip = "";
+            activeTabletLl = "none";
+            activeWriter = null;
             activeSocket = null;
             if (sock != null) {
                 try {

@@ -2201,3 +2201,25 @@ mpv、Firefox 仍是软解（Fedora `ffmpeg-free` 的专利限制），用户选
      - 4 张样本已拉回宿主机 `out/camera-verify/` 目视核验并清理平板 `/tmp/verify29_*.jpg`：前摄肤色自然、白墙中性、亮度均衡；后摄 `10.0D` 下近景贴纸小字（“微萌电蚊拍 / 危险电压 / GB 4706.1”）字字清晰、背景虚化，与 `0.0D`/`2.053D` 形成明显物理焦平面位移（室内后摄白墙略呈轻微偏黄绿暖调，属后续按需白平衡微调项）。5 秒 Wayland GUI 冒烟返回 `GUI_EXIT=124`；测后 `journalctl -k --since "$t_start"`（排除 `ath12k_wifi7_pci`）为空、`10-000c`/`10-0036` 均恢复 `suspended`、`opd2413-face` 与 `wireplumber` 保持 `active`。
   5. **默认项固化与用户验收**：用户已在运行 `-29` 的平板上试用后摄并反馈“已经可以自动聚焦了”，执行 `/usr/libexec/opd2413/boot-select default fedora-7.2.15-29.opd2413.conf && sync`，核实 `loader_default == booted_entry == fedora-7.2.15-29.opd2413.conf`、`pending_next = null`、`KSHIM.CHO` 哈希与 `1 extent` 不变、电量 `94% (charging)`（未再额外触发二次重启以免打断用户当前使用），完成 `#42` 消号。
 
+### `opd2413-netshare 0.1-9` IPv6 穿透与 Android 伴侣后台快速发现优化（2026-11-16，离线通过，待上机装包实测）
+
+- **上机测试前预期与判据：**
+  1. **IPv6 端到端通道预期**：
+     - 手机端 `NetShareService` 从活跃物理网络提取全局单播 IPv6（`2000::/3`，非 ULA `fc00::/7`）与 IPv6 默认路由（464XLAT 场景下自动取底层接口如 `rmnet_data3` 而非 `v4-rmnet_data3`），派生 `/64` 内固定后缀 `::0:2413:49:1`；`helper.sh` 配置 `ip -6 rule`（`pref 9996`/`9997`）、`ip6tables` `opdlink_fwd6`（`tetherctrl_FORWARD`）与 `opdlink_nat6`（`MASQUERADE`，若内核无 `ip6table_nat` 则自动回退 `proxy_ndp` + `ip -6 neigh replace proxy`），并确保上游 `accept_ra=2` 后开启 IPv6 转发。
+     - 平板端 `opd-netshare-daemon` 在 `p2p0` 收到 `v6_ll` + `v6_ip` 后配置 `<v6_ip>/128 nodad`、`default via <v6_ll> dev p2p0 metric <550|700>` 与 IPv6 DNS（`2400:3200::1`、`2402:4e00::`），在线切换上游（如 `wlan0 <-> rmnet_data*` 或切到纯 IPv4 Wi-Fi）时由手机推送 `upstream_update` 同步刷新或清理；`tailscale netcheck` 报告 `IPv6: yes` 且公网 IPv6 可直通。
+  2. **后台发现与连接提速预期**：
+     - 手机端新增 `OpdCompanionService`（`CompanionDeviceService` + `CompanionDeviceManager.startObservingDevicePresence`）避开 ColorOS `OplusHansManager` 后台扫盘冻结，并在 `ACTION_SCREEN_ON` / `ACTION_USER_PRESENT` 刷新 `PendingIntent` 扫描并启动 `20 s` `SCAN_MODE_LOW_LATENCY` 突击 `ScanCallback`。
+     - 手机端 RFCOMM 建连即先发送 `{"event":"hello","sta_freq":...}`；平板端 `opd-netshare-daemon` 订阅 `NetworkManager` `StateChanged` 加快断网唤醒（`s2idle` 唤醒复评 `300 ms`），且在仅广播待命时不预先起 `p2p0` AP（消解空闲 `5745 MHz` 占频触发 `#41`），待收到 `hello`（上限 `0.45 s`）后直接按对端 `sta_freq` 一次选对信道起播 AP。
+  3. **判据**：离线检查 `py_compile`、`sh -n helper.sh`、XML 解析、`tests/netshare-daemon-test.py` 4 项单测与 `tools/build-netshare-rpm.sh 0.1 9` 全通过；待在有 Android SDK 的宿主机编译 `opd-netshare.apk` 并 `adb install -r` 到手机、在平板安装 `opd2413-netshare-0.1-9.noarch.rpm` 并完成伴侣关联后，实测熄屏/退后台自动建连速度、`tailscale netcheck` `IPv6: yes` 及公网 IPv6 连通性。
+- **实机验证结果（2026-11-16，IPv6 已真机通过，后台发现/息屏压测待用户继续实测）：**
+  1. **本机环境配置与装机**：通过 `pkexec dnf` 在平板安装 `opd2413-netshare-0.1-9.noarch` 与 `java-25-openjdk-devel`（`javac 25.0.4.1`）；于 `~/Android/Sdk` 部署 Android `cmdline-tools`、`platforms;android-35` 与 `build-tools;35.0.1`，并在 `~/Android/x86_64-sysroot` 配置精简 `x86_64` `glibc`/`libgcc` 供 `qemu-x86_64-static` 运行 `aapt2`/`zipalign`，直接编出 `out/netshare/opd-netshare.apk`（`114K`，v3 签名校验通过）。手机端经 `su -c 'pm uninstall ...'` 清除旧版残留后由 `/data/local/tmp/` 走 `pm install -r` 安装成功。
+  2. **IPv6 端到端真机通过**：平板切换至 `opd-netshare mode force`（验证广播期未拉起 `p2p0` AP、不干扰 `wlp1s0`）并完成伴侣端建连后，手机经 `rmnet_data3` 上报链路本地网关与 `/64` 派生的全局 IPv6 地址；平板 `p2p0` 自动获配 `<prefix>:0:2413:49:1/128 scope global nodad` 及 `default via fe80::... dev p2p0 proto static metric 550`（并配置 `resolvectl` IPv6 DNS `2400:3200::1`、`2402:4e00::`），AP 运行于 `5180 MHz / 80 MHz`（`1200.9 MBit/s HE-MCS 11 NSS 2`）。
+  3. **Tailscale 与公网 IPv6 实测**：`tailscale netcheck` 返回 `IPv6: yes, [2408:xxxx:...]:32923`（`Nearest DERP: Hong Kong`）、`ping -6 -c 2 2400:3200::1` 往返 `71.1–99.7 ms`（`0% packet loss`）、`curl -6 -I https://www.qq.com` 通过 IPv6 收到正常 HTTP 响应；随后切回 `opd-netshare mode auto` 保持稳定连接。
+  4. **连续切换稳定性修复（`opd2413-netshare-0.1-10` + APK 重编）**：
+     - 定位到桌面端多次切换后复现连续组网失败的原因：1）`helper.sh` `cmd_down` 反复调用 `cmd wifip2p deinit` 且 `cmd_up` 仅 `sleep 0.1`，叠加 160 轮轮询超过 `28 s` 触发 `helper timeout` 强杀后未做 `cancel-connect`；2）平板端 `5180 MHz` 遇邻居 BSS 重叠切换主信道至 `5200 MHz` 时仍向手机下发 `5180`；3）候选信道耗尽重置会话时未清空 `failed_freqs`（`180 s` 冷却残留导致下次只试 1 次即中断）。
+     - 已修复：平板端读取实际 `iw dev p2p0 info` 信道并在候选耗尽时清空 `failed_freqs`（冷却缩至 `60 s`）；`helper.sh` 去掉 `cmd_down` 的 `deinit`、新增 `ensure_p2p_ready` 与 `cmd_cancel`、以墙钟 `16 s` 上限避免 `helper timeout`；`NetShareService` 增加扫描防抖与超时 `cancel`。重跑 `tests/netshare-daemon-test.py`（4/4 `OK`），编译并经 `pkexec dnf` 安装 `opd2413-netshare-0.1-10.noarch`，同时重编 `out/netshare/opd-netshare.apk`（`114K`，同密钥可覆盖安装）。
+  5. **双端连续切换、耗时拆解与锁屏后台验收（2026-11-16 真机通过）**：
+     - 手机覆盖安装新版 APK 后，用户多次切换桌面模式均可稳定恢复连接（`5745 MHz` 一次成功、`IPv6` 同步生效）；耗时拆解确认 BLE+RFCOMM 发现仅 `~1–2 s`、平板按需起 AP `~1 s`，主要耗时约 `11–12 s` 位于 Android `WifiP2pService` 扫频入组与 `~3–4 s` `DhcpClient` 取址（合计约 `15–16 s`）。
+     - **锁屏后台对比实测**：未在 ColorOS 最近任务锁卡时，锁屏静置一段时间后仍会被 ColorOS 强制冻结直至打开手机；**将 `OPD NetShare` 在最近任务栏锁定后再次锁屏静置，平板断开再切回 `auto` 模式可在手机不解锁/不打开 App 的情况下后台自动拉起建连**（同步更新 [TECH-DEBT.md](TECH-DEBT.md) `#40` 与 `#41`）。
+
+

@@ -255,6 +255,7 @@ class StatusDialog(QDialog):
             f"模式: {st.get('mode', '-')}",
             f"状态: {st.get('state', '-')}",
             f"手机 MAC / IP: {st.get('peer_mac') or '-'} / {st.get('peer_ip') or '-'}",
+            f"IPv6 地址: {st.get('v6_ip') or '-'}",
             f"P2P SSID / 信道: {st.get('ssid') or '-'} ({st.get('freq', 0)} MHz)",
             f"速率: {st.get('tx_bitrate') or '-'}",
             f"流量: 下行 {fmt_bytes(int(st.get('rx_bytes', 0)))} / 上行 {fmt_bytes(int(st.get('tx_bytes', 0)))}",
