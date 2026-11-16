@@ -1,0 +1,1192 @@
+From eb85d23ba62e07ee5dfc7894cc094b1f0473e01a Mon Sep 17 00:00:00 2001
+From: opd2413-builder <builder@local>
+Date: Sun, 15 Nov 2026 21:03:28 +0800
+Subject: [PATCH] ipa: simple: shaders: Upgrade GPU ISP pipeline and tuning
+
+---
+ .../internal/software_isp/debayer_params.h    |   1 +
+ .../internal/software_isp/swisp_stats.h       |   8 +
+ src/ipa/simple/algorithms/agc.cpp             |  16 +-
+ src/ipa/simple/algorithms/awb.cpp             |  35 +-
+ src/ipa/simple/data/sc1300cs.yaml             |   8 +-
+ src/ipa/simple/data/sc820cs.yaml              |  20 +-
+ src/ipa/simple/soft_simple.cpp                |   1 +
+ src/libcamera/shaders/bayer_1x_packed.frag    | 319 +++++++-----------
+ src/libcamera/shaders/bayer_unpacked.frag     |  67 ++--
+ src/libcamera/shaders/meson.build             |   1 +
+ src/libcamera/shaders/rgb_post.frag           | 111 ++++++
+ src/libcamera/software_isp/debayer_egl.cpp    | 163 +++++++--
+ src/libcamera/software_isp/debayer_egl.h      |  14 +
+ src/libcamera/software_isp/swstats_cpu.cpp    |  26 ++
+ 14 files changed, 520 insertions(+), 270 deletions(-)
+ create mode 100644 src/libcamera/shaders/rgb_post.frag
+
+diff --git a/include/libcamera/internal/software_isp/debayer_params.h b/include/libcamera/internal/software_isp/debayer_params.h
+index 707e376..8bf51ee 100644
+--- a/include/libcamera/internal/software_isp/debayer_params.h
++++ b/include/libcamera/internal/software_isp/debayer_params.h
+@@ -29,6 +29,7 @@ struct DebayerParams {
+ 	RGB<float> lscCy = RGB<float>({ 0.5, 0.5, 0.5 });
+ 	RGB<float> lscK1 = RGB<float>({ 0.0, 0.0, 0.0 });
+ 	RGB<float> lscK2 = RGB<float>({ 0.0, 0.0, 0.0 });
++	float again = 1.0f;
+ };
+ 
+ } /* namespace libcamera */
+diff --git a/include/libcamera/internal/software_isp/swisp_stats.h b/include/libcamera/internal/software_isp/swisp_stats.h
+index 8c10968..4ce02ad 100644
+--- a/include/libcamera/internal/software_isp/swisp_stats.h
++++ b/include/libcamera/internal/software_isp/swisp_stats.h
+@@ -31,6 +31,14 @@ struct SwIspStats {
+ 	 * \brief Sums of colour channels of all the sampled pixels
+ 	 */
+ 	RGB<uint64_t> sum_;
++	/**
++	 * \brief Sums of unsaturated, above-black-level colour samples for AWB
++	 */
++	RGB<uint64_t> awbSum_;
++	/**
++	 * \brief Number of colour samples accumulated in awbSum_
++	 */
++	uint64_t awbSamples;
+ 	/**
+ 	 * \brief Number of bins in the yHistogram
+ 	 */
+diff --git a/src/ipa/simple/algorithms/agc.cpp b/src/ipa/simple/algorithms/agc.cpp
+index db5498c..58de2bf 100644
+--- a/src/ipa/simple/algorithms/agc.cpp
++++ b/src/ipa/simple/algorithms/agc.cpp
+@@ -27,10 +27,10 @@ namespace ipa::soft::algorithms {
+ static constexpr unsigned int kExposureBinsCount = 5;
+ 
+ /*
+- * The exposure is optimal when the mean sample value of the histogram is
+- * in the middle of the range.
++ * The exposure is optimal slightly below mid-range so radial LSC (~1.5-2.5x)
++ * and AWB gains retain highlight headroom before Filmic tone compression.
+  */
+-static constexpr float kExposureOptimal = kExposureBinsCount / 2.0;
++static constexpr float kExposureOptimal = 2.2f;
+ 
+ /*
+  * This implements the hysteresis for the exposure adjustment.
+@@ -197,6 +197,16 @@ void Agc::process(IPAContext &context,
+ 	}
+ 
+ 	float exposureMSV = (denom == 0 ? 0 : static_cast<float>(num) / denom);
++	if (denom > 0) {
++		unsigned int clipCount = 0;
++		const unsigned int clipStart =
++			SwIspStats::kYHistogramSize > 6 ? SwIspStats::kYHistogramSize - 6 : SwIspStats::kYHistogramSize - 1;
++		for (unsigned int i = clipStart; i < SwIspStats::kYHistogramSize; i++)
++			clipCount += histogram[i];
++		const float satRatio = static_cast<float>(clipCount) / static_cast<float>(denom);
++		if (satRatio > 0.025f)
++			exposureMSV += std::clamp((satRatio - 0.025f) * 10.0f, 0.0f, 1.4f);
++	}
+ 	context.activeState.agc.lastUpdateFrame = frame;
+ 	context.activeState.agc.updated = true;
+ 	updateExposure(context, frameContext, exposureMSV);
+diff --git a/src/ipa/simple/algorithms/awb.cpp b/src/ipa/simple/algorithms/awb.cpp
+index 05155c8..6cf79dd 100644
+--- a/src/ipa/simple/algorithms/awb.cpp
++++ b/src/ipa/simple/algorithms/awb.cpp
+@@ -7,6 +7,7 @@
+ 
+ #include "awb.h"
+ 
++#include <algorithm>
+ #include <numeric>
+ #include <stdint.h>
+ 
+@@ -59,31 +60,39 @@ void Awb::process(IPAContext &context,
+ 		return;
+ 
+ 	/*
+-	 * Black level must be subtracted to get the correct AWB ratios, they
+-	 * would be off if they were computed from the whole brightness range
+-	 * rather than from the sensor range.
++	 * Black level must be subtracted using the exact pixel count matching
++	 * the accumulated channel sums. Prefer unsaturated, above-black-level
++	 * AWB samples whenever at least 1/16 of sampled pixels qualify.
+ 	 */
+-	const uint64_t nPixels = std::accumulate(
++	const uint64_t nAllPixels = std::accumulate(
+ 		histogram.begin(), histogram.end(), uint64_t(0));
+-	const uint64_t offset = blackLevel * nPixels;
++	const bool useFiltered = stats->awbSamples >= std::max<uint64_t>(64, nAllPixels / 16);
++	const uint64_t nPixels = useFiltered ? stats->awbSamples : nAllPixels;
++	const RGB<uint64_t> &rawSum = useFiltered ? stats->awbSum_ : stats->sum_;
++	const uint64_t offset = static_cast<uint64_t>(blackLevel) * nPixels;
+ 	const uint64_t minValid = 1;
+ 	/*
+ 	 * Make sure the sums are at least minValid, while preventing unsigned
+ 	 * integer underflow.
+ 	 */
+-	const RGB<uint64_t> sum = stats->sum_.max(offset + minValid) - offset;
++	const RGB<uint64_t> sum = rawSum.max(offset + minValid) - offset;
+ 
+ 	/*
+-	 * Calculate red and blue gains for AWB.
+-	 * Clamp max gain at 4.0, this also avoids 0 division.
++	 * Calculate red and blue gains for AWB, clamped to avoid colour cast
++	 * runaway on extreme scenes, and smooth temporally after frame 0.
+ 	 */
+-	auto &gains = context.activeState.awb.gains;
+-	gains = { {
+-		sum.r() <= sum.g() / 4 ? 4.0f : static_cast<float>(sum.g()) / sum.r(),
+-		1.0,
+-		sum.b() <= sum.g() / 4 ? 4.0f : static_cast<float>(sum.g()) / sum.b(),
++	const RGB<float> targetGains{ {
++		sum.r() <= sum.g() / 4 ? 3.2f : std::clamp(static_cast<float>(sum.g()) / sum.r(), 0.85f, 3.2f),
++		1.0f,
++		sum.b() <= sum.g() / 4 ? 3.2f : std::clamp(static_cast<float>(sum.g()) / sum.b(), 0.85f, 3.2f),
+ 	} };
+ 
++	auto &gains = context.activeState.awb.gains;
++	if (context.activeState.awb.temperatureK == 0)
++		gains = targetGains;
++	else
++		gains = gains * 0.65f + targetGains * 0.35f;
++
+ 	RGB<double> rgbGains{ { 1 / gains.r(), 1 / gains.g(), 1 / gains.b() } };
+ 	context.activeState.awb.temperatureK = estimateCCT(rgbGains);
+ 	metadata.set(controls::ColourTemperature, context.activeState.awb.temperatureK);
+diff --git a/src/ipa/simple/data/sc1300cs.yaml b/src/ipa/simple/data/sc1300cs.yaml
+index 7231e75..8177f33 100644
+--- a/src/ipa/simple/data/sc1300cs.yaml
++++ b/src/ipa/simple/data/sc1300cs.yaml
+@@ -9,8 +9,8 @@ algorithms:
+       r:
+         cx: 0.5000
+         cy: 0.5000
+-        k0: 0.9739
+-        k1: 0.5753
++        k0: 0.9204
++        k1: 0.5562
+       g:
+         cx: 0.5000
+         cy: 0.5000
+@@ -19,8 +19,8 @@ algorithms:
+       b:
+         cx: 0.5000
+         cy: 0.5000
+-        k0: 0.9669
+-        k1: 0.5221
++        k0: 0.9183
++        k1: 0.5402
+   - Awb:
+   - Ccm:
+       ccms:
+diff --git a/src/ipa/simple/data/sc820cs.yaml b/src/ipa/simple/data/sc820cs.yaml
+index d8c4401..a15843a 100644
+--- a/src/ipa/simple/data/sc820cs.yaml
++++ b/src/ipa/simple/data/sc820cs.yaml
+@@ -7,20 +7,20 @@ algorithms:
+       blackLevel: 4100
+   - Lsc:
+       r:
+-        cx: 0.5200
++        cx: 0.4800
+         cy: 0.5000
+-        k0: 3.7222
+-        k1: -1.0192
++        k0: 2.6230
++        k1: -0.7705
+       g:
+-        cx: 0.5260
+-        cy: 0.5020
+-        k0: 3.0886
+-        k1: -0.9390
++        cx: 0.4740
++        cy: 0.4980
++        k0: 2.4709
++        k1: -0.7512
+       b:
+-        cx: 0.5320
++        cx: 0.4680
+         cy: 0.5000
+-        k0: 2.7514
+-        k1: -0.7593
++        k0: 2.3900
++        k1: -0.7081
+   - Awb:
+   - Ccm:
+       ccms:
+diff --git a/src/ipa/simple/soft_simple.cpp b/src/ipa/simple/soft_simple.cpp
+index c9ed195..295f41e 100644
+--- a/src/ipa/simple/soft_simple.cpp
++++ b/src/ipa/simple/soft_simple.cpp
+@@ -303,6 +303,7 @@ void IPASoftSimple::computeParams(const uint32_t frame)
+ 	for (const auto &algo : algorithms())
+ 		algo->prepare(context_, frame, frameContext, params_);
+ 	params_->combinedMatrix = context_.activeState.combinedMatrix;
++	params_->again = static_cast<float>(context_.activeState.agc.valid ? context_.activeState.agc.again : 1.0);
+ 
+ 	setIspParams.emit();
+ }
+diff --git a/src/libcamera/shaders/bayer_1x_packed.frag b/src/libcamera/shaders/bayer_1x_packed.frag
+index 5fe68ef..0572ccf 100644
+--- a/src/libcamera/shaders/bayer_1x_packed.frag
++++ b/src/libcamera/shaders/bayer_1x_packed.frag
+@@ -12,8 +12,10 @@
+  *
+  *
+  * Modified by Linaro Ltd for 10/12-bit packed vs 8-bit raw Bayer format,
+- * and for simpler demosaic algorithm.
++ * and enhanced with 5x5 Malvar-He-Cutler demosaic, highlight reconstruction,
++ * and luminance-preserving filmic tone mapping.
+  * Copyright (C) 2020, Linaro
++ * Copyright (C) 2026, Fedora OPD2413 contributors
+  *
+  * bayer_1x_packed.frag - Fragment shader code for raw Bayer 10-bit and 12-bit
+  * packed formats
+@@ -23,40 +25,14 @@
+ precision highp float;
+ #endif
+ 
+-/*
+- * These constants are used to select the bytes containing the HS part of
+- * the pixel value:
+- * BPP - bytes per pixel,
+- * THRESHOLD_L = fract(BPP) * 0.5 + 0.02
+- * THRESHOLD_H = 1.0 - fract(BPP) * 1.5 + 0.02
+- * Let X is the x coordinate in the texture measured in bytes (so that the
+- * range is from 0 to (stride_-1)) aligned on the nearest pixel.
+- * E.g. for RAW10P:
+- * -------------+-------------------+-------------------+--
+- *  pixel No    |  0   1    2   3   |  4   5    6   7   | ...
+- * -------------+-------------------+-------------------+--
+- *  byte offset | 0   1   2   3   4 | 5   6   7   8   9 | ...
+- * -------------+-------------------+-------------------+--
+- *      X       | 0.0 1.25 2.5 3.75 | 5.0 6.25 7.5 8.75 | ...
+- * -------------+-------------------+-------------------+--
+- * If fract(X) < THRESHOLD_L then the previous byte contains the LS
+- * bits of the pixel values and needs to be skipped.
+- * If fract(X) > THRESHOLD_H then the next byte contains the LS bits
+- * of the pixel values and needs to be skipped.
+- */
+ #if defined(RAW10P)
+ #define BPP		1.25
+-#define THRESHOLD_L	0.14
+-#define THRESHOLD_H	0.64
+ #elif defined(RAW12P)
+ #define BPP		1.5
+-#define THRESHOLD_L	0.27
+-#define THRESHOLD_H	0.27
+ #else
+ #error Invalid raw format
+ #endif
+ 
+-
+ varying vec2 textureOut;
+ 
+ /* the texture size in pixels */
+@@ -74,6 +50,18 @@ uniform vec4 lscR;
+ uniform vec4 lscG;
+ uniform vec4 lscB;
+ 
++float xByteTex(float px)
++{
++	float p = clamp(px, 0.0, tex_size.x - 1.0);
++	return (floor(BPP * p + 0.02) + 0.5) * tex_step.x;
++}
++
++float yLineTex(float py)
++{
++	float p = clamp(py, 0.0, tex_size.y - 1.0);
++	return (p + 0.5) * tex_step.y;
++}
++
+ float lsc_eval(vec2 uv, vec2 imgSize, vec4 p)
+ {
+ 	vec2 centerPx = p.xy * imgSize;
+@@ -86,7 +74,6 @@ float lsc_eval(vec2 uv, vec2 imgSize, vec4 p)
+ 
+ float apply_contrast(float value)
+ {
+-	// Apply simple S-curve
+ 	if (value < 0.5)
+ 		return 0.5 * pow(value / 0.5, contrastExp);
+ 	else
+@@ -96,179 +83,123 @@ float apply_contrast(float value)
+ void main(void)
+ {
+ 	vec3 rgb;
++	vec2 center_pixel = floor(textureOut * tex_size);
+ 
+-	/*
+-	 * center_bytes holds the coordinates of the MS byte of the pixel
+-	 * being sampled on the [0, stride-1/height-1] range.
+-	 * center_pixel holds the coordinates of the pixel being sampled
+-	 * on the [0, width/height-1] range.
+-	 */
+-	vec2 center_bytes;
+-	vec2 center_pixel;
+-
+-	/*
+-	 * x- and y-positions of the adjacent pixels on the [0, 1] range.
+-	 */
+-	vec2 xcoords;
+-	vec2 ycoords;
+-
+-	/*
+-	 * The coordinates passed to the shader in textureOut may point
+-	 * to a place in between the pixels if the texture format doesn't
+-	 * match the image format. In particular, MIPI packed raw Bayer
+-	 * formats don't have a matching texture format.
+-	 * In this case align the coordinates to the left nearest pixel
+-	 * by hand.
+-	 */
+-	center_pixel = floor(textureOut * tex_size);
+-	center_bytes.y = center_pixel.y;
+-
+-	/*
+-	 * Add a small number (a few mantissa's LSBs) to avoid float
+-	 * representation issues. Maybe paranoic.
+-	 */
+-	center_bytes.x = BPP * center_pixel.x + 0.02;
+-
+-	float fract_x = fract(center_bytes.x);
+-
+-	/*
+-	 * The below floor() call ensures that center_bytes.x points
+-	 * at one of the bytes representing the 8 higher bits of
+-	 * the pixel value, not at the byte containing the LS bits
+-	 * of the group of the pixels.
+-	 */
+-	center_bytes.x = floor(center_bytes.x);
+-	center_bytes *= tex_step;
+-
+-	xcoords = center_bytes.x + vec2(-tex_step.x, tex_step.x);
+-	ycoords = center_bytes.y + vec2(-tex_step.y, tex_step.y);
+-
+-	/*
+-	 * If xcoords[0] points at the byte containing the LS bits
+-	 * of the previous group of the pixels, move xcoords[0] one
+-	 * byte back.
+-	 */
+-	xcoords[0] += (fract_x < THRESHOLD_L) ? -tex_step.x : 0.0;
+-
+-	/*
+-	 * If xcoords[1] points at the byte containing the LS bits
+-	 * of the current group of the pixels, move xcoords[1] one
+-	 * byte forward.
+-	 */
+-	xcoords[1] += (fract_x > THRESHOLD_H) ? tex_step.x : 0.0;
+-
+-	vec2 alternate = mod(center_pixel.xy + tex_bayer_first_red, 2.0);
+-	bool even_col = alternate.x < 1.0;
+-	bool even_row = alternate.y < 1.0;
+-
+-	/*
+-	 * We need to sample the central pixel and the ones with offset
+-	 * of -1 to +1 pixel in both X and Y directions. Let's name these
+-	 * pixels as below, where C is the central pixel:
+-	 *
+-	 *   +----+----+----+----+
+-	 *   | \ x|    |    |    |
+-	 *   |y \ | -1 |  0 | +1 |
+-	 *   +----+----+----+----+
+-	 *   | +1 | D2 | A1 | D3 |
+-	 *   +----+----+----+----+
+-	 *   |  0 | B0 |  C | B1 |
+-	 *   +----+----+----+----+
+-	 *   | -1 | D0 | A0 | D1 |
+-	 *   +----+----+----+----+
+-	 *
+-	 * In the below equations (0,-1).r means "r component of the texel
+-	 * shifted by -tex_step.y from the center_bytes one" etc.
+-	 *
+-	 * In the even row / even column (EE) case the colour values are:
+-	 *   R = C = (0,0).r,
+-	 *   G = (A0 + A1 + B0 + B1) / 4.0 =
+-	 *       ( (0,-1).r + (0,1).r + (-1,0).r + (1,0).r ) / 4.0,
+-	 *   B = (D0 + D1 + D2 + D3) / 4.0 =
+-	 *       ( (-1,-1).r + (1,-1).r + (-1,1).r + (1,1).r ) / 4.0
+-	 *
+-	 * For even row / odd column (EO):
+-	 *   R = (B0 + B1) / 2.0 = ( (-1,0).r + (1,0).r ) / 2.0,
+-	 *   G = C = (0,0).r,
+-	 *   B = (A0 + A1) / 2.0 = ( (0,-1).r + (0,1).r ) / 2.0
+-	 *
+-	 * For odd row / even column (OE):
+-	 *   R = (A0 + A1) / 2.0 = ( (0,-1).r + (0,1).r ) / 2.0,
+-	 *   G = C = (0,0).r,
+-	 *   B = (B0 + B1) / 2.0 = ( (-1,0).r + (1,0).r ) / 2.0
+-	 *
+-	 * For odd row / odd column (OO):
+-	 *   R = (D0 + D1 + D2 + D3) / 4.0 =
+-	 *       ( (-1,-1).r + (1,-1).r + (-1,1).r + (1,1).r ) / 4.0,
+-	 *   G = (A0 + A1 + B0 + B1) / 4.0 =
+-	 *       ( (0,-1).r + (0,1).r + (-1,0).r + (1,0).r ) / 4.0,
+-	 *   B = C = (0,0).r
+-	 */
+-
+-	/*
+-	 * Fetch the values and precalculate the terms:
+-	 *   patterns.x = (A0 + A1) / 2.0
+-	 *   patterns.y = (B0 + B1) / 2.0
+-	 *   patterns.z = (A0 + A1 + B0 + B1) / 4.0
+-	 *   patterns.w = (D0 + D1 + D2 + D3) / 4.0
+-	 */
+-	#define fetch(x, y) texture2D(tex_y, vec2(x, y)).r
+-
+-	float C = texture2D(tex_y, center_bytes).r;
+-	vec4 patterns = vec4(
+-		fetch(center_bytes.x, ycoords[0]),	/* A0: (0,-1) */
+-		fetch(xcoords[0], center_bytes.y),	/* B0: (-1,0) */
+-		fetch(xcoords[0], ycoords[0]),		/* D0: (-1,-1) */
+-		fetch(xcoords[1], ycoords[0]));		/* D1: (1,-1) */
+-	vec4 temp = vec4(
+-		fetch(center_bytes.x, ycoords[1]),	/* A1: (0,1) */
+-		fetch(xcoords[1], center_bytes.y),	/* B1: (1,0) */
+-		fetch(xcoords[1], ycoords[1]),		/* D3: (1,1) */
+-		fetch(xcoords[0], ycoords[1]));		/* D2: (-1,1) */
+-	patterns = (patterns + temp) * 0.5;
+-		/* .x = (A0 + A1) / 2.0, .y = (B0 + B1) / 2.0 */
+-		/* .z = (D0 + D3) / 2.0, .w = (D1 + D2) / 2.0 */
+-	patterns.w = (patterns.z + patterns.w) * 0.5;
+-	patterns.z = (patterns.x + patterns.y) * 0.5;
+-
+-	rgb = even_col ?
+-		(even_row ?
+-			vec3(C, patterns.zw) :
+-			vec3(patterns.x, C, patterns.y)) :
+-		(even_row ?
+-			vec3(patterns.y, C, patterns.x) :
+-			vec3(patterns.wz, C));
+-
+-	/*
+-	 * \todo: Black level normalising, AWB and digital gain could be
+-	 * reworked into a single multiplication.
+-	 */
+-	rgb = max((rgb - blacklevel) / (1.0 - blacklevel), vec3(0.0));
+-
+-	/* Lens Shading Correction (radial DNG polynomial) */
+-	vec3 lscGain = vec3(lsc_eval(textureOut, tex_size, lscR),
+-			    lsc_eval(textureOut, tex_size, lscG),
+-			    lsc_eval(textureOut, tex_size, lscB));
++	float bx_m2 = xByteTex(center_pixel.x - 2.0);
++	float bx_m1 = xByteTex(center_pixel.x - 1.0);
++	float bx_0  = xByteTex(center_pixel.x);
++	float bx_p1 = xByteTex(center_pixel.x + 1.0);
++	float bx_p2 = xByteTex(center_pixel.x + 2.0);
++
++	float by_m2 = yLineTex(center_pixel.y - 2.0);
++	float by_m1 = yLineTex(center_pixel.y - 1.0);
++	float by_0  = yLineTex(center_pixel.y);
++	float by_p1 = yLineTex(center_pixel.y + 1.0);
++	float by_p2 = yLineTex(center_pixel.y + 2.0);
++
++	#define fetch(x, y) texture2D(tex_y, vec2((x), (y))).r
++
++	/* 5x5 Malvar-He-Cutler (McGuire 2008) high-quality Bayer demosaicing */
++	float C = fetch(bx_0, by_0);
++	const vec4 kC = vec4(4.0, 6.0, 5.0, 5.0) / 8.0;
++
++	vec2 alternate = mod(floor(center_pixel + tex_bayer_first_red + 0.5), 2.0);
++
++	vec4 Dvec = vec4(
++		fetch(bx_m1, by_m1),
++		fetch(bx_m1, by_p1),
++		fetch(bx_p1, by_m1),
++		fetch(bx_p1, by_p1));
+ 
+-	/* Apply LSC and AWB gains, and saturate each channel at sensor range */
+-	rgb = clamp(rgb * lscGain * awb, vec3(0.0), vec3(1.0));
++	vec4 PATTERN = (kC.xyz * C).xyzz;
++	Dvec.xy += Dvec.zw;
++	Dvec.x += Dvec.y;
+ 
+-	/* Colour Correction Matrix */
+-	rgb = ccm * rgb;
++	vec4 value = vec4(
++		fetch(bx_0,  by_m2),
++		fetch(bx_0,  by_m1),
++		fetch(bx_m2, by_0),
++		fetch(bx_m1, by_0));
++
++	vec4 temp = vec4(
++		fetch(bx_0,  by_p2),
++		fetch(bx_0,  by_p1),
++		fetch(bx_p2, by_0),
++		fetch(bx_p1, by_0));
++
++	const vec4 kA = vec4(-1.0, -1.5,  0.5, -1.0) / 8.0;
++	const vec4 kB = vec4( 2.0,  0.0,  0.0,  4.0) / 8.0;
++	const vec4 kD = vec4( 0.0,  2.0, -1.0, -1.0) / 8.0;
++	#define kE (kA.xywz)
++	#define kF (kB.xywz)
++
++	value += temp;
++	#define A (value[0])
++	#define B (value[1])
++	#define D (Dvec.x)
++	#define E (value[2])
++	#define F (value[3])
++
++	PATTERN.yzw += (kD.yz * D).xyy;
++	PATTERN += (kA.xyz * A).xyzx + (kE.xyw * E).xyxz;
++	PATTERN.xw += kB.xw * B;
++	PATTERN.xz += kF.xz * F;
++
++	rgb = (alternate.y < 0.5) ?
++		((alternate.x < 0.5) ?
++			vec3(C, PATTERN.xy) :
++			vec3(PATTERN.z, C, PATTERN.w)) :
++		((alternate.x < 0.5) ?
++			vec3(PATTERN.w, C, PATTERN.z) :
++			vec3(PATTERN.yx, C));
+ 
+-	/*
+-	 * Contrast
+-	 * contrastExp 0..2 contrast to 0..infinity; avoid actual infinity at tan(pi/2)
+-	 */
+ 	rgb = clamp(rgb, 0.0, 1.0);
+-	rgb.r = apply_contrast(rgb.r);
+-	rgb.g = apply_contrast(rgb.g);
+-	rgb.b = apply_contrast(rgb.b);
+ 
+-	/* Apply gamma after colour correction */
+-	rgb = pow(rgb, vec3(gamma));
++	/* Subtract black level and track raw channel saturation */
++	vec3 rawLin = max((rgb - blacklevel) / max(vec3(1.0) - blacklevel, vec3(0.001)), vec3(0.0));
++	float rawPeak = max(rawLin.r, max(rawLin.g, rawLin.b));
++	float rawMin = min(rawLin.r, min(rawLin.g, rawLin.b));
+ 
+-#if defined (SWAP_BLUE)
++	/* Lens Shading Correction (radial DNG polynomial) + AWB in linear HDR space */
++	vec3 lscGain = vec3(lsc_eval(textureOut, tex_size, lscR),
++			    lsc_eval(textureOut, tex_size, lscG),
++			    lsc_eval(textureOut, tex_size, lscB));
++	vec3 lin = rawLin * lscGain * awb;
++
++	/* Reconstruct neutral highlight color where sensor channels clip */
++	float clipBlend = max(smoothstep(0.91, 0.985, rawPeak) * smoothstep(0.55, 0.92, rawMin),
++			      smoothstep(0.965, 0.995, rawPeak));
++	float lumPre = dot(lin, vec3(0.25, 0.55, 0.20));
++	float peakPre = max(lin.r, max(lin.g, lin.b));
++	lin = mix(lin, vec3(mix(lumPre, peakPre, 0.45)), clipBlend);
++
++	/* Apply Colour Correction Matrix before highlight compression */
++	lin = max(ccm * lin, vec3(0.0));
++
++	/* Headroom scale + luminance-preserving Extended-Reinhard shoulder & subtle shadow lift */
++	lin *= 0.72;
++	float Y = max(dot(lin, vec3(0.2126, 0.7152, 0.0722)), 1e-5);
++	const float kWhitePt = 2.25;
++	float Yt = (Y * (1.0 + Y / (kWhitePt * kWhitePt))) / (1.0 + Y);
++	Yt = Yt + 0.035 * Yt * (1.0 - Yt) * (1.0 - Yt);
++	vec3 mapped = lin * (Yt / Y);
++	mapped = mix(mapped, vec3(Yt), smoothstep(1.05, 2.2, Y) * 0.65);
++	rgb = clamp(mapped, 0.0, 1.0);
++
++	if (abs(contrastExp - 1.0) > 0.01) {
++		rgb.r = apply_contrast(rgb.r);
++		rgb.g = apply_contrast(rgb.g);
++		rgb.b = apply_contrast(rgb.b);
++	}
++
++	/* Piecewise sRGB transfer avoids near-black slope amplification */
++	vec3 srgbLo = 12.92 * rgb;
++	vec3 srgbHi = 1.055 * pow(max(rgb, vec3(0.0031308)), vec3(1.0 / 2.4)) - 0.055;
++	rgb = mix(srgbLo, srgbHi, step(vec3(0.0031308), rgb));
++	if (abs(gamma - 1.0 / 2.2) > 0.02)
++		rgb = pow(max(rgb, vec3(0.0)), vec3(gamma * 2.2));
++
++#if defined(SWAP_BLUE) && !defined(POST_PASS)
+ 	gl_FragColor = vec4(rgb.bgr, 1.0);
+ #else
+ 	gl_FragColor = vec4(rgb, 1.0);
+diff --git a/src/libcamera/shaders/bayer_unpacked.frag b/src/libcamera/shaders/bayer_unpacked.frag
+index f7ccbb6..d533d15 100644
+--- a/src/libcamera/shaders/bayer_unpacked.frag
++++ b/src/libcamera/shaders/bayer_unpacked.frag
+@@ -144,36 +144,53 @@ void main(void) {
+             vec3(PATTERN.w, C, PATTERN.z) :
+             vec3(PATTERN.yx, C));
+ 
+-    /*
+-     * \todo: Black level normalising, AWB and digital gain could be
+-     * reworked into a single multiplication.
+-     */
+-    rgb = max((rgb - blacklevel) / (1.0 - blacklevel), vec3(0.0));
++    rgb = clamp(rgb, 0.0, 1.0);
++
++    vec3 rawLin = max((rgb - blacklevel) / max(vec3(1.0) - blacklevel, vec3(0.001)), vec3(0.0));
++    float rawPeak = max(rawLin.r, max(rawLin.g, rawLin.b));
++    float rawMin = min(rawLin.r, min(rawLin.g, rawLin.b));
+ 
+-    /* Lens Shading Correction (radial DNG polynomial) */
++    /* Lens Shading Correction (radial DNG polynomial) + AWB in linear HDR space */
+     vec2 lscUv = vec2(center.x / max(stride_factor, 0.0001), center.y);
+     vec3 lscGain = vec3(lsc_eval(lscUv, tex_size, lscR),
+                         lsc_eval(lscUv, tex_size, lscG),
+                         lsc_eval(lscUv, tex_size, lscB));
+-
+-    /* Apply LSC and AWB gains, and saturate each channel at sensor range */
+-    rgb = clamp(rgb * lscGain * awb, vec3(0.0), vec3(1.0));
+-
+-    /* Colour Correction Matrix */
+-    rgb = ccm * rgb;
+-
+-    /*
+-     * Contrast
+-     */
+-    rgb = clamp(rgb, 0.0, 1.0);
+-    rgb.r = apply_contrast(rgb.r);
+-    rgb.g = apply_contrast(rgb.g);
+-    rgb.b = apply_contrast(rgb.b);
+-
+-    /* Apply gamma after colour correction */
+-    rgb = pow(rgb, vec3(gamma));
+-
+-#if defined (SWAP_BLUE)
++    vec3 lin = rawLin * lscGain * awb;
++
++    /* Reconstruct neutral highlight color where sensor channels clip */
++    float clipBlend = max(smoothstep(0.91, 0.985, rawPeak) * smoothstep(0.55, 0.92, rawMin),
++                          smoothstep(0.965, 0.995, rawPeak));
++    float lumPre = dot(lin, vec3(0.25, 0.55, 0.20));
++    float peakPre = max(lin.r, max(lin.g, lin.b));
++    lin = mix(lin, vec3(mix(lumPre, peakPre, 0.45)), clipBlend);
++
++    /* Apply Colour Correction Matrix before highlight compression */
++    lin = max(ccm * lin, vec3(0.0));
++
++    /* Headroom scale + luminance-preserving Extended-Reinhard shoulder & subtle shadow lift */
++    lin *= 0.72;
++    float Y = max(dot(lin, vec3(0.2126, 0.7152, 0.0722)), 1e-5);
++    const float kWhitePt = 2.25;
++    float Yt = (Y * (1.0 + Y / (kWhitePt * kWhitePt))) / (1.0 + Y);
++    Yt = Yt + 0.035 * Yt * (1.0 - Yt) * (1.0 - Yt);
++    vec3 mapped = lin * (Yt / Y);
++    mapped = mix(mapped, vec3(Yt), smoothstep(1.05, 2.2, Y) * 0.65);
++    rgb = clamp(mapped, 0.0, 1.0);
++
++    if (abs(contrastExp - 1.0) > 0.01) {
++        rgb.r = apply_contrast(rgb.r);
++        rgb.g = apply_contrast(rgb.g);
++        rgb.b = apply_contrast(rgb.b);
++    }
++
++    /* Piecewise sRGB transfer avoids near-black slope amplification */
++    vec3 srgbLo = 12.92 * rgb;
++    vec3 srgbHi = 1.055 * pow(max(rgb, vec3(0.0031308)), vec3(1.0 / 2.4)) - 0.055;
++    rgb = mix(srgbLo, srgbHi, step(vec3(0.0031308), rgb));
++    if (abs(gamma - 1.0 / 2.2) > 0.02)
++        rgb = pow(max(rgb, vec3(0.0)), vec3(gamma * 2.2));
++
++#if defined (SWAP_BLUE) && !defined(POST_PASS)
+     gl_FragColor = vec4(rgb.bgr, 1.0);
+ #else
+     gl_FragColor = vec4(rgb, 1.0);
+diff --git a/src/libcamera/shaders/meson.build b/src/libcamera/shaders/meson.build
+index c409ff9..938651f 100644
+--- a/src/libcamera/shaders/meson.build
++++ b/src/libcamera/shaders/meson.build
+@@ -7,6 +7,7 @@ shader_files = files([
+     'bayer_unpacked.frag',
+     'bayer_unpacked.vert',
+     'identity.vert',
++    'rgb_post.frag',
+ ])
+ 
+ # Generate header from shaders
+diff --git a/src/libcamera/shaders/rgb_post.frag b/src/libcamera/shaders/rgb_post.frag
+new file mode 100644
+index 0000000..26dd7ef
+--- /dev/null
++++ b/src/libcamera/shaders/rgb_post.frag
+@@ -0,0 +1,111 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Copyright (C) 2026, Fedora OPD2413 contributors
++ *
++ * Gain-adaptive YCbCr joint-bilateral chroma/luma denoising and clamped
++ * contrast-adaptive sharpening post-process shader.
++ */
++
++#ifdef GL_ES
++precision highp float;
++#endif
++
++varying vec2 textureOut;
++
++uniform sampler2D tex_rgb;
++uniform vec2 post_step;
++uniform float sensor_gain;
++
++vec3 rgb2ycc(vec3 c)
++{
++	float y = dot(c, vec3(0.299, 0.587, 0.114));
++	return vec3(y, c.r - y, c.b - y);
++}
++
++vec3 ycc2rgb(vec3 ycc)
++{
++	float r = ycc.x + ycc.y;
++	float g = ycc.x - 0.50937 * ycc.y - 0.19421 * ycc.z;
++	float b = ycc.x + ycc.z;
++	return vec3(r, g, b);
++}
++
++void main(void)
++{
++	vec3 c0 = rgb2ycc(texture2D(tex_rgb, textureOut).rgb);
++
++	float gainNorm = clamp((sensor_gain - 1.0) / 15.0, 0.0, 1.0);
++	float sigmaChromaY = mix(0.055, 0.16, gainNorm);
++	float sigmaLumaY = mix(0.014, 0.042, gainNorm);
++	float sharpAmount = mix(0.32, 0.14, gainNorm);
++
++	float ySum = c0.x;
++	float yW = 1.0;
++	vec2 cSum = c0.yz;
++	float cW = 1.0;
++
++	float minY = c0.x;
++	float maxY = c0.x;
++	float crossSum = 0.0;
++	float diagSum = 0.0;
++
++	/* 3x3 full neighborhood for joint-bilateral luma/chroma NR + CAS bounds */
++	for (int dy = -1; dy <= 1; dy++) {
++		for (int dx = -1; dx <= 1; dx++) {
++			if (dx == 0 && dy == 0)
++				continue;
++
++			vec2 uv = textureOut + vec2(float(dx), float(dy)) * post_step;
++			vec3 n = rgb2ycc(texture2D(tex_rgb, uv).rgb);
++			float dY = abs(n.x - c0.x);
++
++			minY = min(minY, n.x);
++			maxY = max(maxY, n.x);
++			if (dx == 0 || dy == 0)
++				crossSum += n.x;
++			else
++				diagSum += n.x;
++
++			float spatial = (dx == 0 || dy == 0) ? 0.70 : 0.45;
++			float wl = spatial * exp(-(dY * dY) / max(2.0 * sigmaLumaY * sigmaLumaY, 1e-6));
++			ySum += n.x * wl;
++			yW += wl;
++
++			float wc = spatial * exp(-(dY * dY) / max(2.0 * sigmaChromaY * sigmaChromaY, 1e-6));
++			cSum += n.yz * wc;
++			cW += wc;
++		}
++	}
++
++	/* Sparse radius-2 taps suppress wider-area color noise without blurring edges */
++	for (int i = 0; i < 8; i++) {
++		vec2 ofs = vec2(0.0);
++		if (i == 0) ofs = vec2(-2.0,  0.0);
++		else if (i == 1) ofs = vec2( 2.0,  0.0);
++		else if (i == 2) ofs = vec2( 0.0, -2.0);
++		else if (i == 3) ofs = vec2( 0.0,  2.0);
++		else if (i == 4) ofs = vec2(-2.0, -2.0);
++		else if (i == 5) ofs = vec2( 2.0, -2.0);
++		else if (i == 6) ofs = vec2(-2.0,  2.0);
++		else ofs = vec2( 2.0,  2.0);
++
++		vec3 n = rgb2ycc(texture2D(tex_rgb, textureOut + ofs * post_step).rgb);
++		float dY = abs(n.x - c0.x);
++		float wc = 0.35 * exp(-(dY * dY) / max(2.0 * sigmaChromaY * sigmaChromaY, 1e-6));
++		cSum += n.yz * wc;
++		cW += wc;
++	}
++
++	float yDenoised = ySum / yW;
++	float yBlur = (4.0 * c0.x + 2.0 * crossSum + diagSum) / 16.0;
++	float ySharp = yDenoised + sharpAmount * (yDenoised - yBlur);
++	float yOut = clamp(ySharp, minY - 0.015 * sharpAmount, maxY + 0.015 * sharpAmount);
++
++	vec3 rgb = clamp(ycc2rgb(vec3(yOut, cSum / cW)), 0.0, 1.0);
++
++#if defined(SWAP_BLUE)
++	gl_FragColor = vec4(rgb.bgr, 1.0);
++#else
++	gl_FragColor = vec4(rgb, 1.0);
++#endif
++}
+diff --git a/src/libcamera/software_isp/debayer_egl.cpp b/src/libcamera/software_isp/debayer_egl.cpp
+index c3c41a1..3a2641d 100644
+--- a/src/libcamera/software_isp/debayer_egl.cpp
++++ b/src/libcamera/software_isp/debayer_egl.cpp
+@@ -29,6 +29,31 @@
+ 
+ namespace libcamera {
+ 
++namespace {
++
++const GLfloat kQuadVertices[4][2] = {
++	{ -1.0f, -1.0f },
++	{ -1.0f, +1.0f },
++	{ +1.0f, +1.0f },
++	{ +1.0f, -1.0f },
++};
++
++const GLfloat kQuadTexCoords[4][2] = {
++	{ 0.0f, 0.0f },
++	{ 0.0f, 1.0f },
++	{ 1.0f, 1.0f },
++	{ 1.0f, 0.0f },
++};
++
++const GLfloat kIdentityMatrix[16] = {
++	1.0f, 0.0f, 0.0f, 0.0f,
++	0.0f, 1.0f, 0.0f, 0.0f,
++	0.0f, 0.0f, 1.0f, 0.0f,
++	0.0f, 0.0f, 0.0f, 1.0f
++};
++
++} /* namespace */
++
+ /**
+  * \class DebayerEGL
+  * \brief Class for debayering using an EGL Shader
+@@ -159,6 +184,9 @@ int DebayerEGL::initBayerShaders(PixelFormat inputFormat, PixelFormat outputForm
+ 	/* Specify GL_OES_EGL_image_external */
+ 	egl_.pushEnv(shaderEnv, "#extension GL_OES_EGL_image_external: enable");
+ 
++	/* Pass 1 writes unswapped linear->sRGB RGB into intermediateImage_; Pass 2 handles SWAP_BLUE */
++	egl_.pushEnv(shaderEnv, "#define POST_PASS");
++
+ 	/*
+ 	 * Tell shaders how to re-order output taking account of how the pixels
+ 	 * are actually stored by EGL.
+@@ -287,6 +315,59 @@ int DebayerEGL::initBayerShaders(PixelFormat inputFormat, PixelFormat outputForm
+ 	return getShaderVariableLocations();
+ }
+ 
++int DebayerEGL::initPostShaders(PixelFormat outputFormat)
++{
++	std::vector<std::string> shaderEnv;
++
++	egl_.pushEnv(shaderEnv, "#version 100");
++	switch (outputFormat) {
++	case formats::ARGB8888:
++	case formats::XRGB8888:
++		break;
++	case formats::ABGR8888:
++	case formats::XBGR8888:
++		egl_.pushEnv(shaderEnv, "#define SWAP_BLUE");
++		break;
++	default:
++		LOG(Debayer, Error) << "Unsupported post output format";
++		return -EINVAL;
++	}
++
++	if (egl_.compileVertexShader(postVertexShaderId_, identity_vert, shaderEnv)) {
++		LOG(Debayer, Error) << "Compile post vertex shader fail";
++		return -ENODEV;
++	}
++	utils::scope_exit vShaderGuard([&] { glDeleteShader(postVertexShaderId_); });
++
++	if (egl_.compileFragmentShader(postFragmentShaderId_, rgb_post_frag, shaderEnv)) {
++		LOG(Debayer, Error) << "Compile post fragment shader fail";
++		return -ENODEV;
++	}
++	utils::scope_exit fShaderGuard([&] { glDeleteShader(postFragmentShaderId_); });
++
++	if (egl_.linkProgram(postProgramId_, postVertexShaderId_, postFragmentShaderId_)) {
++		LOG(Debayer, Error) << "Linking post program fail";
++		return -ENODEV;
++	}
++
++	egl_.useProgram(postProgramId_);
++	GLenum err = glGetError();
++	if (err != GL_NO_ERROR) {
++		LOG(Debayer, Error) << "Use post program error " << err;
++		return -ENODEV;
++	}
++
++	postAttributeVertex_ = glGetAttribLocation(postProgramId_, "vertexIn");
++	postAttributeTexture_ = glGetAttribLocation(postProgramId_, "textureIn");
++	postUniformTex_ = glGetUniformLocation(postProgramId_, "tex_rgb");
++	postUniformStep_ = glGetUniformLocation(postProgramId_, "post_step");
++	postUniformGain_ = glGetUniformLocation(postProgramId_, "sensor_gain");
++	postUniformStrideFactor_ = glGetUniformLocation(postProgramId_, "stride_factor");
++	postUniformProjMatrix_ = glGetUniformLocation(postProgramId_, "proj_matrix");
++
++	return 0;
++}
++
+ int DebayerEGL::configure(const StreamConfiguration &inputCfg,
+ 			  const std::vector<std::reference_wrapper<const StreamConfiguration>> &outputCfgs,
+ 			  [[maybe_unused]] bool ccmEnabled)
+@@ -411,8 +492,8 @@ void DebayerEGL::setShaderVariableValues(eGLImage &eglImageIn, const DebayerPara
+ 	GLfloat firstRed[] = { firstRed_x_, firstRed_y_ };
+ 	GLfloat imgSize[] = { (GLfloat)width_,
+ 			      (GLfloat)height_ };
+-	GLfloat Step[] = { static_cast<float>(bytesPerPixel_) / (inputConfig_.stride - 1),
+-			   1.0f / (height_ - 1) };
++	GLfloat Step[] = { static_cast<float>(bytesPerPixel_) / inputConfig_.stride,
++			   1.0f / height_ };
+ 	GLfloat Stride = (GLfloat)width_ / (shaderStridePixels_ / bytesPerPixel_);
+ 	/*
+ 	 * Keep the output viewport mapped across the full FBO and select a
+@@ -448,24 +529,10 @@ void DebayerEGL::setShaderVariableValues(eGLImage &eglImageIn, const DebayerPara
+ 	tcoordinates_[3][0] = u1;
+ 	tcoordinates_[3][1] = v0;
+ 
+-	static const GLfloat projMatrix[16] = {
+-		1.0f, 0.0f, 0.0f, 0.0f,
+-		0.0f, 1.0f, 0.0f, 0.0f,
+-		0.0f, 0.0f, 1.0f, 0.0f,
+-		0.0f, 0.0f, 0.0f, 1.0f
+-	};
+-	/* Static const coordinates */
+-	static const GLfloat vcoordinates[4][2] = {
+-		{ -1.0f, -1.0f },
+-		{ -1.0f, +1.0f },
+-		{ +1.0f, +1.0f },
+-		{ +1.0f, -1.0f },
+-	};
+-
+ 	/* vertexIn - bayer_8.vert */
+ 	glEnableVertexAttribArray(attributeVertex_);
+ 	glVertexAttribPointer(attributeVertex_, 2, GL_FLOAT, GL_TRUE,
+-			      2 * sizeof(GLfloat), vcoordinates);
++			      2 * sizeof(GLfloat), kQuadVertices);
+ 
+ 	/* textureIn - bayer_8.vert */
+ 	glEnableVertexAttribArray(attributeTexture_);
+@@ -491,7 +558,7 @@ void DebayerEGL::setShaderVariableValues(eGLImage &eglImageIn, const DebayerPara
+ 	glUniform2fv(textureUniformSize_, 1, imgSize);
+ 	glUniform2fv(textureUniformStep_, 1, Step);
+ 	glUniform1f(textureUniformStrideFactor_, Stride);
+-	glUniformMatrix4fv(textureUniformProjMatrix_, 1, GL_FALSE, projMatrix);
++	glUniformMatrix4fv(textureUniformProjMatrix_, 1, GL_FALSE, kIdentityMatrix);
+ 
+ 	LOG(Debayer, Debug) << "vertexIn " << attributeVertex_ << " textureIn " << attributeTexture_
+ 			    << " tex_y " << textureUniformBayerDataIn_
+@@ -644,14 +711,46 @@ int DebayerEGL::debayerGPU(FrameBuffer *input, FrameBuffer *output, const Debaye
+ 	if (!eglImageOut)
+ 		return -ENOMEM;
+ 
++	if (!intermediateImage_)
++		return -ENODEV;
++
++	/* Pass 1: 5x5 MHC demosaic + LSC/AWB/highlight reconstruction + CCM + tone map -> intermediateImage_ */
+ 	egl_.useProgram(programId_);
+ 	egl_.activateBindTexture(*eglImageIn);
+-	egl_.attachTextureToFBO(*eglImageOut);
++	if (egl_.attachTextureToFBO(*intermediateImage_))
++		return -ENODEV;
+ 	setShaderVariableValues(*eglImageIn, params);
+ 
+ 	glViewport(0, 0, outputSize_.width, outputSize_.height);
+-	glClear(GL_COLOR_BUFFER_BIT);
+ 	glDrawArrays(GL_TRIANGLE_FAN, 0, DEBAYER_OPENGL_COORDS);
++	glDisableVertexAttribArray(attributeVertex_);
++	glDisableVertexAttribArray(attributeTexture_);
++
++	/* Pass 2: YCbCr joint-bilateral NR + CAS sharpen -> eglImageOut */
++	egl_.useProgram(postProgramId_);
++	egl_.activateBindTexture(*intermediateImage_);
++	if (egl_.attachTextureToFBO(*eglImageOut))
++		return -ENODEV;
++
++	glEnableVertexAttribArray(postAttributeVertex_);
++	glVertexAttribPointer(postAttributeVertex_, 2, GL_FLOAT, GL_FALSE,
++			      2 * sizeof(GLfloat), kQuadVertices);
++	glEnableVertexAttribArray(postAttributeTexture_);
++	glVertexAttribPointer(postAttributeTexture_, 2, GL_FLOAT, GL_FALSE,
++			      2 * sizeof(GLfloat), kQuadTexCoords);
++
++	glUniform1i(postUniformTex_, intermediateImage_->texture_unit_uniform_id_);
++	glUniform1f(postUniformStrideFactor_, 1.0f);
++	glUniformMatrix4fv(postUniformProjMatrix_, 1, GL_FALSE, kIdentityMatrix);
++	glUniform2f(postUniformStep_,
++		    1.0f / std::max(1u, outputSize_.width),
++		    1.0f / std::max(1u, outputSize_.height));
++	glUniform1f(postUniformGain_, std::max(1.0f, params.again));
++
++	glViewport(0, 0, outputSize_.width, outputSize_.height);
++	glDrawArrays(GL_TRIANGLE_FAN, 0, DEBAYER_OPENGL_COORDS);
++	glDisableVertexAttribArray(postAttributeVertex_);
++	glDisableVertexAttribArray(postAttributeTexture_);
+ 
+ 	GLenum err = glGetError();
+ 	if (err != GL_NO_ERROR) {
+@@ -720,6 +819,9 @@ int DebayerEGL::start()
+ {
+ 	GLint maxTextureImageUnits;
+ 
++	if (outputSize_.isNull())
++		return -EINVAL;
++
+ 	if (egl_.initEGLContext())
+ 		return -ENODEV;
+ 
+@@ -727,8 +829,22 @@ int DebayerEGL::start()
+ 
+ 	LOG(Debayer, Debug) << "Available fragment shader texture units " << maxTextureImageUnits;
+ 
+-	if (initBayerShaders(inputPixelFormat_, outputPixelFormat_))
++	if (initBayerShaders(inputPixelFormat_, outputPixelFormat_) ||
++	    initPostShaders(outputPixelFormat_)) {
++		stop();
+ 		return -EINVAL;
++	}
++
++	intermediateImage_ = std::make_unique<eGLImage>(GL_RGBA, outputSize_.width,
++							outputSize_.height,
++							outputSize_.width * 4,
++							GL_TEXTURE2, 2);
++	egl_.createOutputTexture2D(*intermediateImage_);
++	if (egl_.attachTextureToFBO(*intermediateImage_) || glGetError() != GL_NO_ERROR) {
++		LOG(Debayer, Error) << "Failed to initialise intermediate FBO texture";
++		stop();
++		return -ENODEV;
++	}
+ 
+ 	return 0;
+ }
+@@ -738,6 +854,7 @@ void DebayerEGL::stop()
+ 	if (egl_.hasContext())
+ 		egl_.makeCurrent();
+ 
++	intermediateImage_.reset();
+ 	eglImageOutCache_.clear();
+ 	eglImageInCache_.clear();
+ 
+@@ -745,6 +862,10 @@ void DebayerEGL::stop()
+ 		glDeleteProgram(programId_);
+ 		programId_ = 0;
+ 	}
++	if (postProgramId_) {
++		glDeleteProgram(postProgramId_);
++		postProgramId_ = 0;
++	}
+ 
+ 	egl_.cleanUp();
+ }
+diff --git a/src/libcamera/software_isp/debayer_egl.h b/src/libcamera/software_isp/debayer_egl.h
+index b28c367..170425c 100644
+--- a/src/libcamera/software_isp/debayer_egl.h
++++ b/src/libcamera/software_isp/debayer_egl.h
+@@ -65,6 +65,7 @@ private:
+ 	static int getInputConfig(PixelFormat inputFormat, DebayerInputConfig &config);
+ 	static int getOutputConfig(PixelFormat outputFormat, DebayerOutputConfig &config);
+ 	int initBayerShaders(PixelFormat inputFormat, PixelFormat outputFormat);
++	int initPostShaders(PixelFormat outputFormat);
+ 	int getShaderVariableLocations();
+ 	void setShaderVariableValues(eGLImage &eGLImageIn, const DebayerParams &params);
+ 	int debayerGPU(FrameBuffer *input, FrameBuffer *output, const DebayerParams &params, std::optional<MappedFrameBuffer> *mappedInputBuffer, std::optional<DmaSyncer> *inputBufferDmaSyncer);
+@@ -76,12 +77,16 @@ private:
+ 	GLuint vertexShaderId_ = 0;
+ 	GLuint fragmentShaderId_ = 0;
+ 	GLuint programId_ = 0;
++	GLuint postVertexShaderId_ = 0;
++	GLuint postFragmentShaderId_ = 0;
++	GLuint postProgramId_ = 0;
+ 
+ 	eGL egl_;
+ 
+ 	/* Pointer to object representing input texture */
+ 	std::deque<std::pair<SharedFD, std::unique_ptr<eGLImage>>> eglImageInCache_;
+ 	std::deque<std::pair<SharedFD, std::unique_ptr<eGLImage>>> eglImageOutCache_;
++	std::unique_ptr<eGLImage> intermediateImage_;
+ 	unsigned int inputBufferCount_;
+ 	unsigned int outputBufferCount_;
+ 
+@@ -118,6 +123,15 @@ private:
+ 	GLint lscGUniformDataIn_;
+ 	GLint lscBUniformDataIn_;
+ 
++	/* Post-processing pass shader parameters */
++	GLint postAttributeVertex_ = -1;
++	GLint postAttributeTexture_ = -1;
++	GLint postUniformTex_ = -1;
++	GLint postUniformStep_ = -1;
++	GLint postUniformGain_ = -1;
++	GLint postUniformStrideFactor_ = -1;
++	GLint postUniformProjMatrix_ = -1;
++
+ 	Size nativeOutputSize_;
+ 	Rectangle window_;
+ 	std::unique_ptr<SwStatsCpu> stats_;
+diff --git a/src/libcamera/software_isp/swstats_cpu.cpp b/src/libcamera/software_isp/swstats_cpu.cpp
+index ee0d99b..ff10570 100644
+--- a/src/libcamera/software_isp/swstats_cpu.cpp
++++ b/src/libcamera/software_isp/swstats_cpu.cpp
+@@ -178,6 +178,10 @@ static constexpr unsigned int kBlueYMul = 29; /* 0.114 * 256 */
+ 	uint64_t sumR = 0;                                                    \
+ 	uint64_t sumG = 0;                                                    \
+ 	uint64_t sumB = 0;                                                    \
++	uint64_t awbR = 0;                                                    \
++	uint64_t awbG = 0;                                                    \
++	uint64_t awbB = 0;                                                    \
++	uint64_t awbCnt = 0;                                                  \
+ 	uint64_t sumFocus = 0;                                                \
+ 	uint32_t focusSamples = 0;                                            \
+ 	int32_t prevG = 0;                                                    \
+@@ -191,6 +195,17 @@ static constexpr unsigned int kBlueYMul = 29; /* 0.114 * 256 */
+ 	sumR += r;                                                            \
+ 	sumG += g;                                                            \
+ 	sumB += b;                                                            \
++	if (static_cast<unsigned int>(r) < 242u * (div) &&                    \
++	    static_cast<unsigned int>(g) < 242u * (div) &&                    \
++	    static_cast<unsigned int>(b) < 242u * (div) &&                    \
++	    static_cast<unsigned int>(r) > 18u * (div) &&                     \
++	    static_cast<unsigned int>(g) > 18u * (div) &&                     \
++	    static_cast<unsigned int>(b) > 18u * (div)) {                     \
++		awbR += r;                                                    \
++		awbG += g;                                                    \
++		awbB += b;                                                    \
++		awbCnt++;                                                     \
++	}                                                                     \
+                                                                               \
+ 	yVal = r * kRedYMul;                                                  \
+ 	yVal += g * kGreenYMul;                                               \
+@@ -213,6 +228,10 @@ static constexpr unsigned int kBlueYMul = 29; /* 0.114 * 256 */
+ 	stats.sum_.r() += sumR;     \
+ 	stats.sum_.g() += sumG;     \
+ 	stats.sum_.b() += sumB;     \
++	stats.awbSum_.r() += awbR;  \
++	stats.awbSum_.g() += awbG;  \
++	stats.awbSum_.b() += awbB;  \
++	stats.awbSamples += awbCnt; \
+ 	stats.focusMetric += sumFocus; \
+ 	stats.focusSamples += focusSamples;
+ 
+@@ -413,6 +432,8 @@ void SwStatsCpu::startFrame(uint32_t frame)
+ 
+ 	for (auto &s : stats_) {
+ 		s.sum_ = RGB<uint64_t>({ 0, 0, 0 });
++		s.awbSum_ = RGB<uint64_t>({ 0, 0, 0 });
++		s.awbSamples = 0;
+ 		s.yHistogram.fill(0);
+ 		s.focusMetric = 0;
+ 		s.focusSamples = 0;
+@@ -433,11 +454,15 @@ void SwStatsCpu::finishFrame(uint32_t frame, uint32_t bufferId)
+ 
+ 	if (valid) {
+ 		sharedStats_->sum_ = RGB<uint64_t>({ 0, 0, 0 });
++		sharedStats_->awbSum_ = RGB<uint64_t>({ 0, 0, 0 });
++		sharedStats_->awbSamples = 0;
+ 		sharedStats_->yHistogram.fill(0);
+ 		sharedStats_->focusMetric = 0;
+ 		sharedStats_->focusSamples = 0;
+ 		for (const auto &s : stats_) {
+ 			sharedStats_->sum_ += s.sum_;
++			sharedStats_->awbSum_ += s.awbSum_;
++			sharedStats_->awbSamples += s.awbSamples;
+ 			sharedStats_->focusMetric += s.focusMetric;
+ 			sharedStats_->focusSamples += s.focusSamples;
+ 			for (unsigned int j = 0; j < SwIspStats::kYHistogramSize; j++)
+@@ -445,6 +470,7 @@ void SwStatsCpu::finishFrame(uint32_t frame, uint32_t bufferId)
+ 		}
+ 
+ 		sharedStats_->sum_ >>= sumShift_;
++		sharedStats_->awbSum_ >>= sumShift_;
+ 	}
+ 
+ 	sharedStats_->valid = valid;
+-- 
+2.56.0
+

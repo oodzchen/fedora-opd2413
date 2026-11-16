@@ -23,6 +23,8 @@ Patch104: 0104-ipa-simple-Run-swstats-every-frame-and-speed-up-AGC-.patch
 Patch105: 0105-ipa-simple-debayer_egl-Add-radial-per-channel-Lens-S.patch
 Patch106: 0106-pipeline-simple-ipa-simple-Add-CameraLens-VCM-and-co.patch
 Patch107: 0107-ipa-simple-data-Add-initial-sc820cs-and-sc1300cs-tun.patch
+Patch108: 0108-debayer_egl-Fix-crop-viewport-LSC-UV-and-EGL-reconfi.patch
+Patch109: 0109-ipa-simple-shaders-Upgrade-GPU-ISP-pipeline-and-tuni.patch
 
 # libcamera does not currently build on these architectures
 ExcludeArch: s390x ppc64le

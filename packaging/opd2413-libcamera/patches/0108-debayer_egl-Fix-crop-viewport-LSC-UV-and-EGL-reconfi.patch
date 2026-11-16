@@ -1,0 +1,246 @@
+From 37de54f5197d62f5d34c6e38be02897414c3cb60 Mon Sep 17 00:00:00 2001
+From: opd2413-builder <builder@local>
+Date: Sun, 15 Nov 2026 20:59:44 +0800
+Subject: [PATCH] debayer_egl: Fix crop viewport, LSC UV, and EGL reconfigure
+ cleanup
+
+---
+ include/libcamera/internal/egl.h           |  4 +-
+ src/libcamera/egl.cpp                      | 26 ++++++-
+ src/libcamera/software_isp/debayer_egl.cpp | 82 ++++++++++++++++------
+ src/libcamera/software_isp/debayer_egl.h   |  9 ++-
+ 4 files changed, 94 insertions(+), 27 deletions(-)
+
+diff --git a/include/libcamera/internal/egl.h b/include/libcamera/internal/egl.h
+index 1e31d49..6025864 100644
+--- a/include/libcamera/internal/egl.h
++++ b/include/libcamera/internal/egl.h
+@@ -127,11 +127,13 @@ public:
+ 	void deleteProgram(GLuint programId);
+ 	void syncOutput();
+ 	void flushOutput();
++	void cleanUp();
++	bool hasContext() const { return context_ != EGL_NO_CONTEXT; }
+ 
+ private:
+ 	LIBCAMERA_DISABLE_COPY_AND_MOVE(eGL)
+ 
+-	pid_t tid_;
++	pid_t tid_ = 0;
+ 
+ 	EGLDisplay display_ = EGL_NO_DISPLAY;
+ 	EGLContext context_ = EGL_NO_CONTEXT;
+diff --git a/src/libcamera/egl.cpp b/src/libcamera/egl.cpp
+index 7ec7a65..ccd481b 100644
+--- a/src/libcamera/egl.cpp
++++ b/src/libcamera/egl.cpp
+@@ -79,11 +79,30 @@ eGL::eGL()
+  */
+ eGL::~eGL()
+ {
+-	if (context_ != EGL_NO_CONTEXT)
++	cleanUp();
++}
++
++void eGL::cleanUp()
++{
++	if (display_ == EGL_NO_DISPLAY)
++		return;
++
++	if (tid_ == Thread::currentId())
++		eglMakeCurrent(display_, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
++
++	if (context_ != EGL_NO_CONTEXT) {
+ 		eglDestroyContext(display_, context_);
++		context_ = EGL_NO_CONTEXT;
++	}
+ 
+-	if (surface_ != EGL_NO_SURFACE)
++	if (surface_ != EGL_NO_SURFACE) {
+ 		eglDestroySurface(display_, surface_);
++		surface_ = EGL_NO_SURFACE;
++	}
++
++	eglTerminate(display_);
++	display_ = EGL_NO_DISPLAY;
++	tid_ = 0;
+ }
+ 
+ /**
+@@ -403,6 +422,9 @@ int eGL::initEGLContext()
+ 	EGLint numConfigs;
+ 	EGLConfig config;
+ 
++	if (display_ != EGL_NO_DISPLAY)
++		cleanUp();
++
+ 	display_ = probeDisplay();
+ 	if (display_ == EGL_NO_DISPLAY) {
+ 		LOG(eGL, Error) << "Unable to probe display";
+diff --git a/src/libcamera/software_isp/debayer_egl.cpp b/src/libcamera/software_isp/debayer_egl.cpp
+index 20a2a60..c3c41a1 100644
+--- a/src/libcamera/software_isp/debayer_egl.cpp
++++ b/src/libcamera/software_isp/debayer_egl.cpp
+@@ -343,10 +343,17 @@ int DebayerEGL::configure(const StreamConfiguration &inputCfg,
+ 	window_.height = outputCfg.size.height;
+ 
+ 	/*
+-	 * Don't pass x,y from window_ since process() already adjusts for it.
+-	 * But crop the window to 2/3 of its width and height for speedup.
++	 * Gather statistics over a centered 3/4 sensor window rather than a
++	 * top-left (0, 0) window so AEC/AWB/AF ignore severe lens vignetting
++	 * corners and track the actual subject area across all output sizes.
+ 	 */
+-	stats_->setWindow(Rectangle(window_.size()));
++	const unsigned int statsW = std::max(inputConfig_.patternSize.width,
++					     ((width_ * 3) / 4) & ~(inputConfig_.patternSize.width - 1));
++	const unsigned int statsH = std::max(inputConfig_.patternSize.height,
++					     ((height_ * 3) / 4) & ~(inputConfig_.patternSize.height - 1));
++	const unsigned int statsX = ((width_ - statsW) / 2) & ~(inputConfig_.patternSize.width - 1);
++	const unsigned int statsY = ((height_ - statsH) / 2) & ~(inputConfig_.patternSize.height - 1);
++	stats_->setWindow(Rectangle(statsX, statsY, statsW, statsH));
+ 
+ 	inputBufferCount_ = inputCfg.bufferCount;
+ 	outputBufferCount_ = outputCfg.bufferCount;
+@@ -408,18 +415,44 @@ void DebayerEGL::setShaderVariableValues(eGLImage &eglImageIn, const DebayerPara
+ 			   1.0f / (height_ - 1) };
+ 	GLfloat Stride = (GLfloat)width_ / (shaderStridePixels_ / bytesPerPixel_);
+ 	/*
+-	 * Scale the output size from the native size the algorithm produces for
+-	 * the input size. Keep the aspect ratio and prefer cropping over black
+-	 * bars.
++	 * Keep the output viewport mapped across the full FBO and select a
++	 * centered aspect-preserving crop of the usable sensor area via UV
++	 * texture coordinates, reserving a border for 5x5 demosaic taps.
++	 * Passing true full-sensor [0..1] UVs also keeps radial LSC centered.
+ 	 */
+-	GLfloat scale = std::max((GLfloat)outputSize_.width / nativeOutputSize_.width,
+-				 (GLfloat)outputSize_.height / nativeOutputSize_.height);
+-	GLfloat trans = -(1.0f - scale);
+-	GLfloat projMatrix[] = {
+-		scale, 0, 0, 0,
+-		0, scale, 0, 0,
+-		0, 0, 1, 0,
+-		trans, trans, 0, 1
++	const float usableW = std::max(static_cast<float>(width_) - 8.0f,
++				       static_cast<float>(width_) * 0.5f);
++	const float usableH = std::max(static_cast<float>(height_) - 4.0f,
++				       static_cast<float>(height_) * 0.5f);
++	const float outAspect = static_cast<float>(outputSize_.width) /
++				std::max(1.0f, static_cast<float>(outputSize_.height));
++	float cropW, cropH;
++	if (outAspect >= usableW / usableH) {
++		cropW = usableW;
++		cropH = usableW / outAspect;
++	} else {
++		cropH = usableH;
++		cropW = usableH * outAspect;
++	}
++	const float u0 = 0.5f * (static_cast<float>(width_) - cropW) / static_cast<float>(width_);
++	const float u1 = 0.5f * (static_cast<float>(width_) + cropW) / static_cast<float>(width_);
++	const float v0 = 0.5f * (static_cast<float>(height_) - cropH) / static_cast<float>(height_);
++	const float v1 = 0.5f * (static_cast<float>(height_) + cropH) / static_cast<float>(height_);
++
++	tcoordinates_[0][0] = u0;
++	tcoordinates_[0][1] = v0;
++	tcoordinates_[1][0] = u0;
++	tcoordinates_[1][1] = v1;
++	tcoordinates_[2][0] = u1;
++	tcoordinates_[2][1] = v1;
++	tcoordinates_[3][0] = u1;
++	tcoordinates_[3][1] = v0;
++
++	static const GLfloat projMatrix[16] = {
++		1.0f, 0.0f, 0.0f, 0.0f,
++		0.0f, 1.0f, 0.0f, 0.0f,
++		0.0f, 0.0f, 1.0f, 0.0f,
++		0.0f, 0.0f, 0.0f, 1.0f
+ 	};
+ 	/* Static const coordinates */
+ 	static const GLfloat vcoordinates[4][2] = {
+@@ -428,12 +461,6 @@ void DebayerEGL::setShaderVariableValues(eGLImage &eglImageIn, const DebayerPara
+ 		{ +1.0f, +1.0f },
+ 		{ +1.0f, -1.0f },
+ 	};
+-	static const GLfloat tcoordinates[4][2] = {
+-		{ 0.0f, 0.0f },
+-		{ 0.0f, 1.0f },
+-		{ 1.0f, 1.0f },
+-		{ 1.0f, 0.0f },
+-	};
+ 
+ 	/* vertexIn - bayer_8.vert */
+ 	glEnableVertexAttribArray(attributeVertex_);
+@@ -443,7 +470,7 @@ void DebayerEGL::setShaderVariableValues(eGLImage &eglImageIn, const DebayerPara
+ 	/* textureIn - bayer_8.vert */
+ 	glEnableVertexAttribArray(attributeTexture_);
+ 	glVertexAttribPointer(attributeTexture_, 2, GL_FLOAT, GL_TRUE,
+-			      2 * sizeof(GLfloat), tcoordinates);
++			      2 * sizeof(GLfloat), tcoordinates_);
+ 
+ 	/*
+ 	 * Set the sampler2D to the respective texture unit for each texutre
+@@ -617,10 +644,12 @@ int DebayerEGL::debayerGPU(FrameBuffer *input, FrameBuffer *output, const Debaye
+ 	if (!eglImageOut)
+ 		return -ENOMEM;
+ 
++	egl_.useProgram(programId_);
++	egl_.activateBindTexture(*eglImageIn);
+ 	egl_.attachTextureToFBO(*eglImageOut);
+ 	setShaderVariableValues(*eglImageIn, params);
+ 
+-	glViewport(0, 0, width_, height_);
++	glViewport(0, 0, outputSize_.width, outputSize_.height);
+ 	glClear(GL_COLOR_BUFFER_BIT);
+ 	glDrawArrays(GL_TRIANGLE_FAN, 0, DEBAYER_OPENGL_COORDS);
+ 
+@@ -706,11 +735,18 @@ int DebayerEGL::start()
+ 
+ void DebayerEGL::stop()
+ {
++	if (egl_.hasContext())
++		egl_.makeCurrent();
++
+ 	eglImageOutCache_.clear();
+ 	eglImageInCache_.clear();
+ 
+-	if (programId_)
++	if (programId_) {
+ 		glDeleteProgram(programId_);
++		programId_ = 0;
++	}
++
++	egl_.cleanUp();
+ }
+ 
+ SizeRange DebayerEGL::sizes(PixelFormat inputFormat, const Size &inputSize)
+diff --git a/src/libcamera/software_isp/debayer_egl.h b/src/libcamera/software_isp/debayer_egl.h
+index 9a86a0a..b28c367 100644
+--- a/src/libcamera/software_isp/debayer_egl.h
++++ b/src/libcamera/software_isp/debayer_egl.h
+@@ -77,6 +77,8 @@ private:
+ 	GLuint fragmentShaderId_ = 0;
+ 	GLuint programId_ = 0;
+ 
++	eGL egl_;
++
+ 	/* Pointer to object representing input texture */
+ 	std::deque<std::pair<SharedFD, std::unique_ptr<eGLImage>>> eglImageInCache_;
+ 	std::deque<std::pair<SharedFD, std::unique_ptr<eGLImage>>> eglImageOutCache_;
+@@ -119,7 +121,12 @@ private:
+ 	Size nativeOutputSize_;
+ 	Rectangle window_;
+ 	std::unique_ptr<SwStatsCpu> stats_;
+-	eGL egl_;
++	GLfloat tcoordinates_[4][2] = {
++		{ 0.0f, 0.0f },
++		{ 0.0f, 1.0f },
++		{ 1.0f, 1.0f },
++		{ 1.0f, 0.0f },
++	};
+ 	uint32_t width_;
+ 	uint32_t height_;
+ 	GLint glFormat_;
+-- 
+2.56.0
+
