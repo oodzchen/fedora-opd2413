@@ -119,8 +119,14 @@ Fedora 是在运行中的 Armada 里装进新子卷的（没有重新 mkfs），
 | `opd2413-device` | udev 规则、`ufs-guard`、dracut 配置（早期固件列表）、`kernel-install` 插件、`/etc/kernel/cmdline` 默认值、Wi-Fi MAC 和蓝牙地址服务 | 设备 + 集成 |
 | `opd2413-audio` | UCM 配置和 AudioReach 拓扑 | 设备 |
 | `opd2413-sensors` | hexagonrpc、libssc、带补丁的 iio-sensor-proxy、传感器配置 | 设备 |
+| `opd2413-libcamera` | 定制 `libcamera` / `python3-libcamera`（含 Adreno 830 GPU ISP 着色器/调校与 simple 管线 ZSL 双流适配） | 设备 / 媒体 |
+| `opd2413-camera` | 原生 `PySide6` 双流 ZSL 多帧 RAW10 HDR+ 相机 GUI（`opd-camera`）与命令行工具（`opd-camera-cli`） | 桌面应用 |
+| `opd2413-face` | 锁屏/PAM/polkit 人脸认证守护进程与 Qt 录入向导 | 设备 / 安全 |
+| `opd2413-netshare` | 跨设备 BLE + 5 GHz P2P 自动网络共享服务与托盘界面 | 设备 / 网络 |
 | `opd2413-desktop` | KDE 默认值：缩放、电源键与合盖行为、屏幕键盘 | 桌面策略 |
 | `opd2413-mesa`（仅在需要时） | 带补丁的 Mesa。先验证 Fedora 45 自带的 26.2.6 能否驱动 Adreno 830 | 设备 |
+
+需要编测的 `aarch64` 用户态包（`opd2413-libcamera`、`opd2413-sensors`、`opd2413-face`、`opd2413-camera`）默认通过 SSH 在平板 Fedora 上原生编译打包（并保留 `--local` 宿主机固化容器回退）；详细流程见 [BUILD.md](BUILD.md)。
 
 内核版本号用 `7.2.6-<N>.opd2413`，每次构建 `N` 加一、不复用（模块 BTF 与内核必须同次构建，旧模块配新内核会加载失败）。
 一个版本号不能是另一个的前缀：kernel-install 卸载内核时会删除所有 `fedora-<kver>*.conf`。
@@ -192,7 +198,7 @@ docs/               架构、状态、工作日志、技术债、硬件清单
 kernel/             补丁序列、DTS、配置、来源记录
 packaging/          各 RPM 的 spec 和文件
 device/             设备层文件（udev、dracut、kernel-install 插件等）
-tools/              构建脚本（主机上运行）和安装脚本（平板上运行）
+tools/              构建脚本（宿主机调度，用户态 ARM64 包默认经 SSH 在平板原生构建）与安装/控制脚本
 tests/              离线测试
 private/            （忽略）固件、备份、日志、本机数据
 out/                （忽略）构建输出

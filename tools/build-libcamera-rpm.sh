@@ -1,7 +1,8 @@
 #!/bin/bash
-# Build customized Fedora 45 libcamera aarch64 RPMs for OPD2413 in a container.
+# Build customized Fedora 45 libcamera aarch64 RPMs natively on the tablet
+# (default) or in a local QEMU aarch64 podman container (--local).
 #
-#   tools/build-libcamera-rpm.sh [OPDREL]
+#   tools/build-libcamera-rpm.sh [--local|--tablet] [--rebuild-image] [OPDREL]
 #
 # Outputs: out/rpmbuild/RPMS/aarch64/{libcamera,libcamera-ipa,libcamera-tools,
 #          libcamera-devel,libcamera-gstreamer,libcamera-qcam,libcamera-v4l2,
@@ -9,6 +10,12 @@
 set -euo pipefail
 
 repo=$(cd "$(dirname "$0")/.." && pwd)
+# shellcheck source=tools/tablet-build-common.sh
+source "$repo/tools/tablet-build-common.sh"
+
+opd_parse_build_target "$@"
+set -- "${OPD_ARGS[@]+"${OPD_ARGS[@]}"}"
+
 opdrel=${1:-1}
 S=$repo/packaging/opd2413-libcamera
 src=$repo/out/libcamera/src
@@ -47,22 +54,90 @@ cp "$src"/libcamera-v0.7.2.tar.bz2 "$work/rpm/SOURCES/"
 cp "$S"/files/* "$S"/patches/*.patch "$work/rpm/SOURCES/"
 cp "$S/libcamera.spec" "$work/rpm/SPECS/"
 
-podman run --rm --arch arm64 --network host \
-    -v "$work:/work:Z" -v "$cache:/var/cache/libdnf5:Z" \
-    -e OPDREL="$opdrel" -e JOBS="$jobs" -e NOPREP="$noprep_flag" \
-    "$image" bash -euxc '
-dnf -y --setopt=install_weak_deps=False --setopt=keepcache=True install \
-    rpm-build dnf5-plugins patch tar bzip2 >/dev/null
+spec_hash=$(grep -E '^Build(Requires|Conflicts):' "$S/libcamera.spec" | sha256sum | awk '{print $1}')
+builder="localhost/opd2413-builder-libcamera:fc45"
+setup_cmd="dnf -y --setopt=install_weak_deps=False --setopt=keepcache=True install \
+    rpm-build dnf5-plugins patch tar bzip2 >/dev/null && \
 dnf -y --setopt=install_weak_deps=False --setopt=keepcache=True builddep \
-    /work/rpm/SPECS/libcamera.spec >/dev/null
+    /tmp/spec/libcamera.spec >/dev/null && \
+printf '%s\n' '${spec_hash}' > /etc/opd-builddep.sha256"
+
+if [ "$OPD_BUILD_TARGET" = "tablet" ]; then
+    opd_check_tablet_ssh "$repo"
+    if [ "$rm_flag" = "1" ]; then
+        rwork="/var/tmp/opd-build-libcamera"
+    else
+        rwork="/tmp/opd-build-libcamera-$$"
+        cleanup_remote() {
+            opd_tablet_ssh "$repo" "rm -rf '$rwork'" >/dev/null 2>&1 || true
+        }
+        trap cleanup_remote EXIT
+    fi
+
+    opd_tablet_ssh "$repo" "REUSE='$rm_flag' RWORK='$rwork' bash -euc '
+if [ \"\$REUSE\" != \"1\" ]; then
+    rm -rf \"\$RWORK\"
+fi
+mkdir -p \"\$RWORK/rpm\"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
+rm -rf \"\$RWORK/rpm/RPMS/aarch64/\"* \"\$RWORK/rpm/SRPMS/\"*
+'"
+    tar -cf - -C "$work/rpm" SOURCES SPECS | opd_tablet_ssh "$repo" "tar -xf - -C '$rwork/rpm'"
+
+    if ! {
+        declare -f opd_ensure_cached_image
+        cat <<'REMOTE'
+rpm -q podman >/dev/null 2>&1 || dnf -y --setopt=install_weak_deps=False install podman >/dev/null
+if [ "$OPD_REBUILD_IMAGE" != "1" ] && podman image exists "$BUILDER" >/dev/null 2>&1; then
+    img_hash=$(podman run --rm "$BUILDER" cat /etc/opd-builddep.sha256 2>/dev/null || true)
+    [ "$img_hash" = "$SPEC_HASH" ] || OPD_REBUILD_IMAGE=1
+fi
+opd_ensure_cached_image "" "$BUILDER" "$IMAGE" "/var/tmp/opd2413-dnf-cache" "$SETUP_CMD" "-v $RWORK/rpm/SPECS:/tmp/spec:ro,Z"
+NOPREP=""
+if [ "$REUSE" = "1" ] && [ -n "$(ls -A "$RWORK/rpm/BUILD" 2>/dev/null || true)" ]; then
+    NOPREP="--noprep"
+fi
+JOBS=$(( $(nproc) > 1 ? $(nproc) - 1 : 1 ))
+systemd-inhibit --what=idle:sleep --who=opd2413-build --why="Build opd2413-libcamera RPM" \
+    podman run --rm --network host \
+        -v "$RWORK:/work:Z" \
+        -e OPDREL="$OPDREL" -e JOBS="$JOBS" -e NOPREP="$NOPREP" \
+        "$BUILDER" bash -euxc '
 rpmbuild -ba ${NOPREP} \
     --with container_check \
     --define "_topdir /work/rpm" \
     --define "opdrel ${OPDREL}" \
     --define "_smp_mflags -j${JOBS}" \
     /work/rpm/SPECS/libcamera.spec
-' > "$work/build-${opdrel}.log" 2>&1 || { tail -60 "$work/build-${opdrel}.log"; exit 1; }
+'
+REMOTE
+    } | opd_tablet_ssh "$repo" "env OPDREL=$(printf '%q' "$opdrel") REUSE=$(printf '%q' "$rm_flag") RWORK=$(printf '%q' "$rwork") BUILDER=$(printf '%q' "$builder") IMAGE=$(printf '%q' "$image") SPEC_HASH=$(printf '%q' "$spec_hash") SETUP_CMD=$(printf '%q' "$setup_cmd") OPD_REBUILD_IMAGE=$(printf '%q' "$OPD_REBUILD_IMAGE") bash -euxs" > "$work/build-${opdrel}.log" 2>&1; then
+        tail -60 "$work/build-${opdrel}.log"
+        exit 1
+    fi
 
-cp -f "$work/rpm/RPMS/aarch64/"*.rpm "$rpms/"
-cp -f "$work/rpm/SRPMS/"*.src.rpm "$srpms/"
-ls -la "$work/rpm/RPMS/aarch64/"
+    opd_tablet_ssh "$repo" "tar -cf - -C '$rwork/rpm/RPMS/aarch64' ." | tar -xf - -C "$rpms"
+    opd_tablet_ssh "$repo" "tar -cf - -C '$rwork/rpm/SRPMS' ." | tar -xf - -C "$srpms"
+    ls -la "$rpms"/libcamera*-0.7.2-5.*.opd2413."${opdrel}".*.rpm
+else
+    if [ "$OPD_REBUILD_IMAGE" != "1" ] && podman image exists "$builder" >/dev/null 2>&1; then
+        img_hash=$(podman run --rm --arch arm64 "$builder" cat /etc/opd-builddep.sha256 2>/dev/null || true)
+        [ "$img_hash" = "$spec_hash" ] || OPD_REBUILD_IMAGE=1
+    fi
+    opd_ensure_cached_image "--arch arm64" "$builder" "$image" "$cache" "$setup_cmd" "-v $work/rpm/SPECS:/tmp/spec:ro,Z"
+
+    podman run --rm --arch arm64 --network host \
+        -v "$work:/work:Z" \
+        -e OPDREL="$opdrel" -e JOBS="$jobs" -e NOPREP="$noprep_flag" \
+        "$builder" bash -euxc '
+    rpmbuild -ba ${NOPREP} \
+        --with container_check \
+        --define "_topdir /work/rpm" \
+        --define "opdrel ${OPDREL}" \
+        --define "_smp_mflags -j${JOBS}" \
+        /work/rpm/SPECS/libcamera.spec
+    ' > "$work/build-${opdrel}.log" 2>&1 || { tail -60 "$work/build-${opdrel}.log"; exit 1; }
+
+    cp -f "$work/rpm/RPMS/aarch64/"*.rpm "$rpms/"
+    cp -f "$work/rpm/SRPMS/"*.src.rpm "$srpms/"
+    ls -la "$work/rpm/RPMS/aarch64/"
+fi

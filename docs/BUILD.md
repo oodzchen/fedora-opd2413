@@ -1,6 +1,43 @@
 # 构建软件包与离线测试
 
-在主机（x86_64 Fedora）上执行，不需要平板。产物都在被 Git 忽略的 `out/` 下。
+`noarch`、固件包及交叉编译内核打包在宿主机（`x86_64` Fedora）直接执行、不依赖平板；用户态需要编测 `aarch64` C++/Python 的包默认通过 SSH 调度平板的 SM8750 Fedora 原生执行（也可传 `--local` 退回宿主机 QEMU 容器）。所有产物统一归档到被 Git 忽略的 `out/` 下。
+
+## 构建分工
+
+| 脚本 | 打包内容 | 默认构建节点 | 兜底/备注 |
+|---|---|---|---|
+| `tools/build-kernel-rpm.sh` | `kernel-opd2413` | 宿主机打包（`aarch64-linux-gnu-gcc` 交叉编译产物） | 保留宿主机独立救砖/编包能力 |
+| `tools/build-firmware-rpm.sh` | `opd2413-firmware` | 宿主机 | 从本地固件目录按清单打包 |
+| `tools/build-device-rpms.sh` | `opd2413-device`、`opd2413-audio` | 宿主机 | `noarch` 配置包 |
+| `tools/build-netshare-rpm.sh` | `opd2413-netshare` | 宿主机 | `noarch` Python/systemd 包 |
+| `tools/build-camera-rpm.sh` | `opd2413-camera` | **平板原生（默认）** | 传 `--local` 退回宿主机 `arm64` 容器 |
+| `tools/build-face-rpm.sh` | `opd2413-face` | **平板原生（默认）** | 传 `--local` 退回宿主机 `arm64` 容器 |
+| `tools/build-libcamera-rpm.sh` | `libcamera*` / `python3-libcamera` | **平板原生（默认）** | 支持 `REUSE_BUILD=1` 复用编译树及 `--local` |
+| `tools/build-sensors-rpm.sh` | `opd2413-sensors` | **平板原生（默认）** | 传 `--local` 退回宿主机 `arm64` 容器 |
+
+## 平板原生 ARM64 编译（用户态包）
+
+共享辅助库 [../tools/tablet-build-common.sh](../tools/tablet-build-common.sh) 为用户态 `aarch64` 构建脚本提供统一调度，架构遵循“**宿主机管源码校验与产物归档，平板只做无状态原生算力节点**”：
+
+1. **宿主机前置校验**：模型/源码压缩包/ROM 校准文件仍在宿主机完成 `sources.json` / `rom-config.json` 的 SHA-256 校验，再通过 `OPD_OS=fedora private/ssh.sh` 探活平板（确认架构为 `aarch64`，且电池电量 `>=15%` 或处于充电状态；不可达时直接报错并提示唤醒平板或改用 `--local`）。
+2. **工作目录与闪存零磨损**：常规构建仅把最小必要上下文经 `tar` 流式传入平板 `/tmp/opd-build-*`（内存盘 `tmpfs`），脚本结束时通过 `EXIT` trap 自动清理，不写入长期文件；`build-libcamera-rpm.sh` 启用 `REUSE_BUILD=1` 时使用 `/var/tmp/opd-build-libcamera` 保留 `BUILD/` 增量树。
+3. **防休眠与留核限流**：远端构建统一套用 `systemd-inhibit --what=idle:sleep` 防止长编过程中平板休眠断网；并行度在平板上动态取 `nproc - 1`（8 核 SM8750 上固定为 `-j7`），始终留出至少 1 核保障 KDE 前台流畅。
+4. **环境隔离与镜像缓存**：
+   - `build-face-rpm.sh`、`build-libcamera-rpm.sh`、`build-sensors-rpm.sh` 在平板 `podman` 内自动构建并复用持久化原生镜像 `localhost/opd2413-builder-<pkg>:fc45`（`dnf` 包缓存目录挂载于平板 `/var/tmp/opd2413-dnf-cache`），不往平板日常系统装一堆 `-devel` 头文件；其中 `libcamera` 镜像会按 `.spec` 中 `BuildRequires`/`BuildConflicts` 的哈希自动判别重建。
+   - `build-camera-rpm.sh`（纯 Python + Qt/OpenCV/NumPy 应用）直接复用平板已装的运行库，仅在首次缺包时按需补齐 `rpm-build`/`python3-devel`/`desktop-file-utils`，随后数秒内即可完成原生 `rpmbuild` 与 `%check`。
+5. **常用切换参数与环境变量**：
+   ```sh
+   # 默认平板原生编译（示例）
+   tools/build-camera-rpm.sh 0.1 1
+   REUSE_BUILD=1 tools/build-libcamera-rpm.sh 3
+
+   # 平板离线/未开机时回退宿主机 QEMU aarch64 固化镜像容器（--local 或环境变量）
+   tools/build-camera-rpm.sh --local 0.1 1
+   OPD_BUILD_TARGET=local tools/build-face-rpm.sh 0.1 1
+
+   # 当上游依赖更新时，强制重建固化构建镜像（--rebuild-image 或 OPD_REBUILD_IMAGE=1）
+   tools/build-libcamera-rpm.sh --rebuild-image 3
+   ```
 
 ## 需要的输入
 
@@ -12,7 +49,7 @@
 
 `<armada>` 是 armada 仓库 `oneplus-pad-2-pro` 分支的检出。
 
-主机需要 `rpm-build`、`podman`、`qemu-user-static`（跑 aarch64 容器）、`qemu-system-aarch64`、`mtools`、`zstd`。
+主机需要 `rpm-build`、`podman`、`qemu-user-static`（仅 `--local` 跑 aarch64 容器及离线安装测试需要）、`qemu-system-aarch64`、`mtools`、`zstd`。
 
 ## 构建
 

@@ -1,7 +1,8 @@
 #!/bin/bash
-# Build opd2413-sensors (aarch64) in a Fedora 45 aarch64 container.
+# Build opd2413-sensors (aarch64) RPM natively on the tablet (default) or in a
+# local QEMU aarch64 podman container (--local).
 #
-#   tools/build-sensors-rpm.sh VERSION RELEASE ERHAI_REPO
+#   tools/build-sensors-rpm.sh [--local|--tablet] [--rebuild-image] VERSION RELEASE ERHAI_REPO
 #
 # Inputs, all verified before anything is built:
 #   out/sensors/src/          the three source archives of packaging/opd2413-sensors/sources.json
@@ -11,9 +12,15 @@
 #                             packaging/opd2413-sensors/rom-config.json (vendor files: read from
 #                             the erhai checkout, never copied into this repository)
 # Output: out/rpmbuild/RPMS/aarch64/opd2413-sensors-VERSION-RELEASE.aarch64.rpm and a build log.
-# Needs podman and qemu-user-static (aarch64 binfmt). Leaves one CPU core free.
 set -euo pipefail
+
 repo=$(cd "$(dirname "$0")/.." && pwd)
+# shellcheck source=tools/tablet-build-common.sh
+source "$repo/tools/tablet-build-common.sh"
+
+opd_parse_build_target "$@"
+set -- "${OPD_ARGS[@]+"${OPD_ARGS[@]}"}"
+
 ver=${1:?version}; rel=${2:?release}; erhai=$(realpath -e "${3:?erhai repo (onepluspad-2pro-mainline)}")
 S=$repo/packaging/opd2413-sensors
 src=$repo/out/sensors/src; work=$repo/out/sensors/work; rpms=$repo/out/rpmbuild/RPMS/aarch64
@@ -45,13 +52,12 @@ for e in romcfg['files']:
 print(f"inputs verified: {len(lock['sources'])} sources, {len(romcfg['files'])} ROM files")
 EOF
 
-podman run --rm --arch arm64 --network host \
-    -v "$repo:/repo:ro,Z" -v "$erhai:/erhai:ro,Z" -v "$work:/work:Z" -v "$cache:/var/cache/libdnf5:Z" \
-    -e VER="$ver" -e REL="$rel" -e JOBS="$jobs" \
-    "$image" bash -euxc '
-dnf -y --setopt=install_weak_deps=False --setopt=keepcache=True install \
+builder="localhost/opd2413-builder-sensors:fc45"
+setup_cmd='dnf -y --setopt=install_weak_deps=False --setopt=keepcache=True install \
     gcc meson ninja-build pkgconf-pkg-config patch tar bzip2 gzip python3 python3-devel rpm-build \
-    glib2-devel libgudev-devel polkit-devel protobuf-c-devel protobuf-c-compiler libqmi-devel systemd-devel >/dev/null
+    glib2-devel libgudev-devel polkit-devel protobuf-c-devel protobuf-c-compiler libqmi-devel systemd-devel >/dev/null'
+
+build_cmd=$(cat <<'BUILD'
 P=/usr/libexec/opd2413-sensors
 lock=/repo/packaging/opd2413-sensors/sources.json
 rm -rf /build; mkdir -p /build/tree /build/stage
@@ -77,6 +83,51 @@ rpmbuild -bb --define "_topdir /build/rpm" --define "pkgver $VER" --define "pkgr
     --define "stagedir /build/stage" --define "srcdir /repo/packaging/opd2413-sensors" \
     --define "romdir /erhai/packaging/sensors" /repo/packaging/opd2413-sensors/opd2413-sensors.spec
 cp /build/rpm/RPMS/aarch64/*.rpm /work/
-' > "$work/build-$ver-$rel.log" 2>&1 || { tail -40 "$work/build-$ver-$rel.log"; exit 1; }
+BUILD
+)
+
+if [ "$OPD_BUILD_TARGET" = "tablet" ]; then
+    opd_check_tablet_ssh "$repo"
+    rwork="/tmp/opd-build-sensors-$$"
+    cleanup_remote() {
+        opd_tablet_ssh "$repo" "rm -rf '$rwork'" >/dev/null 2>&1 || true
+    }
+    trap cleanup_remote EXIT
+
+    opd_tablet_ssh "$repo" "rm -rf '$rwork' && mkdir -p '$rwork/pkg' '$rwork/src_tar' '$rwork/erhai_sensors' '$rwork/work'"
+    tar -cf - -C "$S" . | opd_tablet_ssh "$repo" "tar -xf - -C '$rwork/pkg'"
+    tar -cf - -C "$src" . | opd_tablet_ssh "$repo" "tar -xf - -C '$rwork/src_tar'"
+    tar -cf - -C "$erhai/packaging/sensors" . | opd_tablet_ssh "$repo" "tar -xf - -C '$rwork/erhai_sensors'"
+
+    if ! {
+        declare -f opd_ensure_cached_image
+        cat <<'REMOTE'
+rpm -q podman >/dev/null 2>&1 || dnf -y --setopt=install_weak_deps=False install podman >/dev/null
+opd_ensure_cached_image "" "$BUILDER" "$IMAGE" "/var/tmp/opd2413-dnf-cache" "$SETUP_CMD"
+JOBS=$(( $(nproc) > 1 ? $(nproc) - 1 : 1 ))
+systemd-inhibit --what=idle:sleep --who=opd2413-build --why="Build opd2413-sensors RPM" \
+    podman run --rm --network host \
+        -v "$RWORK/pkg:/repo/packaging/opd2413-sensors:ro,Z" \
+        -v "$RWORK/src_tar:/repo/out/sensors/src:ro,Z" \
+        -v "$RWORK/erhai_sensors:/erhai/packaging/sensors:ro,Z" \
+        -v "$RWORK/work:/work:Z" \
+        -e VER="$VER" -e REL="$REL" -e JOBS="$JOBS" \
+        "$BUILDER" bash -euxc "$BUILD_CMD"
+REMOTE
+    } | opd_tablet_ssh "$repo" "env VER=$(printf '%q' "$ver") REL=$(printf '%q' "$rel") RWORK=$(printf '%q' "$rwork") BUILDER=$(printf '%q' "$builder") IMAGE=$(printf '%q' "$image") SETUP_CMD=$(printf '%q' "$setup_cmd") BUILD_CMD=$(printf '%q' "$build_cmd") OPD_REBUILD_IMAGE=$(printf '%q' "$OPD_REBUILD_IMAGE") bash -euxs" > "$work/build-$ver-$rel.log" 2>&1; then
+        tail -40 "$work/build-$ver-$rel.log"
+        exit 1
+    fi
+
+    opd_tablet_ssh "$repo" "tar -cf - -C '$rwork/work' ." | tar -xf - -C "$work"
+else
+    opd_ensure_cached_image "--arch arm64" "$builder" "$image" "$cache" "$setup_cmd"
+
+    podman run --rm --arch arm64 --network host \
+        -v "$repo:/repo:ro,Z" -v "$erhai:/erhai:ro,Z" -v "$work:/work:Z" \
+        -e VER="$ver" -e REL="$rel" -e JOBS="$jobs" \
+        "$builder" bash -euxc "$build_cmd" > "$work/build-$ver-$rel.log" 2>&1 || { tail -40 "$work/build-$ver-$rel.log"; exit 1; }
+fi
+
 cp "$work/opd2413-sensors-$ver-$rel.aarch64.rpm" "$rpms/"
 sha256sum "$rpms/opd2413-sensors-$ver-$rel.aarch64.rpm"
