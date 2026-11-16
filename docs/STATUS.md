@@ -5,7 +5,7 @@
 
 ## 唯一的下一步
 
-**`opd2413-face-0.1-10`（锁屏时钟屏保待命→唤醒刷脸、`sudo`/`polkit` 人脸授权、Qt 录入向导与 `face-smile` 笑脸图标）及 `libcamera-0.7.2-5.fc45.opd2413.2`（`0101`–`0107` SoftISP 补丁）均已收尾并在平板完成真机验收（见 [WORKLOG.md](WORKLOG.md)、后摄 `cn3927` 登记在 [TECH-DEBT.md](TECH-DEBT.md#L42-L43) `#42`）。唯一的下一步：按用户节奏决定是否推送当前本地提交，并向 `linux-sm8750-erhai` / Linux 上游回馈 `2434` 及前期修复；后续功能排查可继续 Batch 4 功耗排查（`a600000.usb`/`88e8000.phy` 空闲 `ctrl=on`、`LPASS`/`SoundWire`/`lpass-lpi`、KDE `powerdevilrc` 与 `aosd=0` 等）或 `#42`（后摄 `cn3927` CCI 超时）。**
+**`kernel-opd2413-7.2.15-29.opd2413`（含补丁 `2435` 修复后摄 `cn3927` `ac7b000.cci` 超时与共电 PM 顺序，[TECH-DEBT.md](TECH-DEBT.md) `#42` 已消号）与 `opd2413-camera-0.1-2`（自动亮度/肤色保护鲜艳度及后摄 AF 控制）均已持久化安装至平板并设为默认启动项，单次引导 `90 s` 上线后经用户试用与晨光 CLI/GUI 实拍验证后摄自动对焦及手动 `0.0D`/`10.0D` 切焦均零超时通过（保留 `-28`/`-26` 作回退，见 [WORKLOG.md](WORKLOG.md)）。唯一的下一步：按用户节奏决定是否提交当前工作区改动与本地提交、向 `linux-sm8750-erhai` / Linux 上游回馈 `2434` / `2435` 及前期修复，或继续推进 Batch 4 功耗排查（`a600000.usb`/`88e8000.phy` 空闲 `ctrl=on`、`LPASS`/`SoundWire`/`lpass-lpi`、KDE `powerdevilrc` 与 `aosd=0` 等）。**
 - 2026-11-15 `7.2.15-28.opd2413` 根因修复与上机验证通过（见 [WORKLOG.md](WORKLOG.md)）：对 `-27` 首次冷启动卡死提取 `boot -1` 与反汇编，定位到 `sound/soc/qcom/qdsp6/q6dsp-lpass-clocks.c` 在 `dev_set_drvdata()` 前即通过 `devm_of_clk_add_hw_provider()` 公开时钟，并发探针的 `va_macro` 在 `clk_q6dsp_prepare()` 读取 `NULL + 0x348`（`struct q6dsp_cc.desc`）触发 Oops 并带 `clk_prepare_lock` 死锁；新增补丁 `2434` 将 `dev_set_drvdata()` 提前至时钟注册之前（`-F0` 合入、`pkg-test28` 通过）。卸 `-27`（保留 `-26` 为默认回退）并装 `-28` 后，经 `tools/tablet-reboot.py --entry fedora-7.2.15-28.opd2413.conf` `59 s` 上线：`uname -r = 7.2.15-28.opd2413`、`running`、`0 failed`、SELinux `Enforcing`、`0 AVC`、`dmesg` 零 Oops/`0x348`/`adsp` 崩溃、`aplay -l`/`opd2413-sensors-*`/`bluetooth`/`opd-netshare`/`Adreno 830`、`DPMS off/on` 断电复核与 5 s `s2idle` 均正常。
 - 2026-11-15 功耗与续航 Batch 3（`7.2.15-27.opd2413`）真机通过（见 [WORKLOG.md](WORKLOG.md)；`-27` 因无 `2434` 出现冷启动竞态卡死，已由 `-28` 取代并卸载）：`2431`（erhai `5930568b2`）、`2432`（erhai `8ebec9278` 刷新上下文）与 `2433`（回退 `1411`）严格合入 7.2.15；将 `-26` 设默认回退并卸 `-25` 后装机，`-27` 一次性冷启动上线后完成 3 次 `kscreen-doctor --dpms off/on` 校验（灭屏 `lcd_vsp`/`lcd_vsn`/`vreg_l12b_1p8` 全部 `disabled`/`users=0`、亮屏重新下载 `nt36536` 固件且无 DSI/DPU/KTZ 报错）、30 s 拔线 `rtcwake -m mem -s 30`（`pm_wakeup_irq=242` `pm8xxx_rtc_alarm`、`cxsd`/`ddr` `30.87 s`、`aosd=0`）、用户目视确认画面与触控正常，并实测仅 `DPMS off` 即可使电池放电由 `~530–593 mA`（`2.33–2.60 W`）降至 `~113–135 mA`（`0.50–0.59 W`），`TECH-DEBT.md` `#19` 已解除。
 - 2026-11-15 功耗与续航 Batch 2（`7.2.15-26.opd2413`）真机通过（见 [WORKLOG.md](WORKLOG.md)）：`2425`–`2430`（`c5590c6a0`、`81aafa28f`、`39636e8c3`+`f12f2ab7a`、`870167fad`、`627372bef`、`a1576b156`）+ `m3-3-power.config`（`CONFIG_HOTPLUG_PCI_PCIE=y`）严格合入 7.2.15；将 `-25` 设默认回退并卸 `-24` 后装机，仅调整 `-26` 启动条目 `options` 去掉 `fw_devlink.sync_state=timeout`/`pcie_ports=compat` 并添加 `mem_sleep_default=s2idle`，`58 s` 一次性上线：`/sys/power/mem_sleep` 为 `[s2idle] deep`、`pciehp`/`pcie_pme`/`aer` 就绪，30 s `rtcwake -m mem -s 30` 睡满无误唤醒、`cxsd`/`ddr` 各塌陷 `31.08 s`（`Count +3`）、`ddr_stats` 印证 DDR 不再锁死 `4224 MHz`、唤醒重连 Wi-Fi/蓝牙/GPU 全正常。
@@ -45,7 +45,7 @@ M2 剩下的被动观察项：开机提示音毛刺再出现时当场取证；�
 
 ## 当前阻塞
 
-没有全局阻塞（第 2 次冷启动偶发选入口后黑屏自动重启已另立为 `#39` 后续排查）。平板当前默认并运行 `7.2.15-28.opd2413`（12:11 未插电无干预冷启动直接上线，`running`、`0 failed`，`-26` 保留作回退、`-27` 已卸载），平板 `/etc/kernel/cmdline` 已收尾更新。Fedora 45 KDE 正常运行。
+没有全局阻塞（第 2 次冷启动偶发选入口后黑屏自动重启已另立为 `#39` 后续排查）。平板当前默认并运行 `7.2.15-29.opd2413`（`running`、`0 failed`，保留 `-28` 与 `-26` 作回退，`boot-select default` 已将 `loader.conf` 默认项设为 `fedora-7.2.15-29.opd2413.conf`）。Fedora 45 KDE 正常运行。
 
 已知的坑：
 
@@ -63,14 +63,14 @@ M2 剩下的被动观察项：开机提示音毛刺再出现时当场取证；�
 3. 改了 `device/` 或任何 spec，按 [BUILD.md](BUILD.md) 重新构建、跑离线测试，再拷到平板用 `dnf install ./*.rpm` 装。
 4. 关机会自动重新开机（插着电时）。需要冷启动验证时可以直接经 SSH `systemctl poweroff`，约 40 秒后回来。
 
-## 设备状态（2026-11-15）
+## 设备状态（2026-11-16）
 
-- 当前运行：Fedora 45 KDE，已于 `2026-11-15 12:11:28` 未插电无干预冷启动直接上线至默认内核 **`7.2.15-28.opd2413`**（`booted_entry: fedora-7.2.15-28.opd2413.conf`，`loader_default: fedora-7.2.15-28.opd2413.conf`，`pending_next: null`，保留 `-26` 作回退、`-27` 已卸载）。冷启动核验：`uname -r = 7.2.15-28.opd2413`、`running`、`0 failed`、SELinux `Enforcing`、`0 AVC`、`/proc/cmdline` 不含 `fw_devlink.sync_state=timeout` 与 `pcie_ports=compat` 并含 `mem_sleep_default=s2idle`、`/sys/power/mem_sleep = [s2idle] deep`、`dmesg` 无 Oops/`qsh_process`/`fatal error`、`bound 3d37000.gmu`、`remote processor adsp is now up`、`[nt36536] Update firmware success!`（`PID=5F95`）、`opd2413-sensors-*`/`bluetooth`/`opd-netshare` 均为 `active`、`aplay -l` 正常列出 `card 0: OnePlusPad2Pro`（另此前 `-28` 已完成 `kscreen-doctor --dpms off/on` 断电、`Adreno 830` 与 5 s `rtcwake -m mem -s 5` 验证）；ESP `/dev/sda16` 已用 `247M / 512M`、`49%`。
-- systemd-boot：`kshim_remembered: "Fedora"`，`loader_default: "fedora-7.2.15-28.opd2413.conf"`，`pending_next = null`；平板当前已装条目包含 `fedora-7.2.15-28.opd2413`（默认，冷启动真机通过）与 `fedora-7.2.15-26.opd2413`（保留回退）。
-  ESP `/dev/sda16` 总计 512M、已用 247M、空闲 266M（49 %）。固定路径 `/dtbs/qcom/sm8750-oneplus-pad2pro.dtb` 是 7.2.15 的（与内核 3 相同）。
+- 当前运行：Fedora 45 KDE，已于 `2026-11-16` 经单次安全引导 `90 s` 上线至内核 **`7.2.15-29.opd2413`**（合入补丁 `2435` 修复 `#42`），并经 `boot-select default` 设为默认（`booted_entry: fedora-7.2.15-29.opd2413.conf`，`loader_default: fedora-7.2.15-29.opd2413.conf`，`pending_next: null`，保留 `-28`、`-26` 作回退）。内核及实拍核验：`uname -r = 7.2.15-29.opd2413`、`running`、`0 failed`、SELinux `Enforcing`、`0 AVC`、`/proc/cmdline` 不含 `fw_devlink.sync_state=timeout` 与 `pcie_ports=compat` 并含 `mem_sleep_default=s2idle`、`/sys/power/mem_sleep = [s2idle] deep`、`dmesg` 无 Oops/`qsh_process`/`fatal error` 且零 `ac7b000.cci` 超时、`bound 3d37000.gmu`、`remote processor adsp is now up`、`[nt36536] Update firmware success!`、`cn3927` 从 `/lib/modules/7.2.15-29.opd2413/kernel/drivers/media/i2c/cn3927.ko` 加载（`/tmp/cn3927.ko` 已清除）、`/sys/class/devlink/i2c:10-000c--i2c:10-0036/runtime_pm = 1`、相机实拍及 GUI 冒烟后 `10-000c`/`10-0036` 均恢复 `suspended`、`opd2413-sensors-*`/`bluetooth`/`opd-netshare`/`opd2413-face`/`wireplumber` 均为 `active`、`aplay -l` 正常列出 `card 0: OnePlusPad2Pro`、`KSHIM.CHO` 哈希（`65d97e12...`）与 `1 extent` 前后完全一致、电池 `94% (charging)`（此前 `-28` 亦于 `2026-11-15 12:11:28` 完成未插电冷启动并保留作回退）。
+- systemd-boot：`kshim_remembered: "Fedora"`，`loader_default: "fedora-7.2.15-29.opd2413.conf"`，`pending_next = null`；平板当前已装条目包含 `fedora-7.2.15-29.opd2413`（默认）、`fedora-7.2.15-28.opd2413`（保留回退）与 `fedora-7.2.15-26.opd2413`（保留回退）。
+  ESP `/dev/sda16` 总计 512M、已用 370M、空闲 143M（73 %）。固定路径 `/dtbs/qcom/sm8750-oneplus-pad2pro.dtb` 是 7.2.15 的（与内核 3 相同）。
 - `boot_b` = `07bf1b53…`（fedora1：菜单 ColorOS / Fedora / Fedora boot menu，倒计时 10 s，默认项仍是 ColorOS）；KSHIM.CHO 记住 Fedora。
   上一版 `492f2cdf…` 的整分区回读在主机 `private/bootflow-20261111/boot_b-readonly.img`。
-- 软件包：内核 `kernel-opd2413-7.2.15-28.opd2413`（当前默认条目，冷启动真机通过）与 `kernel-opd2413-7.2.15-26.opd2413`（保留回退条目，`-27` 已卸载），以及 `opd2413-device-0.1-14`、`opd2413-audio-0.1-12`、`opd2413-sensors-0.1-1`、`opd2413-netshare-0.1-8`、`libcamera{,-ipa,-tools}-0.7.2-5.fc45.opd2413.2`、`python3-libcamera-0.7.2-5.fc45.opd2413.2`、`opd2413-face-0.1-10`、`wireless-regdb-2026.09.03-1.fc45`、`opd2413-firmware-16.0.10.600-2`、`showtime`（registry 在 `/var/lib/opd2413/sensors`）。`rpm -ivh --nosignature` 不受 `installonly_limit=2` 自动淘汰。
+- 软件包：内核 `kernel-opd2413-7.2.15-29.opd2413`（当前默认条目）、`kernel-opd2413-7.2.15-28.opd2413`（保留回退条目）与 `kernel-opd2413-7.2.15-26.opd2413`（保留回退条目），以及 `opd2413-device-0.1-14`、`opd2413-audio-0.1-12`、`opd2413-sensors-0.1-1`、`opd2413-netshare-0.1-8`、`libcamera{,-ipa,-tools}-0.7.2-5.fc45.opd2413.3`、`python3-libcamera-0.7.2-5.fc45.opd2413.3`、`opd2413-camera-0.1-2`、`opd2413-face-0.1-10`、`wireless-regdb-2026.09.03-1.fc45`、`opd2413-firmware-16.0.10.600-2`、`showtime`（registry 在 `/var/lib/opd2413/sensors`）。`rpm -ivh --nosignature` 不受 `installonly_limit=2` 自动淘汰。
   内核 3（`7.2.6-3`）08:45 经用户同意卸载，它的包仍在主机 `out/rpms/`。
 - 7.3 测试内核、"M3 test" 和 "Log capture" 两个条目、ESP 上的 `opd2413-bootlog/` 已于 11-11 23:29 删除。
 - `/etc/modprobe.d/opd2413-pps.conf` 已删除（11-12）。`/etc/kernel/tries` 已删除。
@@ -112,7 +112,8 @@ M2 剩下的被动观察项：开机提示音毛刺再出现时当场取证；�
 | `out/rpmbuild/RPMS/aarch64/kernel-opd2413-7.2.15-18.opd2413.aarch64.rpm` | 旧测试内核（`2411`–`2413`，手动切 60 Hz 时复现 `CTL_0` 卡死，已从平板卸载） |
 | `out/rpmbuild/RPMS/aarch64/kernel-opd2413-7.2.15-22.opd2413.aarch64.rpm` | 上一版内核，现保留为平板回退条目（`2411`–`2414`，`SHA256: 139a520f...`） |
 | `out/rpmbuild/RPMS/aarch64/kernel-opd2413-7.2.15-23.opd2413.aarch64.rpm` | 上一版内核，现保留为平板回退条目（合入 `2415`–`2417` 解除开机灰闪，`SHA256: cbfdd4108e0278b2ea426fc158a994587716e1e17ade72bda77dfc2c2c67deb8`） |
-| `out/rpmbuild/RPMS/aarch64/kernel-opd2413-7.2.15-24.opd2413.aarch64.rpm` | 当前默认内核（`m3-wifi-reg.config` 5 GHz AP 调控域支持，默认条目冷启动复查通过；`out/m3k/pkg-test24` 为安装检验；`SHA256: a8e0dc41...`） |
+| `out/rpmbuild/RPMS/aarch64/kernel-opd2413-7.2.15-24.opd2413.aarch64.rpm` | 历史内核（`m3-wifi-reg.config` 5 GHz AP 调控域支持；`SHA256: a8e0dc41...`） |
+| `out/rpmbuild/RPMS/aarch64/kernel-opd2413-7.2.15-29.opd2413.aarch64.rpm` | 当前默认内核（含 `2418`–`2434` 及 `2435` 修复后摄 `cn3927` 物理 AF，同步存档于 `out/m3k/rpms29/`；`out/m3k/pkg-test29/`、`out/camera-verify/` 为离线与实拍证据；`SHA256: 0acbb9b0...`） |
 | `private/m3-kbdwake-20261113/` | 2026-11-13 Pogo 键盘唤醒排查、4 簇过滤验证、`ramoops-000009-s2idle.txt` 及 `7.2.15-12` 两次冷启动验收日志 |
 | `out/rpmbuild/RPMS/aarch64/opd2413-sensors-0.1-1.aarch64.rpm`、`out/sensors/` | 传感器包及其源码包、构建日志 |
 | `private/sensors-persist-20261102/` | 从 persist 备份导出的传感器 registry（本机数据） |
@@ -122,9 +123,11 @@ M2 剩下的被动观察项：开机提示音毛刺再出现时当场取证；�
 | `out/rpmbuild/RPMS/noarch/opd2413-device-0.1-13.noarch.rpm` | 平板上现在装的设备包（0.1-9 起允许 s2idle，0.1-10 修 boot-select 的条目 id，0.1-11 加键盘 hwdb，0.1-13 VP9 走软解） |
 | `out/rpmbuild/RPMS/noarch/opd2413-firmware-16.0.10.600-2.noarch.rpm` | 平板上的固件包（加 Iris 固件） |
 | `out/rpmbuild/RPMS/noarch/opd2413-netshare-0.1-8.noarch.rpm`、`out/netshare/opd-netshare.apk` | 跨设备自动网络共享平板端 RPM（`99K`，含 `0.1-4` 80 MHz/`CN`/SCC、 `0.1-5` WirePlumber BT Sink/HF 隔离、`0.1-6`/`0.1-7` BT 断电/重配对自愈、`0.1-8` Wayland `setDesktopFileName`/多尺寸 `hicolor` 应用图标与 4 态 `128×128` 托盘图标）与 Android 伴侣 APK（`90K`，v3 签名，含自适应/单色桌面图标及 24dp 六边形通知/磁贴矢量） |
-| `out/rpmbuild/RPMS/aarch64/libcamera*-0.7.2-5.fc45.opd2413.2.aarch64.rpm` | `libcamera` SoftISP / LSC / AF 补丁产物（`0101`–`0107`） |
+| `out/rpmbuild/RPMS/aarch64/libcamera*-0.7.2-5.fc45.opd2413.3.aarch64.rpm` | `libcamera` SoftISP / LSC / AF 与 Stage 1 调校/视角修复 RPM 产物（含 `0101`–`0107` 及调校更新） |
+| `out/rpmbuild/RPMS/aarch64/opd2413-camera-0.1-2.fc45.aarch64.rpm` | ZSL 多帧 RAW10 HDR+ 相机 CLI（`opd-camera-cli`）与 Qt6 Wayland GUI（`opd-camera`）RPM（含自动亮度/肤色保护鲜艳度及后摄 AF 控制） |
 | `out/rpmbuild/RPMS/aarch64/opd2413-face-0.1-10.fc45.aarch64.rpm` | 原生人脸识别守护进程、PAM、锁屏覆盖与 GUI 录入向导 RPM |
 | `out/video/`、`private/m3-video-20261112/` | 视频测试片源、解码记录 |
+| `private/cam-stage1-20261115/` | Stage 1 / Stage 2 HDR+ 相机前后摄真机对比样张与量化指标证据 |
 | `private/m3-sleep-20261112/` | M3.3 的 pm_test、s2idle、按键挂起证据 |
 | `private/ssh.sh`、`private/scp.sh` | 连平板的 SSH / scp 包装（`OPD_OS=fedora` 用 Fedora 的地址和主机密钥） |
 | `private/install.env` | 用户给的初始密码 |
@@ -183,7 +186,7 @@ Armada 下的结论见 [HARDWARE.md](HARDWARE.md)。换了发行版后都要重�
 | 充电（9 V PD） | 真机通过 | 2026-11-12，7.2.15-3 起（M3.2a）；PPS 快充驱动已装、待电量低于 75 % 实测（M3.2b） |
 | 电量、温控 | 真机通过 | 电量、电流（符号正确）、温度读数正常（M3.2a）；温控未单独验 |
 | 传感器、自动旋转 | 真机通过 | 2026-11-12，opd2413-sensors（M3.4c）：自动旋转、环境光、指南针、陀螺仪；KDE 无自动亮度 |
-| 摄像头 | 真机通过 | 2026-11-12 起；2026-11-15 `libcamera-0.7.2-5.fc45.opd2413.2` 合入 `0101`–`0107` SoftISP 调校/LSC/VCM 反差 AF 补丁，前摄 `sc820cs` 经人脸解锁与 GUI 实测可用；后摄 `cn3927`（`10-000c` / `ac7b000.cci`）CCI 超时，物理 AF 暂不可用（[TECH-DEBT.md](TECH-DEBT.md#L42-L43) `#42`） |
+| 摄像头 | 真机通过 | 2026-11-12 起；2026-11-15 Stage 1 `libcamera-0.7.2-5.fc45.opd2413.3` 完成 `0101`–`0107` 补丁及高光零溢出/16:9 居中视角调校，Stage 2 `opd2413-camera-0.1-1` 通过前/后摄 ZSL 多帧 RAW10 HDR+（`black_level_10b=64.0`、中性灰黑阴影、EXIF 完整）及 `opd-camera` Qt6 Wayland 实况预览与 `opd-face` 协同；2026-11-16 升级 `opd2413-camera-0.1-2`（`LUX` 中心加权自动亮度、暗部归零/肤色保护鲜艳度、后摄 AF 控制）并随默认内核 `7.2.15-29.opd2413`（补丁 `2435`）持久化修复后摄 `cn3927` 物理对焦：`cn3927` 原生加载、晨光实拍 Contrast AF 锁定 `af_state=2`（`2.053D`）与手动 `0.0D`/`10.0D` 近距贴纸清晰切焦、5 秒 Wayland GUI 冒烟及用户真机试用均零 CCI 超时通过，`opd2413-face` 与 `wireplumber` 协同正常，`#42` 已消号（室内后摄白墙略带轻微偏黄绿暖调按需微调） |
 | 人脸识别解锁（`opd2413-face`） | 真机通过 | 2026-11-15，`opd2413-face-0.1-10`（锁屏屏保待命→唤醒视觉扫描→刷脸解锁、`sudo`/`polkit` 人脸授权、冷启后解锁、Qt 录入向导及 `face-smile` 图标均经用户实测通过） |
 | 视频硬解 | 真机通过 | 2026-11-12（M3.4a）：固件 600-2 后 GStreamer 硬解 H.264/HEVC，Showtime 为默认播放器；VP9 走软解；mpv/Firefox 仍软解（ffmpeg-free） |
 | DP 外接显示 | 有源码线索 | erhai |

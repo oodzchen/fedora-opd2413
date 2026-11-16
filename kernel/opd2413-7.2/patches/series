@@ -110,3 +110,6 @@
 
 # Boot race fix: q6dsp-lpass-clocks drvdata before clk/provider registration
 2434-ASoC-qcom-qdsp6-set-drvdata-before-registering-clock.patch
+
+# M3.4b camera rear autofocus fix: cn3927 settle delay, regulator load, sensor runtime PM link
+2435-media-i2c-cn3927-fix-power-up-delay-load-and-runtime-pm.patch

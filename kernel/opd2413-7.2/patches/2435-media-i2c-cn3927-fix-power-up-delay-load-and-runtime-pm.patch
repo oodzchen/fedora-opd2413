@@ -1,0 +1,332 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Kholin <oodzchen@gmail.com>
+Date: Mon, 16 Nov 2026 01:30:00 +0800
+Subject: [PATCH] media: i2c: cn3927: fix power-up settle, regulator load, and runtime PM
+
+On OnePlus Pad 2 Pro (OPD2413 / erhai), the CN3927 VCM actuator previously
+NACKed CCI master 1 I2C transactions whenever udev/libcamera opened
+/dev/v4l-subdev29 or when sc1300cs began streaming with VAF still powered off,
+leaving the device stuck in runtime PM error state (-ETIMEDOUT / -EINVAL).
+
+Vendor calibration metadata (erhaimain_actuator and qcom,cam-sensor0 in
+runtime.dts) shows VAF is powered alongside VIO prior to rear sensor
+streaming, requires a 20 ms VAF power-up settle, HPM regulator load votes
+on VIO/VAF, 100 us post-unlock settle after register 0x08=0x6f, and uses
+step size 64 for lens ramps. Meanwhile, the old .open()/.close() callbacks
+woke the VCM on every udev probe or idle open, and cn3927_set_ctrl() skipped
+hardware writes while runtime-suspended.
+
+Fix CN3927 bring-up and power management:
+- Remove .open/.close internal_ops so probing/udev never wakes the VCM.
+- Set HPM regulator loads (300 mA VIO, 1.2 A VAF), raise VAF settle delay
+  to 25 ms (20 ms vendor spec + 5 ms margin), and wait 100 us after the
+  register unlock sequence before moving the lens.
+- Link the paired I2C sensor referenced via lens-focus as a runtime PM
+  consumer of CN3927 (consumer = sensor, supplier = CN3927, using
+  DL_FLAG_STATELESS | DL_FLAG_PM_RUNTIME) so streaming the sensor keeps
+  VIO/VAF active across focus ramps and autosuspend (500 ms) parks the
+  lens with step size 64 once streaming stops.
+- Wake the VCM via pm_runtime_resume_and_get() on focus control writes and
+  add 3x bounded I2C write retries (5 ms interval) to tolerate transient glitches.
+- Add SYSTEM_SLEEP_PM_OPS so system suspend cleanly parks and powers off
+  the VCM.
+
+Co-Authored-By: Antigravity <noreply@deepmind.google>
+---
+ drivers/media/i2c/cn3927.c | 166 +++++++++++++++++++++++++++++++++++----------
+ 1 file changed, 131 insertions(+), 35 deletions(-)
+
+diff --git a/drivers/media/i2c/cn3927.c b/drivers/media/i2c/cn3927.c
+index e61113453..7a8539a89 100644
+--- a/drivers/media/i2c/cn3927.c
++++ b/drivers/media/i2c/cn3927.c
+@@ -13,6 +13,7 @@
+ #include <linux/delay.h>
+ #include <linux/i2c.h>
+ #include <linux/module.h>
++#include <linux/of.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/regulator/consumer.h>
+ 
+@@ -22,10 +23,16 @@
+ 
+ #define CN3927_NAME			"cn3927"
+ #define CN3927_MAX_FOCUS_POS		1023
+-#define CN3927_PARK_STEP		32
++#define CN3927_PARK_STEP		64
+ #define CN3927_PARK_POSITION		32
+ #define CN3927_MOVE_DELAY_US		1000
+-#define CN3927_POWER_DELAY_US		10000
++#define CN3927_POWER_DELAY_US		25000
++#define CN3927_INIT_DELAY_US		100
++#define CN3927_AUTOSUSPEND_DELAY_MS	500
++#define CN3927_VIO_LOAD_UA		300000
++#define CN3927_VAF_LOAD_UA		1200000
++#define CN3927_I2C_RETRIES		3
++#define CN3927_I2C_RETRY_DELAY_US	5000
+ 
+ /* Position DAC: MSB[1:0] at 0x03, LSB at 0x04. */
+ #define CN3927_REG_POS_MSB		0x03
+@@ -35,6 +42,8 @@ struct cn3927_device {
+ 	struct v4l2_ctrl_handler controls;
+ 	struct v4l2_subdev subdev;
+ 	struct regulator_bulk_data supplies[2];
++	struct device *sensor_dev;
++	struct device_link *sensor_link;
+ 	u16 focus;
+ };
+ 
+@@ -47,12 +56,29 @@ static int cn3927_write(struct cn3927_device *cn3927, u8 reg, u8 value)
+ {
+ 	struct i2c_client *client = v4l2_get_subdevdata(&cn3927->subdev);
+ 	u8 buf[] = { reg, value };
++	unsigned int attempt;
++	int err = -EIO;
+ 	int ret;
+ 
+-	ret = i2c_master_send(client, buf, sizeof(buf));
+-	if (ret == sizeof(buf))
+-		return 0;
+-	return ret < 0 ? ret : -EIO;
++	for (attempt = 0; attempt < CN3927_I2C_RETRIES; attempt++) {
++		ret = i2c_master_send(client, buf, sizeof(buf));
++		if (ret == sizeof(buf)) {
++			if (attempt > 0)
++				dev_warn(&client->dev,
++					 "I2C write 0x%02x succeeded on retry %u\n",
++					 reg, attempt);
++			return 0;
++		}
++
++		err = ret < 0 ? ret : -EIO;
++		if (attempt + 1 < CN3927_I2C_RETRIES)
++			usleep_range(CN3927_I2C_RETRY_DELAY_US,
++				     CN3927_I2C_RETRY_DELAY_US + 1000);
++	}
++
++	dev_err(&client->dev, "I2C write 0x%02x failed after %u attempts: %d\n",
++		reg, CN3927_I2C_RETRIES, err);
++	return err;
+ }
+ 
+ static int cn3927_set_focus(struct cn3927_device *cn3927, u16 focus)
+@@ -82,6 +108,9 @@ static int cn3927_init(struct cn3927_device *cn3927)
+ 		if (ret)
+ 			return ret;
+ 	}
++
++	/* Allow the CN3927 internal timing circuit to settle after unlock. */
++	usleep_range(CN3927_INIT_DELAY_US, CN3927_INIT_DELAY_US + 100);
+ 	return 0;
+ }
+ 
+@@ -89,24 +118,23 @@ static int cn3927_set_ctrl(struct v4l2_ctrl *ctrl)
+ {
+ 	struct cn3927_device *cn3927 =
+ 		container_of(ctrl->handler, struct cn3927_device, controls);
++	struct device *dev = cn3927->subdev.dev;
+ 	int ret;
+ 
+ 	if (ctrl->id != V4L2_CID_FOCUS_ABSOLUTE)
+ 		return -EINVAL;
+ 
+-	ret = pm_runtime_get_if_in_use(cn3927->subdev.dev);
++	ret = pm_runtime_resume_and_get(dev);
+ 	if (ret < 0)
+ 		return ret;
+-	if (!ret) {
+-		cn3927->focus = ctrl->val;
+-		return 0;
+-	}
+ 
+ 	ret = cn3927_set_focus(cn3927, ctrl->val);
+-	pm_runtime_put(cn3927->subdev.dev);
+ 	if (!ret)
+ 		cn3927->focus = ctrl->val;
+ 
++	pm_runtime_mark_last_busy(dev);
++	pm_runtime_put_autosuspend(dev);
++
+ 	return ret;
+ }
+ 
+@@ -114,23 +142,6 @@ static const struct v4l2_ctrl_ops cn3927_ctrl_ops = {
+ 	.s_ctrl = cn3927_set_ctrl,
+ };
+ 
+-static int cn3927_open(struct v4l2_subdev *subdev, struct v4l2_subdev_fh *fh)
+-{
+-	return pm_runtime_resume_and_get(subdev->dev);
+-}
+-
+-static int cn3927_close(struct v4l2_subdev *subdev, struct v4l2_subdev_fh *fh)
+-{
+-	pm_runtime_put(subdev->dev);
+-
+-	return 0;
+-}
+-
+-static const struct v4l2_subdev_internal_ops cn3927_internal_ops = {
+-	.open = cn3927_open,
+-	.close = cn3927_close,
+-};
+-
+ static const struct v4l2_subdev_core_ops cn3927_core_ops = {
+ 	.log_status = v4l2_ctrl_subdev_log_status,
+ 	.subscribe_event = v4l2_ctrl_subdev_subscribe_event,
+@@ -213,6 +224,43 @@ static void cn3927_cleanup(struct cn3927_device *cn3927)
+ 	media_entity_cleanup(&cn3927->subdev.entity);
+ }
+ 
++static int cn3927_get_paired_sensor(struct device *dev,
++				    struct device **sensor_dev)
++{
++	struct device_node *bus_np = dev->parent ? dev->parent->of_node : NULL;
++
++	*sensor_dev = NULL;
++	if (!bus_np || !dev->of_node)
++		return 0;
++
++	for_each_available_child_of_node_scoped(bus_np, child) {
++		struct device_node *lens_np;
++		bool match;
++
++		lens_np = of_parse_phandle(child, "lens-focus", 0);
++		if (!lens_np)
++			continue;
++
++		match = (lens_np == dev->of_node);
++		of_node_put(lens_np);
++		if (!match)
++			continue;
++
++		*sensor_dev = bus_find_device_by_of_node(&i2c_bus_type, child);
++		if (!*sensor_dev)
++			return -EPROBE_DEFER;
++		return 0;
++	}
++
++	return 0;
++}
++
++static void cn3927_clear_supply_loads(struct cn3927_device *cn3927)
++{
++	regulator_set_load(cn3927->supplies[1].consumer, 0);
++	regulator_set_load(cn3927->supplies[0].consumer, 0);
++}
++
+ static int cn3927_probe(struct i2c_client *client)
+ {
+ 	struct cn3927_device *cn3927;
+@@ -231,10 +279,24 @@ static int cn3927_probe(struct i2c_client *client)
+ 		return dev_err_probe(&client->dev, ret,
+ 				     "failed to get VCM supplies\n");
+ 
++	ret = regulator_set_load(cn3927->supplies[0].consumer,
++				 CN3927_VIO_LOAD_UA);
++	if (ret)
++		return dev_err_probe(&client->dev, ret,
++				     "failed to set VIO load\n");
++
++	ret = regulator_set_load(cn3927->supplies[1].consumer,
++				 CN3927_VAF_LOAD_UA);
++	if (ret)
++		goto err_clear_loads;
++
++	ret = cn3927_get_paired_sensor(&client->dev, &cn3927->sensor_dev);
++	if (ret)
++		goto err_clear_loads;
++
+ 	v4l2_i2c_subdev_init(&cn3927->subdev, client, &cn3927_subdev_ops);
+ 	cn3927->subdev.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE |
+ 				  V4L2_SUBDEV_FL_HAS_EVENTS;
+-	cn3927->subdev.internal_ops = &cn3927_internal_ops;
+ 	cn3927->subdev.entity.function = MEDIA_ENT_F_LENS;
+ 	strscpy(cn3927->subdev.name, "cn3927 focus",
+ 		sizeof(cn3927->subdev.name));
+@@ -254,25 +316,53 @@ static int cn3927_probe(struct i2c_client *client)
+ 		goto err_free_controls;
+ 
+ 	/*
+-	 * The VCM is physically powered off at this point.  Initialise runtime
+-	 * PM before publishing the subdevice: publishing it first allows udev or
+-	 * libcamera to open the node while runtime PM still considers the device
+-	 * active and skips the resume callback entirely.
++	 * The VCM is physically powered off at this point. Enable runtime PM
++	 * before linking the paired sensor as a consumer so opening or
++	 * streaming the sensor brings up VIO/VAF alongside it.
+ 	 */
+ 	pm_runtime_set_suspended(&client->dev);
++	pm_runtime_set_autosuspend_delay(&client->dev,
++					 CN3927_AUTOSUSPEND_DELAY_MS);
++	pm_runtime_use_autosuspend(&client->dev);
+ 	pm_runtime_enable(&client->dev);
+ 
++	if (cn3927->sensor_dev) {
++		u32 dl_flags = DL_FLAG_STATELESS | DL_FLAG_PM_RUNTIME;
++
++		if (pm_runtime_active(cn3927->sensor_dev))
++			dl_flags |= DL_FLAG_RPM_ACTIVE;
++		cn3927->sensor_link = device_link_add(cn3927->sensor_dev,
++						      &client->dev, dl_flags);
++		if (!cn3927->sensor_link) {
++			ret = -ENOMEM;
++			goto err_disable_pm;
++		}
++	}
++
+ 	ret = v4l2_async_register_subdev(&cn3927->subdev);
+ 	if (ret)
+-		goto err_disable_pm;
++		goto err_unlink_sensor;
+ 
+ 	return 0;
+ 
++err_unlink_sensor:
++	if (cn3927->sensor_link)
++		device_link_del(cn3927->sensor_link);
+ err_disable_pm:
++	pm_runtime_dont_use_autosuspend(&client->dev);
+ 	pm_runtime_disable(&client->dev);
++	if (!pm_runtime_status_suspended(&client->dev)) {
++		if (cn3927_runtime_suspend(&client->dev))
++			regulator_bulk_disable(ARRAY_SIZE(cn3927->supplies),
++					       cn3927->supplies);
++	}
++	pm_runtime_set_suspended(&client->dev);
+ 	media_entity_cleanup(&cn3927->subdev.entity);
+ err_free_controls:
+ 	v4l2_ctrl_handler_free(&cn3927->controls);
++	put_device(cn3927->sensor_dev);
++err_clear_loads:
++	cn3927_clear_supply_loads(cn3927);
+ 	return ret;
+ }
+ 
+@@ -282,6 +372,9 @@ static void cn3927_remove(struct i2c_client *client)
+ 	struct cn3927_device *cn3927 = to_cn3927(subdev);
+ 
+ 	v4l2_async_unregister_subdev(subdev);
++	if (cn3927->sensor_link)
++		device_link_del(cn3927->sensor_link);
++	pm_runtime_dont_use_autosuspend(&client->dev);
+ 	pm_runtime_disable(&client->dev);
+ 	if (!pm_runtime_status_suspended(&client->dev)) {
+ 		/* Unbind cannot defer parking: balance the remaining rail votes. */
+@@ -290,6 +383,8 @@ static void cn3927_remove(struct i2c_client *client)
+ 					       cn3927->supplies);
+ 	}
+ 	pm_runtime_set_suspended(&client->dev);
++	put_device(cn3927->sensor_dev);
++	cn3927_clear_supply_loads(cn3927);
+ 	cn3927_cleanup(cn3927);
+ }
+ 
+@@ -306,6 +401,7 @@ static const struct i2c_device_id cn3927_id_table[] = {
+ MODULE_DEVICE_TABLE(i2c, cn3927_id_table);
+ 
+ static const struct dev_pm_ops cn3927_pm_ops = {
++	SET_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, pm_runtime_force_resume)
+ 	RUNTIME_PM_OPS(cn3927_runtime_suspend, cn3927_runtime_resume, NULL)
+ };
+ 

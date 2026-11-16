@@ -2086,3 +2086,118 @@ mpv、Firefox 仍是软解（Fedora `ffmpeg-free` 的专利限制），用户选
 - **实测验证（2026-11-15）：**
   - **锁屏、唤醒识别、`sudo`/`polkit` 与向导功能（`0.1-8` / `0.1-9`，真机通过）**：冷启重启后刷脸解锁、`sudo`/`polkit` 自动人脸授权、挡住摄像头退回重试/密码输入、锁屏默认停留在时钟屏保并在唤醒后显示扫描图标解锁、应用启动器打开录入向导与 4 组录入测试均经用户真机实测确认正常；自动 D-Bus 抓包确认锁屏待命 3.5 s 期间仅调 1 次 `SetLockscreenMode(true, false)`、0 次 `Verify`。
   - **图标修复版本升级（`0.1-10`，真机通过）**：产包 `out/rpmbuild/RPMS/aarch64/opd2413-face-0.1-10.fc45.aarch64.rpm`（SHA-256 `6c32d3eacd16fd89c7e3f4e875d791ed257cf85a929fd10020a3cf5c95e8b0ea`），`desktop-file-validate` clean；平板离线 `dnf upgrade` 替换 `0.1-9` 后 `rpm -V opd2413-face plasma-desktop` 无差异、`/usr/libexec/opd2413/` 无 `__pycache__`、已执行 `kbuildsycoca6` 刷新、`WAYLAND_DEBUG=1` 实测 `wayland-1` 发送 `xdg_toplevel_icon_v1.set_name("face-smile")` 与 7 档位 `wl_buffer`；`opd-face status --user colin` 为 `idle` 且 `enrolled=yes`、`authselect` 为 `opd2413-face with-silent-lastlog with-mdns4`、`lockscreen UI shell overlay: enabled`、`systemctl is-system-running = running`、`--failed = 0`、`ausearch --input-logs -m avc -ts recent = <no matches>`，用户实机确认桌面启动器 `face-smile` 图标显示正常。
+
+#### 2026-11-15 相机实时 GPU ISP 画质与重配置修复：`libcamera 0.7.2-5.fc45.opd2413.3`
+
+- **问题对照与离线原型依据：**
+  - 对比 ColorOS（`3264×2448` 8MP、`1/25s`、`f/2.0`、`ISO 400`）与 Fedora GNOME Snapshot / PipeWire 默认出片（`1920×1080`）及直采 8MP SoftISP 实机样张（存宿主机 gitignored 试验目录），定位 5 项实时画质/稳定性差距：
+    1. `DebayerEGL::debayerGPU()` 对 1080p 裁剪 FBO 仍使用全传感器 `glViewport(0, 0, width_, height_)` 与左下角锚点 `projMatrix`，造成 1080p 底部约 25% 画面截断且径向 LSC 坐标拉伸失真，同时 `SwStatsCpu` 测光窗口落于左上角 `(0, 0)`；
+    2. `RAW10P`/`RAW12P` 着色器（[bayer_1x_packed.frag](../packaging/opd2413-libcamera/patches/0109-ipa-simple-shaders-Upgrade-GPU-ISP-pipeline-and-tuni.patch)）仍采用 3×3 双线性去马赛克、无降噪锐化、且在 CCM 前执行 `clamp(rgb * lscGain * awb, 0.0, 1.0)` 导致高光被硬削平且过曝白墙泛洋红（实测 1080p `>250` 溢出 `16.61%`、8MP 达 `37.19%`，而传感器原始 RAW10 仅 `5.44%` 饱和）；
+    3. `sc820cs` 在 `Rotation=180` 硬件 `HFLIP+VFLIP` 后光学中心 `cx` 未镜像且径向 `R/G` 增益偏高（角部 `3.70x` vs `3.15x`）引发四角粉紫偏色；
+    4. `SwStatsCpu` 统计 `sum_` 未剔除饱和/黑电平区、AGC `kExposureOptimal=2.5` 未感知高光溢出、`Awb` 缺帧间 IIR 平滑；
+    5. `DebayerEGL::stop()` 未执行 `makeCurrent()` 与 `eglTerminate`/`eglDestroyContext` 清理，同进程切换分辨率会残留跨线程上下文状态并报错 `debayerGPU failed`。
+  - 先通过宿主机零写入实验抓取 `sc820cs` 实时帧与 8 帧 RAW10 连拍包并在离线原型验证：修复居中视口、LSC 色差阻尼、5×5 MHC、高光中性白重建、色调映射与联合双边降噪后，单帧 `>250` 溢出由 `37.19%` 降至 `0.93%`、四角 `R/G, B/G` 收敛到 `1.01, 0.99`。
+- **补丁与离线打包（`packaging/opd2413-libcamera/`，`opdrel=3`）：**
+  - 新增 `Patch108`（[0108-debayer_egl-Fix-crop-viewport-LSC-UV-and-EGL-reconfi.patch](../packaging/opd2413-libcamera/patches/0108-debayer_egl-Fix-crop-viewport-LSC-UV-and-EGL-reconfi.patch)）：在 `eGL` 新增 `cleanUp()` / `hasContext()` 及 `initEGLContext()` 重入清理；在 `DebayerEGL` 调整成员析构顺序、补全 `stop()` 的 `makeCurrent()` + 缓存/程序/EGL 上下文销毁、修复 `outputSize_` 视口及保长宽比居中 UV 裁剪（保持全画幅 LSC 坐标）、并将 `SwStatsCpu` 统计窗口居中到传感器 3/4 视场。
+  - 新增 `Patch109`（[0109-ipa-simple-shaders-Upgrade-GPU-ISP-pipeline-and-tuni.patch](../packaging/opd2413-libcamera/patches/0109-ipa-simple-shaders-Upgrade-GPU-ISP-pipeline-and-tuni.patch)）：
+    - 将 `bayer_1x_packed.frag` 升级为 5×5 Malvar-He-Cutler 去马赛克及半像素居中字节寻址（`Step[] = { bpp/stride, 1/height }`）；
+    - 在 `bayer_1x_packed.frag` 与 `bayer_unpacked.frag` 统一去除 CCM 前截断，实现饱和通道中性白重建、线性 HDR CCM、保亮度 Extended-Reinhard 软肩部与微幅暗部补偿、分段 sRGB 传递函数；
+    - 新增 `rgb_post.frag`（[0109 补丁](../packaging/opd2413-libcamera/patches/0109-ipa-simple-shaders-Upgrade-GPU-ISP-pipeline-and-tuni.patch) 内 `src/libcamera/shaders/rgb_post.frag`）并挂载到 `DebayerEGL` Pass 2 离屏 FBO（`intermediateImage_`），按 `DebayerParams::again` 实时增益执行 3×3 + 稀疏 5×5 YCbCr 联合双边降噪与 CAS 无光晕锐化；
+    - 改进 `SwIspStats`/`SwStatsCpu`/`Awb`/`Agc`（剔除饱和与黑电平噪声采样用于 AWB 并保持有效样本数一致、AWB 首帧瞬时收敛+后续 IIR 平滑、AGC 目标 `2.2` + 顶部直方图饱和惩罚）并更新 `sc820cs.yaml`（镜像光心与阻尼 LSC）与 `sc1300cs.yaml`。
+  - 在 ARM64 Fedora 45 容器执行 `tools/build-libcamera-rpm.sh 3` 编译通过，`--with container_check` 过滤运行 77 项 `meson test` 结果：`45 Ok`、`1 Expected Fail`、`0 Fail`、`31 Skipped`（容器内无内核 `vimc`/硬件节点项退出码 77 跳过；`libcamera.spec` 另排除 `6` 项依赖 `clone3`/IPC/虚拟管道测试）；`rpm -qlp` 核对 `libcamera-ipa` 含 `ipa_soft_simple.so`、`ipa_soft_simple.so.sign`、`sc820cs.yaml` 与 `sc1300cs.yaml`。
+  - 对应平板当前已安装包的 `0.7.2-5.fc45.opd2413.3.aarch64.rpm` 产物 SHA-256：
+    - `libcamera`：`fa4469dfe88f4cc38431e679052341925164b4cfd974efd134797eebd5ce1945`
+    - `libcamera-ipa`：`78d8bb04f8d27d69bc7d429eadfac80e24c6e97fa0d076ec27664860ed22c131`
+    - `libcamera-tools`：`f0c7f08c3911a662b724c2bf234d78412c5b5b2374ead2736f84d215154b3490`
+    - `python3-libcamera`：`08bc139bf02a415b65fe18fd912e3c55c0229ea0208c2b79f2473fcbc821777d`
+- **上机测试前预期与判据：**
+  1. **设备写入范围（待用户确认后执行）**：仅向平板 `/tmp/` 传入上述 4 个对应已安装子包的 `0.7.2-5.fc45.opd2413.3.aarch64.rpm`，在 `ARMADA_ROOT` 上执行 `dnf upgrade -y` 并删除 `/tmp/` 临时 RPM，重启 `opd2413-faced.service` 与用户态 `pipewire`/`wireplumber`（不触碰 ESP、`ARMADA_BOOT`、`boot_b` 或 Android 分区）。
+  2. **前摄 `sc820cs` 实时画质达标**：1080p（PipeWire / GNOME Snapshot）与 8MP 出片高光溢出率（`>250`）从 `16%~37%` 降至 `<3%`，1080p 底部截断消失（上下对称居中 16:9 视场），四角偏色消除（`|R/G - 1| <= 0.06`），平坦区彩噪与亮度颗粒显著下降且无边缘白边/黑边光晕。
+  3. **跨分辨率重配置稳定性**：同一进程内连续切换 `1920×1080 <-> 3256×2448` 启动/停止流零 `debayerGPU failed` 或断言失败。
+  4. **关联链路无回归**：`opd2413-face`（`1280×960`、8 帧预热）认证服务与后摄 `sc1300cs` 13MP 实时 GPU 出片均正常，系统与桌面日志无新报错。
+- **真机验收结果（2026-11-15，真机通过）：**
+  - **离线升级与服务健康**：4 个 `0.7.2-5.fc45.opd2413.3.aarch64` 子包经 SHA-256 校验后在 `ARMADA_ROOT` 完成 `dnf upgrade -y --disablerepo='*'`，临时包已清理；重启 `opd2413-face.service` 与用户态 `wireplumber`/`pipewire` 后，`opd-face status` 显示 `org.opd2413.Face1` 为 `idle`、`enrolled=yes`，`systemctl --failed` 为 `0` 项，`ausearch -m avc -ts recent` 无匹配拒绝。
+  - **同进程多分辨率切换与帧率**：同一进程对 `sc820cs` 连续 `stop() -> 排空取消请求 -> configure() -> start()` 切换四档配置全部零 `debayerGPU failed` 通过：
+    - `1920×1080 XRGB8888`：24 帧，`31.63 fps`；
+    - `3256×2448 XRGB8888`：18 帧，`31.61 fps`；
+    - `1280×960 XRGB8888`（`opd2413-face` 分辨率）：12 帧，`31.80 fps`；
+    - `[Viewfinder 1632×1224 XRGB8888, Raw 3264×2448]` 双流 ZSL：12 帧，`32.59 fps`。
+    - 后摄 `sc1300cs` `[StillCapture 4152×3120 XRGB8888, Raw 4160×3120]` 20 帧达 `32.67 fps`。验证过程同时定位并确认：Python/C++ 客户端每次 `cam.stop()` 后需立即排空 `get_ready_requests()` 中被取消的旧请求，避免将旧流的小尺寸输出缓冲误复用进大尺寸新配置触发 `Output cache 4 exceeded`。
+  - **客观画质指标与视觉对比**（存宿主机 gitignored `private/cam-stage1-20261115/` 证据目录）：
+    - 前摄 `1080p` / `8MP` 高光溢出率（`>250`）分别由升级前的 `24.66%` / `40.75%` 降至 **`0.0%`**（与 ColorOS 参考图一致），平坦区噪声标准差由 `5.37` / `5.84` 降至 **`1.49` / `1.84`**（ColorOS 为 `1.30`）；
+    - 左侧同色纯白墙上下角相对中心墙面色比：`8MP` 上左 `(R/G=1.058, B/G=1.024)`、下左 `(R/G=1.055, B/G=1.028)`，`1080p` 上左 `(1.052, 1.030)`、下左 `(1.051, 1.017)`，墙面均值 `[171.9, 174.1, 175.3]`；16:9 视角上下居中对称恢复（不再截断底部 25% 画面），白墙及木纹色彩、清晰度经人工视觉检视无伪影。
+  - **双摄 Raw 相位与后续 Stage 2 标定确认**：双流 `Raw` 相关性实测确认前摄 `sc820cs`（`3264×2448`）与后摄 `sc1300cs`（`4160×3120`）在内存中均已正立（`0°` 无需旋转）且实际物理 Bayer 排列均为 `BGGR10_CSI2P`（尽管 `StreamRole.Raw` 元信息仍标为 `SRGGB10_CSI2P`）；注：后摄测试时平板背面朝暗处且 20 帧下 AE 仍停留在 `17.6 ms / gain 1.0` 亮度偏暗，亮景与 HDR+ 效果留待 Stage 2 验证。
+
+### ARM64 用户态 RPM 平板原生编译链路与阶段 2 HDR+ 相机离线验证（2026-11-15，离线通过）
+
+- **平板原生编译流水线**（`tools/tablet-build-common.sh` 及 4 个 `tools/build-{camera,face,libcamera,sensors}-rpm.sh`）：
+  - 默认通过 `private/ssh.sh`（`OPD_OS=fedora`）对平板执行架构与电量（`>=15%` 或充电中）检查后，在平板 SM8750 Oryon 原生环境（`/tmp` 内存盘、`systemd-inhibit` 防休眠、`nproc - 1` 即 `-j7` 留核限流）执行编译打包并回传产物与日志；保留 `--local` / `OPD_BUILD_TARGET=local` 宿主机固化容器镜像兜底路径（`opd_ensure_cached_image`，`build-libcamera-rpm.sh` 支持 `BuildRequires` 哈希自动失效与 `REUSE_BUILD=1`）。
+  - 5 个脚本已通过 `bash -n` 静态检查；`tools/build-camera-rpm.sh 0.1 1`（首次按需补齐 `rpm-build`/`python3-devel` 后，复跑纯构建 + `%check`）从宿主 QEMU 容器约 `2.5+ min` 缩短至端到端 **`4.562s`**。注：`face`/`libcamera`/`sensors` 三个脚本的平板原生路径已做静态语法校验，暂未实际重跑全量构建。
+- **阶段 2：`opd2413-camera` 0.1-1（ZSL 多帧 RAW10 HDR+ 相机，状态：`离线通过`）**：
+  - **实现文件（`packaging/opd2413-camera/`）**：`src/hdrplus_isp.py`（RAW10 CSI2P 解包、2×2 超像素双阶段局部零均值相位相关对齐、`mad_noise` 与双帧方差 `2.0` 比例缩放去鬼影融合、5×5 Malvar-He-Cutler 去马赛克、中性高光重建、LSC/AWB/色温插值 CCM、5 级 Mertens 曝光融合、YCrCb 双边降噪与 CAS 锐化、`ExifIFD 0x8769` EXIF 写入）、`src/opd-camera-cli.py`（`/usr/bin/opd-camera-cli`）、`src/opd-camera-gui.py`（`/usr/bin/opd-camera`，`PySide6` ZSL 双流 `XRGB8888` + `stop()` 后 `get_ready_requests()` 排空）、`data/opd-camera.desktop`、`opd2413-camera.spec`、`tests/test_hdrplus_isp.py`。
+  - **构建与单测校验**：`tools/build-camera-rpm.sh 0.1 1` 在平板原生构建并全部通过 `%build`（`py_compile`）、`%install`、`desktop-file-validate` 与 `tests/test_hdrplus_isp.py`（`ALL_HDRPLUS_UNIT_TESTS_PASSED`，含单 Bayer 子通道平坦区降噪校验与多尺度宽带纹理对齐 RMSE 校验），产出 `out/rpmbuild/RPMS/aarch64/opd2413-camera-0.1-1.fc45.aarch64.rpm`（SHA-256：`9d2ef6b94dfec9e42fad86b06175206e01ef3b8870fed3841af8a968cc1ed877`）。
+  - **Oryon 真机芯片离线 RAW10 基准**（宿主机 `private/cam-exp-20261115/` 8 帧 8MP `sc820cs` 连拍输入，传平板 `/tmp` 运行后清理，输出 `private/cam-stage1-20261115/stage2_offline_hdrplus_8mp.jpg`）：全管线耗时 **`5629.8 ms`（5.63s）**，`clip(>250)% = 0.000%`，平坦白墙高频噪点标准差 **`0.55`**（Stage 1 单帧 `1.84`、ColorOS 参考图 `1.30`）；人工检视图像正立、白墙中性无色偏、细节清晰且无重影或高光溢出。
+- **阶段 2 上机安装前预期与判据（待用户确认后执行）：**
+  1. **设备写入范围**：仅向平板 `/tmp/` 传入 `opd2413-camera-0.1-1.fc45.aarch64.rpm`，在 `ARMADA_ROOT` 执行离线 `dnf install -y --disablerepo='*'` 后清除 `/tmp/` 临时 RPM；包内包含 `/usr/bin/opd-camera`、`/usr/bin/opd-camera-cli`、`/usr/libexec/opd2413/{hdrplus_isp,opd-camera-cli,opd-camera-gui}.py` 与 `/usr/share/applications/opd-camera.desktop`（运行依赖 `libcamera >= 0.7.2-5.fc45.opd2413.3`、`python3-{libcamera,numpy,opencv,pillow,pyside6}` 均已在平板就绪）。
+  2. **前/后摄 ZSL HDR+ 实拍验收**：前摄 `sc820cs`（8MP）与后摄 `sc1300cs`（13MP）均可通过 `opd-camera-cli` 正常执行双流 ZSL 多帧 RAW10 采集与 HDR+ 出片，方向正立、色彩自然、高光不死白且无 `debayerGPU failed` 或崩溃。
+
+#### 真机验收结果（2026-11-15，真机通过）
+
+- **问题定位与最终修复**（[hdrplus_isp.py](../packaging/opd2413-camera/src/hdrplus_isp.py) / [opd-camera-gui.py](../packaging/opd2413-camera/src/opd-camera-gui.py)）：
+  - 在 `opd-camera-gui.py` 补全 Wayland 桌面元数据（`app.setDesktopFileName("opd-camera")` 与 `QIcon.fromTheme("camera-photo")`）。
+  - 首轮真机测试中前摄 `8MP` 成片正常，后摄 `sc1300cs`（`AnalogueGain=16.0`）暗光实拍出现整体紫红暗部雾霾（`mean_rgb=[129.9, 94.5, 117.5]`）；对实机 RAW10 做 8 帧均值采样确认 `SensorBlackLevels=4096`（`64.00 DN`）及最暗 `128×128` 块（`[B=64.96, Gb=66.0, Gr=65.42, R=64.69] DN`）准确且中性，问题系 `p005*0.98` 将 `black_level_10b` 误拉低至 `57.82 DN`、去马赛克前 `np.maximum(merged_bayer, 0.0)` 对零均值读噪声做半波整流产生正偏差，以及 `_auto_ev_gain` / Mertens 最大提亮达 `4.5×1.65=7.4×` 所致。
+  - 修复方案：取消 `p005*0.98` 下拉（仅保留 `p05 < bl * 0.5` 严重失配兜底）、取消去马赛克前负值截断、在 CCM 后依据 `merge_info["mad_noise"]` 添加极暗部色度滚降，并将 `_auto_ev_gain` 上限压至 `2.4`、Mertens 倍率调整为 `[0.75, 1.0, 1.40]`。
+- **最终编译、单测与平板装机**：
+  - 平板原生运行 `bash tools/build-camera-rpm.sh 0.1 1`（`jobs=7 batt=94%(Charging)`）成功生成最终 `out/rpmbuild/RPMS/aarch64/opd2413-camera-0.1-1.fc45.aarch64.rpm`（SHA-256：`434aadb1a68e59fe993b463b142e5472cb49c1eec750cc8727bb0da2bae81df1`）；
+  - 通过 `dnf reinstall -y --disablerepo='*'` 离线重装至 `ARMADA_ROOT` 并删除 `/tmp/` 临时包后，针对实装目录 `/usr/libexec/opd2413` 运行 `packaging/opd2413-camera/tests/test_hdrplus_isp.py` 直接观测输出 `ALL_HDRPLUS_UNIT_TESTS_PASSED`。
+- **前/后摄 `opd-camera-cli` 实拍实测（普通用户 `colin`）**：
+  - **前摄 `sc820cs`（8MP，`--mode hdr+ --frames 8 --warmup 24`）**：`black_level_10b=64.0`，`burst_capture_ms=234.5`，`isp_process_ms=3819.8`（`total_ms=7162.3`），`awb_gains=[1.667, 1.0, 1.36]`、`est_ct=6095.0`、`analogue_gain=12.36`、`exposure_us=33280`；样张 `private/cam-stage1-20261115/stage2_live_front_8mp.jpg`（`3264×2448`）指标 `mean_rgb=[162.92, 152.9, 141.96]`、`clip(>250)%=0.000%`、`flat_hp_noise=1.12`，EXIF `Make='OnePlus'`、`Model='OnePlus Pad 2 Pro (OPD2413)'`、`Orientation='Horizontal (normal)'`、`ISO=1236`、`ExposureTime=1/30`、`FNumber=2.0`；目视人像、白墙及纱帐正立清晰、无偏色。
+  - **后摄 `sc1300cs`（13MP，`--mode hdr+ --frames 8 --warmup 30`）**：`black_level_10b=64.0`，`burst_capture_ms=222.7`，`isp_process_ms=9366.8`（`total_ms=12887.1`），`awb_gains=[2.151, 1.0, 1.685]`、`est_ct=5817.0`、`analogue_gain=16.0`、`exposure_us=33270`；样张 `private/cam-stage1-20261115/stage2_live_rear_13mp.jpg`（`4160×3120`）指标 `mean_rgb=[89.09, 99.86, 86.52]`、`dark10_rgb=[22.55, 22.07, 22.09]`、`clip(>250)%=0.119%`、`flat_hp_noise=2.25`，EXIF `Make='OnePlus'`、`Model='OnePlus Pad 2 Pro (OPD2413)'`、`Orientation='Horizontal (normal)'`、`ISO=1600`、`ExposureTime=1/30`、`FNumber=2.2`；目视黑色衣物恢复中性灰黑、紫红暗部雾霾彻底消除（`cn3927` 物理对焦仍受 `#42` 限制）。
+- **Qt6 Wayland GUI 与系统健康度**：
+  - 用户 `colin` 于 `WAYLAND_DISPLAY=wayland-1 QT_QPA_PLATFORM=wayland` 下启动 `/usr/bin/opd-camera` 运行 6 秒实况取景（Adreno 830 EGL `1632x1224` + `3264x2448`），`timeout -s TERM 6s` 干净退出（`GUI_EXIT_CODE=124`），无 Python 异常且无残留进程；
+  - `opd2413-face.service` 状态 `active`（`idle`，`user 'colin': enrolled=yes`），`systemctl --failed` 为空，最近 SELinux `AVC` 无拒绝，平板 `/tmp/opd*` 已清理。
+- **证据位置**：宿主机 `private/cam-stage1-20261115/stage2_live_front_8mp.jpg`、`private/cam-stage1-20261115/stage2_live_rear_13mp.jpg`。
+
+### 后摄 `cn3927` 自动对焦与 `opd2413-camera-0.1-2` 亮度/鲜艳度修复（2026-11-16，RAM 热加载与 CLI/冒烟验证通过，待 `-29` 冷启动固化）
+
+- **上机测试前预期与判据：**
+  1. **设备写入边界**：内核侧先通过 `sysfs` 在线验证及 `rmmod cn3927 && insmod /tmp/cn3927.ko` 在平板内存（RAM）中完成真机验证，不触碰 `/boot` 与 ESP（待实机验证后向用户汇报并征求确认再持久化刷入内核 RPM）；用户态仅升级安装 `opd2413-camera-0.1-2.fc45.aarch64.rpm` 到 `ARMADA_ROOT`。
+  2. **预期 1（后摄 `cn3927` 共电耦合与 PM 生命周期修复）**：保持 `sc1300cs` (`10-0036`) 处于 `active` 时重新绑定并驱动 `cn3927` (`10-000c`) 不再出现 `master 1 queue 0 timeout`；加载补丁 `2435` 后，空闲态打开 `/dev/v4l-subdev*` 不触发 I2C、写 `V4L2_CID_FOCUS_ABSOLUTE` 配合 `device_link` 在流期间保持马达与传感器共电稳定、停流后顺利归位并挂起，`dmesg` 零超时与报错；`opd-camera-cli --camera rear` 中 `libcamera` Contrast AF 正常锁定 `AfState == 2` (`Focused`)，手动 `0.0D` 远焦与 `10.0D` 近焦实拍呈现可测锐度差异。
+  3. **预期 2（`opd2413-camera-0.1-2` 自动亮度与肤色保护鲜艳度）**：采用 `LUX` 感知中心加权测光 + 通透中间调曲线及暗部归零/肤色高斯保护 `Vibrance + Saturation` 后，前/后摄亮度与色彩鲜艳度明显改善，同时暗部保持中性（`dark10_rgb` 不偏紫）、高光裁剪 `< 1.0%`、Wayland GUI 与 `opd2413-face.service` 无回归。
+- **用户态升级与首次复测根因定位：**
+  - 更新 `packaging/opd2413-camera/`（`opd2413-camera.spec`、`src/hdrplus_isp.py`、`src/opd-camera-cli.py`、`src/opd-camera-gui.py`、`tests/test_hdrplus_isp.py`），在平板原生编译打包生成 `out/rpmbuild/RPMS/aarch64/opd2413-camera-0.1-2.fc45.aarch64.rpm`（`sha256: 48fb126bf88dc95595e4358b7862f378ae9e3ad6b6d03bcd9de1b0afe7d94e21`）并离线 `dnf upgrade` 升级，单元测试 `test_hdrplus_isp.py` 输出 `ALL_HDRPLUS_UNIT_TESTS_PASSED`。
+  - 首次后摄实测中，出流约 `1.3 s` 首个 `S_CTRL` 仍触发 `i2c-qcom-cci ac7b000.cci: master 1 queue 0 timeout`，导致 `10-000c` 锁死在 `runtime_status=error`。对照 OEM `runtime.dts`、`erhaimain_actuator` 配置与 `/sys/class/devlink/i2c:10-0036--i2c:10-000c` 查明三重原因：(1) `device_link_add` 的 `consumer`/`supplier` 写反，将 `sc1300cs` (`10-0036`) 当成 `cn3927` (`10-000c`) 的 supplier 而非 consumer，且 sensor 已激活时缺少 `DL_FLAG_RPM_ACTIVE`；(2) `cn3927` 发送 `0x08=0x6f` 解锁后缺少 OEM 要求的 `100 us`（`CN3927_INIT_DELAY_US`）稳定延时，且 `CN3927_PARK_STEP` 应为 `64`；(3) `cn3927_write()` 缺少总线短暂抖动重试（`CN3927_I2C_RETRIES=3`，间隔 `5 ms`）。
+- **补丁 `2435` 离线编译与反向校验：**
+  - 修正 `drivers/media/i2c/cn3927.c`（移除 `<linux/suspend.h>`、`bool unbinding`、`usage_count > 1` 判断及 `device_is_bound` 延迟，改用 `device_link_add(cn3927->sensor_dev, &client->dev, dl_flags)` 与清理路径），导出 `kernel/opd2413-7.2/patches/2435-media-i2c-cn3927-fix-power-up-delay-load-and-runtime-pm.patch` 并更新 `kernel/PATCHES.md`。
+  - 宿主机 `ARCH=arm64` 增量编译 `modules` 目标退出码 `0`（注：Kbuild 单目标 `drivers/media/i2c/cn3927.ko` 因缺少 `Module.symvers` 无法单独过 `modpost`），strip 后模块 `61K`（`sha256: 4dea8b257b3b814ce4ffa4cdafb27699805eeba7033b31ebd37e0824c6fc4408`，`vermagic=7.2.15-28.opd2413 SMP preempt mod_unload aarch64`）；`patch -p1 -R -F0 --dry-run` 返回 `PATCH_REVERSE_F0_OK`。
+- **实机结果与证据（RAM 热加载 + 两轮实拍 + 5s GUI 冒烟，2026-11-16）：**
+  - **RAM 热加载**：将 `cn3927.ko` 传至平板 `/tmp/cn3927.ko`（`sha256` 校验一致），停 `opd2413-face` 与 `wireplumber`、解绑 `ad27000.isp` 与 `10-000c` 后 `rmmod cn3927 && insmod /tmp/cn3927.ko`，重绑 `ad27000.isp` 并拉起服务（未触碰 `/boot` 与 ESP）。核验 `/sys/class/devlink/i2c:10-000c--i2c:10-0036/runtime_pm = 1`，`10-000c` 与 `10-0036` 均为 `suspended` 且 `runtime_error=none`。
+  - **两轮 CLI 连拍实测（以 `colin` 执行，6 次拍摄全部 `Contrast AF enabled`、零 `Unable to set control`）：**
+    1. `test_front_012.jpg`：`3264x2448, frames=6, burst=162.0ms, isp=3591.9ms`，`meanY=14.07, p50Y=13.00, p95Y=32.00, meanSat=60.89, dark10=[4.01, 3.83, 4.58], center_lap_var=676.11, center_sobel=40.08, corners_lap=[1111.48, 1174.21, 1162.07, 1202.54]`。
+    2. `test_rear_af_012.jpg`：`4160x3120, frames=6, af_state=2, lens=1.833D, burst=155.6ms, isp=6473.2ms`，`meanY=8.49, p50Y=6.00, p95Y=23.00, meanSat=32.33, dark10=[3.49, 3.25, 3.31], center_lap_var=455.93, center_sobel=31.34, corners_lap=[737.79, 826.27, 715.95, 826.98]`。
+    3. `test_rear_lp0_012.jpg`：`4160x3120, frames=6, af_state=0, lens=0.0D, burst=162.6ms, isp=6440.1ms`，`meanY=8.58, p50Y=6.00, p95Y=24.00, meanSat=31.03, dark10=[3.23, 3.24, 2.98], center_lap_var=466.75, center_sobel=31.93, corners_lap=[754.67, 834.98, 729.77, 808.68]`。
+    4. `test_rear_lp10_012.jpg`：`4160x3120, frames=6, af_state=0, lens=10.0D, burst=166.0ms, isp=6509.7ms`，`meanY=7.74, p50Y=5.00, p95Y=23.00, meanSat=52.24, dark10=[3.14, 3.15, 4.0], center_lap_var=408.65, center_sobel=29.2, corners_lap=[655.49, 748.13, 664.12, 781.72]`。
+    5. `test_front2_012.jpg`（`10.0D` 后切前摄）：`3264x2448, frames=6, burst=164.7ms, isp=3693.3ms`。
+    6. `test_rear_af2_012.jpg`（再切回后摄 AF）：`4160x3120, frames=6, af_state=2, lens=6.012D, burst=165.3ms, isp=6475.2ms`，`meanY=8.29, p50Y=6.00, p95Y=23.00, meanSat=48.79, dark10=[3.62, 3.27, 4.01], center_lap_var=438.64, center_sobel=30.8, corners_lap=[664.27, 768.44, 702.97, 817.89]`。
+  - **内核日志与状态收尾**：测试后 `10-000c` 与 `10-0036` 均恢复 `suspended`（`runtime_error=none`）；`journalctl -k --since "2026-11-16 01:31:17"`（排除 `ath12k_wifi7_pci`）为空，0 次 CCI 超时或重试（Step 2B 降频 100 kHz 无需实施）。4 张样本已拉回宿主机 `out/camera-verify/` 目视核验，平板 `/tmp/test_*.jpg` 已清理（保留 `/tmp/cn3927.ko`）。
+  - **GUI 冒烟与全机健康**：`colin` 在 `WAYLAND_DISPLAY=wayland-1`（`QT_QPA_PLATFORM=wayland`）运行 `timeout 5s /usr/bin/opd-camera` 返回 `124`（Adreno 830 EGL `1632x1224` + `3264x2448`，`Contrast AF enabled`）；退出后 `10-000c`/`10-0036` 保持 `suspended`、`kernel_log=clean`、`opd2413-face=active`、`wireplumber=active`、`systemctl --failed` 为 `0 loaded units listed`、`ausearch -m avc -ts recent` 为 `<no matches>`、电量 `94% (Charging)`。
+  - **实测范围与待跟进项**：本次拍摄在夜间极暗室内完成（`meanY` `7.74–14.07`），`0.0D` 与 `10.0D` 在右下微弱反光点已体现明显清晰度差异且深暗部中性（`dark10 ~ 2.98–4.58`），但极暗纯噪点边缘在多帧对齐下存在明显移位伪影；明亮环境下的 `0.1-2` 亮度/色彩观感、日间远近焦对比与 GUI 交互按钮仍待用户在正常光照下实测，内核修改待用户确认后编译安装 `kernel-opd2413-7.2.15-29` 并冷启动验收。
+
+### 持久化内核 `kernel-opd2413-7.2.15-29` 构建、刷入与重启对焦验收（2026-11-16，已完成）
+
+- **上机测试前预期与判据：**
+  1. **构建与离线校验预期**：`N=29 bash out/m3k/build.sh`（`-j15`，保留 1 核空闲）零错误编出 `kernel-opd2413-7.2.15-29.opd2413.aarch64.rpm`，stage 内 `cn3927.ko*` 的 `vermagic` 为 `7.2.15-29.opd2413 SMP preempt mod_unload aarch64`；`tests/ufs-guard-test.sh` 退出码 `0`，`tests/package-install-test.sh out/m3k/rpms29 out/m3k/pkg-test29` 确认 ESP 条目、DTB 与 initramfs 全部早期固件 `0 missing` 且无 rescue 镜像（仅允许已知 `66` vs `67` 常量提示）。
+  2. **安全装机与 `KSHIM.CHO` 零变动**：保留 `-28` 与 `-26` 回退包，通过 `rpm -ivh --nosignature` 安装 `-29` 并清理 `/tmp/cn3927.ko` 与临时 RPM；核验 `/boot/efi/KSHIM.CHO` 的 `sha256sum` 与 `filefrag -v` 物理 extent 前后完全一致，先维持 `loader.conf` 默认项为 `fedora-7.2.15-28.opd2413.conf` 并用 `tools/tablet-reboot.py --entry fedora-7.2.15-29.opd2413.conf --wait 240` 单次引导至 `-29`。
+  3. **重启上线、相机对焦与默认切换判据**：`-29` 上线后 `uname -r == 7.2.15-29.opd2413`、`systemctl is-system-running == running`、`0 failed`、`Enforcing`、`0 AVC`；`cn3927` 从 `/lib/modules/7.2.15-29.opd2413/...` 加载、`/sys/class/devlink/i2c:10-000c--i2c:10-0036/runtime_pm == 1`；完成晨光下前摄/后摄 AF/手动 `0.0D`/`10.0D` CLI 实拍及 5 秒 Wayland GUI 预览冒烟，全程 `dmesg` 零 `ac7b000.cci` 超时与报错、`10-000c`/`10-0036` 回归 `suspended`（`runtime_error=none`）；随后将 `fedora-7.2.15-29.opd2413.conf` 设为默认并做无 `--entry` 重启复核后消号 `#42`。
+- **实际结果与证据：**
+  1. **宿主机交叉编译与离线校验**：`N=29 bash out/m3k/build.sh`（`-j15`）输出 `BUILD-OK`，生成 `out/rpmbuild/RPMS/aarch64/kernel-opd2413-7.2.15-29.opd2413.aarch64.rpm`（`sha256: 0acbb9b0918ca63d2d022b681db4b4b5d99386309925f4df26cd9d5b3851c45b`，同步归档于 `out/m3k/rpms29/`）；`cn3927.ko`（`61K`）`vermagic = 7.2.15-29.opd2413 SMP preempt mod_unload aarch64`。`tests/ufs-guard-test.sh` 退出码 `0`；`tests/package-install-test.sh out/m3k/rpms29 out/m3k/pkg-test29` 仅触发已知第 78 行 `FAIL: expected 66 early firmware files, the helper lists 67`，实际 `initramfs: 94063852 bytes, 67 device firmware files required, 0 missing`、`negative.txt = refused`、无 Fedora 原生内核且无其他失败。
+  2. **安全装机与 `KSHIM.CHO` 前后一致**：流式上传并校验 SHA-256 一致后，执行 `rpm -ivh --nosignature` 安装 `-29` 并清理 `/tmp/kernel-opd2413-7.2.15-29*.rpm` 与 `/tmp/cn3927.ko`；保留 `-26`/`-28`/`-29` 三个内核 RPM 与条目，ESP `/dev/sda16` 已用 `370M / 512M`（`73%`，剩余 `143M`）；`/boot/efi/KSHIM.CHO` 装前装后均为 `65d97e12564575a318ba221c6b76ce8b9db91d40187168793c58f4ab3ae52a7d`、`16384` 字节、`1 extent found`。
+  3. **单次安全引导与系统全检**：保持 `loader.conf` 默认为 `fedora-7.2.15-28.opd2413.conf`，执行 `python3 tools/tablet-reboot.py --entry fedora-7.2.15-29.opd2413.conf --wait 240` 经 `90 s` 直接上线至 `7.2.15-29.opd2413`（`running`、`0 failed`、`Enforcing`、`ausearch --input-logs -m avc -ts boot` 为 `<no matches>`）；`/proc/cmdline` 含 `mem_sleep_default=s2idle` 且不含 `fw_devlink.sync_state=timeout`/`pcie_ports=compat`；`/tmp/cn3927.ko` 已不存在，`modinfo -n cn3927` 指向 `/lib/modules/7.2.15-29.opd2413/kernel/drivers/media/i2c/cn3927.ko`；`/sys/class/devlink/i2c:10-000c--i2c:10-0036/runtime_pm = 1`，`10-000c`/`10-0036` 均处于 `suspended`（注：该内核 sysfs 无 `runtime_error` 属性文件）；`dmesg` 无 Oops/`qsh_process`/`fatal error` 且**零 `ac7b000.cci` 超时**（仅含既有 `ath12k_wifi7_pci` 接收警告），`opd2413-sensors-*`/`bluetooth`/`opd-netshare`/`opd2413-face`/`wireplumber` 均为 `active`，`aplay -l` 正常列出 `card 0: OnePlusPad2Pro`。
+  4. **晨光相机实拍与 GUI 冒烟（以 `colin` 执行）**：
+     - `verify29_front.jpg`：`3264x2448, size=2492362, frames=8, burst=225.6ms, isp=4073.5ms`，`meanY=166.66, p50Y=189.06, p95Y=238.93, meanSat=26.65, dark10=[54.9, 53.03, 58.26], center_lap_var=52.23, center_sobel=18.27`；
+     - `verify29_rear_af.jpg`：`4160x3120, size=5928893, frames=8, af_state=2 (Focused), lens=2.053D, burst=222.3ms, isp=6625.6ms`，`meanY=133.68, p50Y=121.92, p95Y=234.21, meanSat=21.82, dark10=[46.06, 46.29, 46.34], center_lap_var=148.10, center_sobel=17.84`；
+     - `verify29_rear_lp0.jpg`：`4160x3120, size=6041485, frames=8, af_state=0, lens=0.0D, burst=222.7ms, isp=6750.5ms`，`meanY=132.63, p50Y=120.61, p95Y=233.31, meanSat=37.31, dark10=[44.27, 45.99, 43.37], center_lap_var=192.05, center_sobel=19.97`；
+     - `verify29_rear_lp10.jpg`：`4160x3120, size=6447861, frames=8, af_state=0, lens=10.0D, burst=225.9ms, isp=6691.9ms`，`meanY=133.50, p50Y=116.59, p95Y=226.37, meanSat=49.76, dark10=[46.45, 49.41, 43.58], center_lap_var=252.20, center_sobel=23.04`。
+     - 4 张样本已拉回宿主机 `out/camera-verify/` 目视核验并清理平板 `/tmp/verify29_*.jpg`：前摄肤色自然、白墙中性、亮度均衡；后摄 `10.0D` 下近景贴纸小字（“微萌电蚊拍 / 危险电压 / GB 4706.1”）字字清晰、背景虚化，与 `0.0D`/`2.053D` 形成明显物理焦平面位移（室内后摄白墙略呈轻微偏黄绿暖调，属后续按需白平衡微调项）。5 秒 Wayland GUI 冒烟返回 `GUI_EXIT=124`；测后 `journalctl -k --since "$t_start"`（排除 `ath12k_wifi7_pci`）为空、`10-000c`/`10-0036` 均恢复 `suspended`、`opd2413-face` 与 `wireplumber` 保持 `active`。
+  5. **默认项固化与用户验收**：用户已在运行 `-29` 的平板上试用后摄并反馈“已经可以自动聚焦了”，执行 `/usr/libexec/opd2413/boot-select default fedora-7.2.15-29.opd2413.conf && sync`，核实 `loader_default == booted_entry == fedora-7.2.15-29.opd2413.conf`、`pending_next = null`、`KSHIM.CHO` 哈希与 `1 extent` 不变、电量 `94% (charging)`（未再额外触发二次重启以免打断用户当前使用），完成 `#42` 消号。
+
