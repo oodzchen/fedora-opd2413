@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=OPD2413 HDR+ Camera
+Name[zh_CN]=OPD2413 HDR+ 相机
+GenericName=HDR+ Camera
+GenericName[zh_CN]=计算摄影相机
+Comment=Native ZSL multi-frame RAW10 HDR+ camera for OnePlus Pad 2 Pro
+Comment[zh_CN]=一加平板 2 Pro 原生零延迟多帧 RAW10 HDR+ 相机
+Exec=/usr/bin/opd-camera
+Icon=camera-photo
+Terminal=false
+Categories=Graphics;Photography;Qt;
+Keywords=camera;photo;hdr;raw;selfie;
+StartupNotify=true
