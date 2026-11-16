@@ -11,6 +11,7 @@
 #include <QDBusPendingCall>
 #include <QDBusPendingCallWatcher>
 #include <QDBusPendingReply>
+#include <QDBusVariant>
 #include <QJSEngine>
 #include <QQmlEngine>
 
@@ -19,6 +20,11 @@ namespace {
 constexpr const char *kBusName = "org.opd2413.Face1";
 constexpr const char *kBusPath = "/org/opd2413/Face1";
 constexpr const char *kBusIface = "org.opd2413.Face1";
+
+constexpr const char *kUPowerBus = "org.freedesktop.UPower";
+constexpr const char *kUPowerPath = "/org/freedesktop/UPower";
+constexpr const char *kUPowerIface = "org.freedesktop.UPower";
+constexpr const char *kDBusPropsIface = "org.freedesktop.DBus.Properties";
 
 QString currentUsername()
 {
@@ -43,7 +49,16 @@ FaceBridge::FaceBridge(QObject *parent)
         this,
         SLOT(onStatusChanged(QString, QString)));
 
+    QDBusConnection::systemBus().connect(
+        QString::fromLatin1(kUPowerBus),
+        QString::fromLatin1(kUPowerPath),
+        QString::fromLatin1(kDBusPropsIface),
+        QStringLiteral("PropertiesChanged"),
+        this,
+        SLOT(onUPowerPropertiesChanged(QString, QVariantMap, QStringList)));
+
     refreshEnrolled();
+    refreshLidClosed();
 }
 
 FaceBridge::~FaceBridge()
@@ -163,6 +178,46 @@ void FaceBridge::setStateInternal(const QString &state, const QString &reason)
     if (m_busy != nowBusy) {
         m_busy = nowBusy;
         Q_EMIT busyChanged();
+    }
+}
+
+void FaceBridge::setLidClosedInternal(bool closed)
+{
+    if (m_lidClosed != closed) {
+        m_lidClosed = closed;
+        Q_EMIT lidClosedChanged();
+    }
+}
+
+void FaceBridge::refreshLidClosed()
+{
+    QDBusMessage msg = QDBusMessage::createMethodCall(
+        QString::fromLatin1(kUPowerBus),
+        QString::fromLatin1(kUPowerPath),
+        QString::fromLatin1(kDBusPropsIface),
+        QStringLiteral("Get"));
+    msg << QString::fromLatin1(kUPowerIface) << QStringLiteral("LidIsClosed");
+
+    QDBusPendingCall call = QDBusConnection::systemBus().asyncCall(msg, 1000);
+    auto *watcher = new QDBusPendingCallWatcher(call, this);
+    connect(watcher, &QDBusPendingCallWatcher::finished, this, [this](QDBusPendingCallWatcher *w) {
+        QDBusPendingReply<QDBusVariant> reply(*w);
+        if (!reply.isError())
+            setLidClosedInternal(reply.value().variant().toBool());
+        w->deleteLater();
+    });
+}
+
+void FaceBridge::onUPowerPropertiesChanged(const QString &iface, const QVariantMap &changed, const QStringList &invalidated)
+{
+    if (iface != QLatin1String(kUPowerIface))
+        return;
+
+    const QString key = QStringLiteral("LidIsClosed");
+    if (changed.contains(key)) {
+        setLidClosedInternal(changed.value(key).toBool());
+    } else if (invalidated.contains(key)) {
+        refreshLidClosed();
     }
 }
 

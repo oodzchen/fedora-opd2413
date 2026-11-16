@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+"""Trigger suspendToRam after the lid stays continuously closed for a delay.
+
+PowerDevil's HandleButtonEvents executes LidAction immediately on lid close and
+has no built-in delayed lid-suspend action. When LidAction is configured to
+TurnOffScreen (64) with LockBeforeTurnOffDisplay=true, closing the lid locks
+and blanks the panel immediately; this helper watches UPower's LidIsClosed
+property and invokes PowerDevil's SuspendSession.suspendToRam() after the
+configured delay (default 600s) unless the lid reopens, an external display
+inhibits lid action, or the system already entered sleep.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import signal
+import subprocess
+import sys
+from gi.repository import Gio, GLib
+
+try:
+    from gi.repository import GLibUnix
+except ImportError:  # older PyGObject
+    GLibUnix = None
+
+UPOWER_BUS = "org.freedesktop.UPower"
+UPOWER_PATH = "/org/freedesktop/UPower"
+UPOWER_IFACE = "org.freedesktop.UPower"
+DBUS_PROPS_IFACE = "org.freedesktop.DBus.Properties"
+
+LOGIN1_BUS = "org.freedesktop.login1"
+LOGIN1_PATH = "/org/freedesktop/login1"
+LOGIN1_IFACE = "org.freedesktop.login1.Manager"
+
+PD_BUS = "org.kde.Solid.PowerManagement"
+PD_HANDLE_PATH = "/org/kde/Solid/PowerManagement/Actions/HandleButtonEvents"
+PD_HANDLE_IFACE = "org.kde.Solid.PowerManagement.Actions.HandleButtonEvents"
+PD_SUSPEND_PATH = "/org/kde/Solid/PowerManagement/Actions/SuspendSession"
+PD_SUSPEND_IFACE = "org.kde.Solid.PowerManagement.Actions.SuspendSession"
+
+
+def log(msg: str) -> None:
+    print(f"opd2413-lid-suspend: {msg}", flush=True)
+
+
+class LidSuspendWatcher:
+    def __init__(self, delay_sec: int, dry_run: bool = False) -> None:
+        self.delay_sec = delay_sec
+        self.dry_run = dry_run
+        self.timer_id: int | None = None
+        self.dpms_guard_ids: list[int] = []
+        self.sys_bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+        self.sess_bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        self.loop = GLib.MainLoop()
+
+    @staticmethod
+    def get_kwin_dpms_state() -> str:
+        """Query KWin's real Wayland DPMS mode ('on', 'off', or 'unknown')."""
+        try:
+            res = subprocess.run(
+                ["kscreen-doctor", "--dpms", "show"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=3,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return "unknown"
+        if res.returncode != 0:
+            return "unknown"
+        for line in res.stdout.splitlines():
+            if "dpms mode for screen DSI-" in line:
+                if line.rstrip().endswith(": on"):
+                    return "on"
+                if line.rstrip().endswith(": off"):
+                    return "off"
+        return "unknown"
+
+    def set_kwin_dpms(self, mode: str) -> None:
+        if self.dry_run:
+            log(f"dry-run: would run kscreen-doctor --dpms {mode}")
+            return
+        try:
+            subprocess.run(["kscreen-doctor", "--dpms", mode], check=False, timeout=3)
+            log(f"enforced kscreen-doctor --dpms {mode}")
+        except (OSError, subprocess.SubprocessError) as err:
+            log(f"failed to enforce DPMS {mode}: {err}")
+
+    def cancel_dpms_guards(self) -> None:
+        ctx = GLib.MainContext.default()
+        for gid in self.dpms_guard_ids:
+            if ctx.find_source_by_id(gid) is not None:
+                GLib.source_remove(gid)
+        self.dpms_guard_ids.clear()
+
+    def schedule_dpms_guards(self) -> None:
+        self.cancel_dpms_guards()
+        for delay_ms in (400, 1000):
+            gid = GLib.timeout_add(delay_ms, self._on_dpms_guard, delay_ms)
+            self.dpms_guard_ids.append(gid)
+
+    def schedule_lid_open_wake(self) -> None:
+        self.cancel_dpms_guards()
+        gid = GLib.timeout_add(250, self._on_lid_open_wake)
+        self.dpms_guard_ids.append(gid)
+
+    def _on_dpms_guard(self, delay_ms: int) -> bool:
+        if self.get_lid_closed() and self.triggers_lid_action() and self.get_kwin_dpms_state() == "on":
+            log(f"dpms guard (+{delay_ms}ms) saw KWin DPMS still on")
+            self.set_kwin_dpms("off")
+        return False
+
+    def _on_lid_open_wake(self) -> bool:
+        if not self.get_lid_closed() and self.get_kwin_dpms_state() == "off":
+            log("lid open wake (+250ms) saw KWin DPMS still off")
+            self.set_kwin_dpms("on")
+        return False
+
+    def get_lid_closed(self) -> bool:
+        try:
+            res = self.sys_bus.call_sync(
+                UPOWER_BUS,
+                UPOWER_PATH,
+                DBUS_PROPS_IFACE,
+                "Get",
+                GLib.Variant("(ss)", (UPOWER_IFACE, "LidIsClosed")),
+                GLib.VariantType("(v)"),
+                Gio.DBusCallFlags.NONE,
+                3000,
+                None,
+            )
+            return bool(res.unpack()[0])
+        except GLib.Error as err:
+            log(f"failed to query UPower LidIsClosed: {err.message}")
+            return False
+
+    def triggers_lid_action(self) -> bool:
+        try:
+            res = self.sess_bus.call_sync(
+                PD_BUS,
+                PD_HANDLE_PATH,
+                PD_HANDLE_IFACE,
+                "triggersLidAction",
+                None,
+                GLib.VariantType("(b)"),
+                Gio.DBusCallFlags.NONE,
+                3000,
+                None,
+            )
+            return bool(res.unpack()[0])
+        except GLib.Error as err:
+            log(f"PowerDevil triggersLidAction unavailable ({err.message}); assuming true")
+            return True
+
+    def trigger_suspend(self) -> None:
+        if self.dry_run:
+            log("dry-run: would call PowerDevil SuspendSession.suspendToRam()")
+            return
+        try:
+            self.sess_bus.call_sync(
+                PD_BUS,
+                PD_SUSPEND_PATH,
+                PD_SUSPEND_IFACE,
+                "suspendToRam",
+                None,
+                None,
+                Gio.DBusCallFlags.NONE,
+                5000,
+                None,
+            )
+            log("called PowerDevil SuspendSession.suspendToRam()")
+            return
+        except GLib.Error as err:
+            log(f"PowerDevil suspendToRam failed ({err.message}); falling back to login1 Suspend(false)")
+
+        try:
+            self.sys_bus.call_sync(
+                LOGIN1_BUS,
+                LOGIN1_PATH,
+                LOGIN1_IFACE,
+                "Suspend",
+                GLib.Variant("(b)", (False,)),
+                None,
+                Gio.DBusCallFlags.NONE,
+                5000,
+                None,
+            )
+            log("called login1 Manager.Suspend(false)")
+        except GLib.Error as err:
+            log(f"login1 Suspend failed: {err.message}")
+
+    def cancel_timer(self, reason: str) -> None:
+        self.cancel_dpms_guards()
+        if self.timer_id is not None:
+            GLib.source_remove(self.timer_id)
+            self.timer_id = None
+            log(f"cancelled suspend timer ({reason})")
+
+    def arm_timer(self, reason: str, enforce_dpms: bool = False) -> None:
+        self.cancel_timer("re-arming")
+        self.timer_id = GLib.timeout_add_seconds(self.delay_sec, self._on_timeout)
+        if enforce_dpms:
+            self.schedule_dpms_guards()
+        log(f"armed {self.delay_sec}s suspend timer ({reason})")
+
+    def _on_timeout(self) -> bool:
+        self.timer_id = None
+        if not self.get_lid_closed():
+            log("timer fired but lid is open; skipping suspend")
+            return False
+        if not self.triggers_lid_action():
+            log("timer fired but triggersLidAction() is false (external monitor active); skipping suspend")
+            return False
+        log(f"lid remained closed for {self.delay_sec}s; triggering suspend")
+        self.trigger_suspend()
+        return False
+
+    def _on_upower_props(
+        self,
+        _conn: Gio.DBusConnection,
+        _sender: str,
+        _path: str,
+        _iface: str,
+        _signal: str,
+        params: GLib.Variant,
+    ) -> None:
+        iface_name, changed, invalidated = params.unpack()
+        if iface_name != UPOWER_IFACE:
+            return
+        if "LidIsClosed" in changed:
+            closed = bool(changed["LidIsClosed"])
+        elif "LidIsClosed" in invalidated:
+            closed = self.get_lid_closed()
+        else:
+            return
+
+        if closed:
+            self.arm_timer("lid closed", enforce_dpms=True)
+        else:
+            self.cancel_timer("lid opened")
+            self.schedule_lid_open_wake()
+
+    def _on_prepare_for_sleep(
+        self,
+        _conn: Gio.DBusConnection,
+        _sender: str,
+        _path: str,
+        _iface: str,
+        _signal: str,
+        params: GLib.Variant,
+    ) -> None:
+        going_to_sleep = bool(params.unpack()[0])
+        if going_to_sleep:
+            self.cancel_timer("entering sleep")
+        elif self.get_lid_closed():
+            self.arm_timer("resumed while lid still closed", enforce_dpms=True)
+
+    def run(self) -> int:
+        self.sys_bus.signal_subscribe(
+            UPOWER_BUS,
+            DBUS_PROPS_IFACE,
+            "PropertiesChanged",
+            UPOWER_PATH,
+            UPOWER_IFACE,
+            Gio.DBusSignalFlags.NONE,
+            self._on_upower_props,
+        )
+        self.sys_bus.signal_subscribe(
+            LOGIN1_BUS,
+            LOGIN1_IFACE,
+            "PrepareForSleep",
+            LOGIN1_PATH,
+            None,
+            Gio.DBusSignalFlags.NONE,
+            self._on_prepare_for_sleep,
+        )
+
+        if self.get_lid_closed():
+            self.arm_timer("startup with lid closed")
+        else:
+            log(f"watching lid events (delay={self.delay_sec}s, lid currently open)")
+
+        signal_add = GLibUnix.signal_add if GLibUnix is not None else GLib.unix_signal_add
+        signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, self._quit)
+        signal_add(GLib.PRIORITY_DEFAULT, signal.SIGINT, self._quit)
+        self.loop.run()
+        return 0
+
+    def _quit(self) -> bool:
+        self.cancel_timer("shutting down")
+        self.loop.quit()
+        return False
+
+
+def main() -> int:
+    default_delay = int(os.environ.get("OPD2413_LID_SUSPEND_DELAY", "600"))
+    parser = argparse.ArgumentParser(description="Delayed suspend after lid close")
+    parser.add_argument("--delay", type=int, default=default_delay, help="Seconds before suspend (default: 600)")
+    parser.add_argument("--dry-run", action="store_true", help="Log action without suspending")
+    args = parser.parse_args()
+    if args.delay < 1:
+        parser.error("--delay must be >= 1")
+    return LidSuspendWatcher(delay_sec=args.delay, dry_run=args.dry_run).run()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -198,7 +198,7 @@ Item {
                 // Keep Regular password PAM ready immediately while holding face scan
                 // behind the post-reveal transition timer.
                 authenticator.startAuthenticating();
-                if (FaceBridge.enrolled && !faceTriedThisOpen) {
+                if (FaceBridge.enrolled && !faceTriedThisOpen && !FaceBridge.lidClosed) {
                     FaceBridge.resetState();
                     faceScanDelayTimer.restart();
                 }
@@ -231,7 +231,7 @@ Item {
             id: faceScanDelayTimer
             interval: 260
             onTriggered: {
-                if (lockScreenRoot.uiVisible && !authenticator.unlocked && FaceBridge.enrolled && !lockScreenRoot.faceTriedThisOpen) {
+                if (lockScreenRoot.uiVisible && !authenticator.unlocked && FaceBridge.enrolled && !lockScreenRoot.faceTriedThisOpen && !FaceBridge.lidClosed) {
                     lockScreenRoot.faceTriedThisOpen = true;
                     FaceBridge.armScan();
                 }
@@ -268,8 +268,36 @@ Item {
                     faceWatchdogTimer.stop();
                 }
             }
+            function onFaceStateChanged() {
+                if (FaceBridge.faceState === "failed" && FaceBridge.lastReason === "lid-closed") {
+                    Qt.callLater(function() {
+                        if (FaceBridge.faceState === "failed" && FaceBridge.lastReason === "lid-closed") {
+                            lockScreenRoot.faceTriedThisOpen = false;
+                            lockScreenRoot.uiVisible = false;
+                        }
+                    });
+                }
+            }
+            function onLidClosedChanged() {
+                if (FaceBridge.lidClosed) {
+                    faceScanDelayTimer.stop();
+                    faceWatchdogTimer.stop();
+                    lockScreenRoot.faceTriedThisOpen = false;
+                    lockScreenRoot.uiVisible = false;
+                    FaceBridge.setLockscreenMode(true, false);
+                    FaceBridge.resetState();
+                } else if (!authenticator.unlocked) {
+                    lockScreenRoot.faceTriedThisOpen = false;
+                    FaceBridge.resetState();
+                    if (!lockScreenRoot.uiVisible) {
+                        lockScreenRoot.uiVisible = true;
+                    } else if (FaceBridge.enrolled && !FaceBridge.busy) {
+                        faceScanDelayTimer.restart();
+                    }
+                }
+            }
             function onEnrolledChanged() {
-                if (lockScreenRoot.uiVisible && !authenticator.unlocked && FaceBridge.enrolled && !lockScreenRoot.faceTriedThisOpen) {
+                if (lockScreenRoot.uiVisible && !authenticator.unlocked && FaceBridge.enrolled && !lockScreenRoot.faceTriedThisOpen && !FaceBridge.lidClosed) {
                     FaceBridge.resetState();
                     faceScanDelayTimer.restart();
                 }

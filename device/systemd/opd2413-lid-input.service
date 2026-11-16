@@ -1,0 +1,16 @@
+# Inhibit internal covered input devices (touch, pen, pogo keyboard/touchpad)
+# while gpio-keys SW_LID is closed so cover contact cannot bounce DPMS back On
+# or trigger lockscreen unlock attempts behind the closed folio cover.
+[Unit]
+Description=Inhibit covered internal inputs while lid is closed (OPD2413)
+After=systemd-udevd.service
+Before=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/libexec/opd2413/lid-input
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

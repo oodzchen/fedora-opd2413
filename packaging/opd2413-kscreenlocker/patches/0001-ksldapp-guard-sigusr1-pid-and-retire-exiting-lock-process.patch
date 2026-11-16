@@ -1,0 +1,245 @@
+From: OPD2413 Maintainer <opd2413@local>
+Date: Mon, 16 Nov 2026 21:10:00 +0800
+Subject: [PATCH] ksldapp: guard SIGUSR1 target pid and retire exiting lock process on fast relock
+
+1. Never call kill(pid, SIGUSR1) with pid <= 0 when lockState() != Unlocked.
+   If m_lockProcess is not running (processId() == 0), kill(0, SIGUSR1)
+   broadcasts SIGUSR1 to the compositor's entire process group, killing
+   kwin_wayland_wrapper. Restart the greeter instead unless emergency mode
+   is active.
+2. Retire any still-exiting QProcess before starting a new greeter, and
+   clear per-instance exit flags on lock(), so a grace-time unlock() ->
+   solidSuspend()/lock() race never fails with 'Process is already running'
+   or leaves Locked state without a greeter.
+---
+diff --git a/ksldapp.cpp b/ksldapp.cpp
+index 2e83b2a..acc74c0 100644
+--- a/ksldapp.cpp
++++ b/ksldapp.cpp
+@@ -155,69 +155,7 @@ void KSldApp::initialize()
+         lock(EstablishLock::Delayed);
+     });
+ 
+-    m_lockProcess = new QProcess();
+-    m_lockProcess->setProcessChannelMode(QProcess::ForwardedErrorChannel);
+-    m_lockProcess->setReadChannel(QProcess::StandardOutput);
+-    auto finishedSignal = static_cast<void (QProcess::*)(int, QProcess::ExitStatus)>(&QProcess::finished);
+-    connect(m_lockProcess, &QProcess::readyRead, this, [this] {
+-        const auto str = QString::fromLocal8Bit(m_lockProcess->readLine());
+-        if (str == QStringLiteral("Unlocked\n")) {
+-            lockProcessRequestedUnlock();
+-        }
+-    });
+-    connect(m_lockProcess, finishedSignal, this, [this](int exitCode, QProcess::ExitStatus exitStatus) {
+-        qCDebug(KSCREENLOCKER) << "Greeter process exitted with status:" << exitStatus << "exit code:" << exitCode;
+-
+-        if (s_lockProcessRequestedExit) {
+-            qCDebug(KSCREENLOCKER) << "Lock process had requested exit; we already did the unlock process elsewhere";
+-            return;
+-        }
+-
+-        if (s_graceTimeKill) {
+-            qCDebug(KSCREENLOCKER) << "screen locker killed due to grace time.";
+-            s_graceTimeKill = false;
+-            s_logindExit = false;
+-            return;
+-        }
+-        const bool regularExit = !exitCode && exitStatus == QProcess::NormalExit;
+-        if (regularExit || s_logindExit) {
+-            // unlock process finished successfully - we can remove the lock grab
+-
+-            if (regularExit) {
+-                qCDebug(KSCREENLOCKER) << "Unlocking now on regular exit.";
+-            } else {
+-                Q_ASSERT(s_logindExit);
+-                qCDebug(KSCREENLOCKER) << "Unlocking anyway since forced through logind.";
+-            }
+-
+-            s_graceTimeKill = false;
+-            s_logindExit = false;
+-            doUnlock();
+-            return;
+-        }
+-
+-        qCWarning(KSCREENLOCKER) << "Greeter process exit unregular. Restarting lock.";
+-
+-        m_greeterCrashedCounter++;
+-        if (m_greeterCrashedCounter < 4) {
+-            // Perhaps it crashed due to a graphics driver issue, force software rendering now
+-            qCDebug(KSCREENLOCKER, "Trying to lock again with software rendering (%d/4).", m_greeterCrashedCounter);
+-            setForceSoftwareRendering(true);
+-            startLockProcess(EstablishLock::Immediate);
+-        } else if (!m_emergencyLockWindow) {
+-            qCWarning(KSCREENLOCKER) << "Everything else failed. Need to put Greeter in emergency mode.";
+-            m_emergencyLockWindow = std::make_unique<EmergencyWindow>();
+-        }
+-    });
+-    connect(m_lockProcess, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
+-        if (error == QProcess::FailedToStart) {
+-            qCDebug(KSCREENLOCKER) << "Greeter Process  failed to start. Trying to directly unlock again.";
+-            doUnlock();
+-            qCCritical(KSCREENLOCKER) << "Greeter Process not available";
+-        } else {
+-            qCWarning(KSCREENLOCKER) << "Greeter Process encountered an unhandled error:" << error << ". Detailed error:" << m_lockProcess->errorString();
+-        }
+-    });
++    setupLockProcess();
+     m_lockedTimer.invalidate();
+     m_graceTimer->setSingleShot(true);
+     connect(m_graceTimer, &QTimer::timeout, this, &KSldApp::endGraceTime);
+@@ -232,7 +170,7 @@ void KSldApp::initialize()
+     });
+     connect(m_logind, &LogindIntegration::requestUnlock, this, [this]() {
+         if (lockState() == Locked) {
+-            if (m_lockProcess->state() != QProcess::NotRunning) {
++            if (m_lockProcess && m_lockProcess->state() != QProcess::NotRunning) {
+                 s_logindExit = true;
+                 m_lockProcess->terminate();
+             } else {
+@@ -324,8 +262,14 @@ void KSldApp::lock(EstablishLock establishLock)
+         // but make sure it's really locked
+         endGraceTime();
+         if (establishLock == EstablishLock::Immediate) {
+-            // signal the greeter to switch to immediateLock mode
+-            kill(m_lockProcess->processId(), SIGUSR1);
++            const qint64 pid = m_lockProcess ? m_lockProcess->processId() : 0;
++            if (pid > 0) {
++                // signal the greeter to switch to immediateLock mode
++                kill(pid, SIGUSR1);
++            } else if (!m_emergencyLockWindow) {
++                qCWarning(KSCREENLOCKER) << "Lock process not running while locked; restarting greeter";
++                startLockProcess(establishLock);
++            }
+         }
+         return;
+     }
+@@ -335,6 +279,8 @@ void KSldApp::lock(EstablishLock establishLock)
+     KNotification::event(QStringLiteral("locked"), i18n("Screen locked"), QPixmap(), KNotification::CloseOnTimeout, QStringLiteral("ksmserver"));
+ 
+     s_lockProcessRequestedExit = false;
++    s_graceTimeKill = false;
++    s_logindExit = false;
+ 
+     m_lockState = Locked;
+     m_lockedTimer.restart();
+@@ -378,10 +324,95 @@ void KSldApp::setWaylandFd(int fd)
+     m_waylandFd = fd;
+ }
+ 
++void KSldApp::setupLockProcess()
++{
++    m_lockProcess = new QProcess();
++    m_lockProcess->setProcessChannelMode(QProcess::ForwardedErrorChannel);
++    m_lockProcess->setReadChannel(QProcess::StandardOutput);
++    auto finishedSignal = static_cast<void (QProcess::*)(int, QProcess::ExitStatus)>(&QProcess::finished);
++    connect(m_lockProcess, &QProcess::readyRead, this, [this] {
++        const auto str = QString::fromLocal8Bit(m_lockProcess->readLine());
++        if (str == QStringLiteral("Unlocked\n")) {
++            lockProcessRequestedUnlock();
++        }
++    });
++    connect(m_lockProcess, finishedSignal, this, [this](int exitCode, QProcess::ExitStatus exitStatus) {
++        qCDebug(KSCREENLOCKER) << "Greeter process exitted with status:" << exitStatus << "exit code:" << exitCode;
++
++        if (s_lockProcessRequestedExit) {
++            qCDebug(KSCREENLOCKER) << "Lock process had requested exit; we already did the unlock process elsewhere";
++            return;
++        }
++
++        if (s_graceTimeKill) {
++            qCDebug(KSCREENLOCKER) << "screen locker killed due to grace time.";
++            s_graceTimeKill = false;
++            s_logindExit = false;
++            return;
++        }
++        const bool regularExit = !exitCode && exitStatus == QProcess::NormalExit;
++        if (regularExit || s_logindExit) {
++            // unlock process finished successfully - we can remove the lock grab
++
++            if (regularExit) {
++                qCDebug(KSCREENLOCKER) << "Unlocking now on regular exit.";
++            } else {
++                Q_ASSERT(s_logindExit);
++                qCDebug(KSCREENLOCKER) << "Unlocking anyway since forced through logind.";
++            }
++
++            s_graceTimeKill = false;
++            s_logindExit = false;
++            doUnlock();
++            return;
++        }
++
++        qCWarning(KSCREENLOCKER) << "Greeter process exit unregular. Restarting lock.";
++
++        m_greeterCrashedCounter++;
++        if (m_greeterCrashedCounter < 4) {
++            // Perhaps it crashed due to a graphics driver issue, force software rendering now
++            qCDebug(KSCREENLOCKER, "Trying to lock again with software rendering (%d/4).", m_greeterCrashedCounter);
++            setForceSoftwareRendering(true);
++            startLockProcess(EstablishLock::Immediate);
++        } else if (!m_emergencyLockWindow) {
++            qCWarning(KSCREENLOCKER) << "Everything else failed. Need to put Greeter in emergency mode.";
++            m_emergencyLockWindow = std::make_unique<EmergencyWindow>();
++        }
++    });
++    connect(m_lockProcess, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
++        if (error == QProcess::FailedToStart) {
++            qCDebug(KSCREENLOCKER) << "Greeter Process  failed to start. Trying to directly unlock again.";
++            doUnlock();
++            qCCritical(KSCREENLOCKER) << "Greeter Process not available";
++        } else {
++            qCWarning(KSCREENLOCKER) << "Greeter Process encountered an unhandled error:" << error << ". Detailed error:" << m_lockProcess->errorString();
++        }
++    });
++}
++
+ void KSldApp::startLockProcess(EstablishLock establishLock)
+ {
+     qCDebug(KSCREENLOCKER) << "Starting lock process with establishLock:" << establishLockToString(establishLock);
+ 
++    if (!m_lockProcess) {
++        setupLockProcess();
++    } else if (m_lockProcess->state() != QProcess::NotRunning) {
++        // A previous greeter process may still be shutting down asynchronously after unlock().
++        // Retire it so a fast unlock->lock cycle neither fails QProcess::start() nor leaks stale exit flags.
++        QProcess *oldProcess = m_lockProcess;
++        oldProcess->disconnect(this);
++        oldProcess->setParent(this);
++        connect(oldProcess, &QProcess::finished, oldProcess, &QObject::deleteLater);
++        connect(oldProcess, &QProcess::errorOccurred, oldProcess, [oldProcess](QProcess::ProcessError err) {
++            if (err == QProcess::FailedToStart) {
++                oldProcess->deleteLater();
++            }
++        });
++        oldProcess->terminate();
++        setupLockProcess();
++    }
++
+     Q_EMIT aboutToStartGreeter();
+ 
+     QProcessEnvironment env = m_greeterEnv;
+@@ -463,8 +494,10 @@ void KSldApp::unlock()
+     if (isGraceTime() || !m_requirePassword) {
+         // the process might take some time to exit; don't wait for that to happen
+         doUnlock();
+-        s_graceTimeKill = true;
+-        m_lockProcess->terminate();
++        if (m_lockProcess && m_lockProcess->state() != QProcess::NotRunning) {
++            s_graceTimeKill = true;
++            m_lockProcess->terminate();
++        }
+     }
+ }
+ 
+diff --git a/ksldapp.h b/ksldapp.h
+index 44cfa55..05e4ca1 100644
+--- a/ksldapp.h
++++ b/ksldapp.h
+@@ -281,6 +281,7 @@ private:
+      *
+      * @param establishLock The type of lock to establish (eg. immediate or delayed).
+      */
++    void setupLockProcess();
+     void startLockProcess(EstablishLock establishLock);
+ 
+     /**

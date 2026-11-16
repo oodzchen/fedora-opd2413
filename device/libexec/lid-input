@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+"""Inhibit lid-covered internal input devices whenever SW_LID is closed.
+
+On OnePlus Pad 2 Pro (OPD2413) with the magnetic pogo keyboard cover, closing
+the folio cover onto the glass can brush NVTCapacitiveTouchScreen or bump the
+pogo keyboard/touchpad right as PowerDevil triggers DPMS Off, causing KWin's
+DpmsInputEventFilter to bounce DPMS back On before panel power-down finishes.
+Writing 1 to /sys/class/input/input*/inhibited while SW_LID=1 drops all events
+from those covered internal devices at the kernel input layer without affecting
+power/volume keys, gpio-keys lid switch, or external USB/Bluetooth peripherals.
+"""
+
+from __future__ import annotations
+
+import errno
+import fcntl
+import os
+import select
+import signal
+import socket
+import struct
+import sys
+from pathlib import Path
+
+INPUT_SYS_DIR = Path("/sys/class/input")
+INHIBIT_NAMES = frozenset(
+    {
+        "NVTCapacitiveTouchScreen",
+        "NVTCapacitivePen",
+        "OnePlus Pad 2 Pro Keyboard",
+        "OnePlus Pad 2 Pro Keyboard Touchpad",
+    }
+)
+
+# <linux/input.h>: struct input_event on 64-bit Linux (timeval + type + code + value)
+INPUT_EVENT_STRUCT = struct.Struct("llHHi")
+EV_SYN = 0x00
+SYN_DROPPED = 0x03
+EV_SW = 0x05
+SW_LID = 0x00
+# _IOR('E', 0x1b, 8): EVIOCGSW(8)
+EVIOCGSW_8 = (2 << 30) | (8 << 16) | (ord("E") << 8) | 0x1B
+
+NETLINK_KOBJECT_UEVENT = 15
+
+
+def log(msg: str) -> None:
+    print(f"opd2413-lid-input: {msg}", flush=True)
+
+
+def find_lid_event_device() -> Path:
+    """Locate the gpio-keys (or SW_LID-capable) /dev/input/eventX device."""
+    candidates: list[Path] = []
+    for entry in sorted(INPUT_SYS_DIR.glob("input*")):
+        if not entry.is_dir():
+            continue
+        name_path = entry / "name"
+        sw_path = entry / "capabilities" / "sw"
+        try:
+            name = name_path.read_text(encoding="utf-8").strip()
+            sw_mask = int(sw_path.read_text(encoding="utf-8").strip(), 16)
+        except (OSError, ValueError):
+            continue
+        if (sw_mask & (1 << SW_LID)) == 0:
+            continue
+        for ev in sorted(entry.glob("event*")):
+            dev = Path("/dev/input") / ev.name
+            if dev.exists():
+                if name == "gpio-keys":
+                    return dev
+                candidates.append(dev)
+    if candidates:
+        return candidates[0]
+    raise FileNotFoundError("No SW_LID input event device found under /sys/class/input")
+
+
+def read_lid_closed(fd: int) -> bool:
+    buf = bytearray(8)
+    fcntl.ioctl(fd, EVIOCGSW_8, buf, True)
+    return bool(buf[0] & (1 << SW_LID))
+
+
+def set_inhibited(inhibited: bool, names: frozenset[str] = INHIBIT_NAMES, sys_dir: Path = INPUT_SYS_DIR) -> list[str]:
+    """Set kernel input inhibited flag (1 or 0) on all matching sysfs input devices."""
+    target = "1" if inhibited else "0"
+    changed: list[str] = []
+    for entry in sorted(sys_dir.glob("input*")):
+        if not entry.is_dir():
+            continue
+        name_path = entry / "name"
+        inh_path = entry / "inhibited"
+        try:
+            name = name_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if name not in names or not inh_path.exists():
+            continue
+        try:
+            cur = inh_path.read_text(encoding="utf-8").strip()
+            if cur != target:
+                inh_path.write_text(f"{target}\n", encoding="utf-8")
+                changed.append(f"{entry.name}({name})={target}")
+        except OSError as err:
+            log(f"failed to update {inh_path}: {err}")
+    return changed
+
+
+def open_uevent_socket() -> socket.socket | None:
+    try:
+        sock = socket.socket(socket.AF_NETLINK, socket.SOCK_DGRAM, NETLINK_KOBJECT_UEVENT)
+        sock.bind((os.getpid(), 1))
+        sock.setblocking(False)
+        return sock
+    except OSError as err:
+        log(f"netlink uevent socket unavailable ({err}); continuing without hotplug rescan")
+        return None
+
+
+def main() -> int:
+    ev_dev = find_lid_event_device()
+    ev_fd = os.open(str(ev_dev), os.O_RDONLY | os.O_NONBLOCK)
+    wake_r, wake_w = os.pipe()
+    os.set_blocking(wake_r, False)
+    os.set_blocking(wake_w, False)
+    nl_sock = open_uevent_socket()
+
+    stopping = False
+
+    def _handle_signal(_signum: int, _frame: object) -> None:
+        nonlocal stopping
+        stopping = True
+        try:
+            os.write(wake_w, b"x")
+        except OSError:
+            pass
+
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+
+    try:
+        lid_closed = read_lid_closed(ev_fd)
+        changed = set_inhibited(lid_closed)
+        log(f"watching {ev_dev} (lid_closed={lid_closed}, updated={changed or 'none'})")
+
+        watch_fds = [ev_fd, wake_r]
+        if nl_sock is not None:
+            watch_fds.append(nl_sock.fileno())
+
+        buf = b""
+        while not stopping:
+            try:
+                readable, _, _ = select.select(watch_fds, [], [])
+            except InterruptedError:
+                continue
+
+            if wake_r in readable:
+                break
+
+            if ev_fd in readable:
+                while True:
+                    try:
+                        chunk = os.read(ev_fd, INPUT_EVENT_STRUCT.size * 32)
+                    except BlockingIOError:
+                        break
+                    except OSError as err:
+                        if err.errno in (errno.EAGAIN, errno.EINTR):
+                            break
+                        raise
+                    if not chunk:
+                        break
+                    buf += chunk
+
+                resync = False
+                while len(buf) >= INPUT_EVENT_STRUCT.size:
+                    _sec, _usec, ev_type, ev_code, ev_val = INPUT_EVENT_STRUCT.unpack_from(buf, 0)
+                    buf = buf[INPUT_EVENT_STRUCT.size :]
+                    if ev_type == EV_SYN and ev_code == SYN_DROPPED:
+                        resync = True
+                    elif ev_type == EV_SW and ev_code == SW_LID:
+                        new_state = bool(ev_val)
+                        if new_state != lid_closed:
+                            lid_closed = new_state
+                            changed = set_inhibited(lid_closed)
+                            log(f"SW_LID={int(lid_closed)} -> {changed or 'no-change'}")
+
+                if resync:
+                    new_state = read_lid_closed(ev_fd)
+                    if new_state != lid_closed:
+                        lid_closed = new_state
+                        changed = set_inhibited(lid_closed)
+                        log(f"SYN_DROPPED resync SW_LID={int(lid_closed)} -> {changed or 'no-change'}")
+
+            if nl_sock is not None and nl_sock.fileno() in readable:
+                reapply = False
+                while True:
+                    try:
+                        msg = nl_sock.recv(4096)
+                    except BlockingIOError:
+                        break
+                    except OSError:
+                        break
+                    if b"SUBSYSTEM=input" in msg and (b"ACTION=add" in msg or b"ACTION=bind" in msg):
+                        reapply = True
+                if reapply and lid_closed:
+                    changed = set_inhibited(True)
+                    if changed:
+                        log(f"hotplug while lid closed -> {changed}")
+    finally:
+        restored = set_inhibited(False)
+        log(f"exiting, restored inhibited=0 ({restored or 'none'})")
+        if nl_sock is not None:
+            nl_sock.close()
+        os.close(ev_fd)
+        os.close(wake_r)
+        os.close(wake_w)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

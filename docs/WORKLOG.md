@@ -2239,5 +2239,65 @@ mpv、Firefox 仍是软解（Fedora `ffmpeg-free` 的专利限制），用户选
      - IPv4 恢复与 IPv6 双栈总耗时：`RFCOMM hello` 后 **`1.251 s`** 平板即接入 `192.168.49.x` IPv4 网络（`18:27:34.442`），**`2.042 s`** 完成全部 `iptables`/`ip6tables`/路由切换进入双栈可用状态（`18:27:35.233`，含首次写入 `/dev/.opdlink_v6nat_ok=0` 与 `p2p0` `dad_transmits=0`）。
   2. **功能与连通复核**：`opd-netshare status` 显示 `State: connected`、`5745 MHz`、`576.4 MBit/s 80MHz HE-MCS 5 NSS 2`；`ping -6 -c 2 2400:3200::1` 返回 `0% packet loss`（`62.5 / 66.0 ms`）；手机端 `helper.sh adb-status` 正常响应，APK 新增的顶部环境栏 `P2P ADB` 开关编译并装机就绪。
 
+### 合盖休眠/唤醒触发 `kwin_wayland` `SIGUSR1` 崩死与 `fcitx5` 失灵根因排查及修复（2026-11-16，离线单测通过，用户态配置已生效，待 `sudo` 安装 `kscreenlocker` RPM 后真机复测）
+
+- **现象与根因定位（证据位置：`journalctl -b -1`、`coredumpctl`、`/lib64/libKScreenLocker.so.6` 反汇编、SRPM `ksldapp.cpp`）：**
+  1. **合盖前先触发宽限期解锁撞上睡眠锁屏**：`~/.config/kscreenlockerrc` 原含 `LockGrace=900`（`900 s`）。`20:29:54` 空闲锁屏启动 `kscreenlocker_greet[84429]`；`20:35:51.835` 合盖时仍在宽限期内，`20:35:51.879` `84429` 报 `The Wayland connection broke`，`64 ms` 后 `20:35:51.943` 收到 `PrepareForSleep(true)` 触发 `KSldApp::lock(EstablishLock::Immediate)`。因旧 `m_lockProcess` 尚未退出，`20:35:52.140` `kwin_wayland[3330]` 报 `QProcess::start: Process is already running`，随后旧进程退出回调命中未清零的 `s_graceTimeKill` 返回，系统在 `m_lockState=Locked` 且 `processId()=0`（无 greeter）的损坏状态进入并退出第一次 `s2idle`。
+  2. **`kill(0, SIGUSR1)` 广播误杀合成器**：`20:37:13.349` 第二次合盖触发 `KSldApp::lock(EstablishLock::Immediate)`，源码直接调用 `kill(m_lockProcess->processId(), SIGUSR1)` 未判 `pid > 0`，实际执行 `kill(0, SIGUSR1)` 击中 `kwin_wayland` 整个进程组。`20:37:13.482` `plasma-kwin_wayland.service` 以 `status=10/USR1` 退出，同组 `fcitx5[3482]` 亦于同毫秒收到信号 `10`/`15` 退出。
+  3. **黑屏卡顿、40 次崩溃弹窗与 `fcitx5` 失灵连锁**：`plasmalogin` 重建 `session-10` 时复用仍存活的 `user@1000.service`（其 `graphical-session.target` 保持 `active` 未停），`xdg-desktop-autostart.target` 早于 `kwin_wayland[88415]` 就绪即并发拉起全部 XDG 自启动程序、`plasma-ksplash.service` 阻塞 `33.244 s`，`20:37:13`–`20:37:31` 累计 `40` 次 `systemd-coredump` 并由 `drkonqi-coredump-launcher` 弹窗；同时 `~/.config/autostart/org.fcitx.Fcitx5.desktop` 抢先于 `20:37:31.205` 占用 `org.fcitx.Fcitx5` D-Bus 名且无 Wayland/X11 连接，导致 `20:37:33.689` KWin 托管拉起的 `fcitx5[88612]` 因 D-Bus 冲突自卸全部插件而失效。
+- **修复预期与判据：**
+  1. 用户态配置：删除冗余 `~/.config/autostart/org.fcitx.Fcitx5.desktop`（仅留 `~/.config/kwinrc` `[Wayland] InputMethod[$e]` 托管），并将 `~/.config/kscreenlockerrc` 的 `LockGrace` 调回 `5` 秒并重载配置。
+  2. `kscreenlocker` 修复打包（`packaging/opd2413-kscreenlocker/`、`tools/build-kscreenlocker-rpm.sh`，补丁 `0001`）：`KSldApp::lock()` 仅在 `pid > 0` 时发 `SIGUSR1`（`pid <= 0` 且非应急窗则重起 greeter），`KSldApp::startLockProcess()` 在 `m_lockProcess->state() != QProcess::NotRunning` 时断开信号并 `deleteLater` 退役旧 `QProcess` 后重建，`lock()` 同步复位 `s_graceTimeKill`/`s_logindExit`，`unlock()`/`requestUnlock` 增加空指针与运行态守卫，不改 `ksldapp.h` ABI 布局（登记 [TECH-DEBT.md](TECH-DEBT.md) `#43`）。
+  3. **判据**：离线确认 `libKScreenLocker.so.6.8.3` 与 `libkwin.so.6` 缺失符号为空、`PASS : KSldTest::testNoKillZeroAndFastRelock()`（`Totals: 3 passed, 0 failed`）在无 Wayland 模拟 `Locked+pid==0` 及宽限期 `unlock()->lock()` 时 `g_gotUsr1==0` 且旧 `QProcess` 退出不破坏新 `Locked` 状态；待在平板执行 `sudo dnf upgrade ./out/rpmbuild/RPMS/aarch64/kscreenlocker-6.8.3-1.fc45.opd2413.1.aarch64.rpm` 并重启会话/系统后，连续合盖休眠、开盖唤醒桌面与 `fcitx5` 输入均正常、`journalctl` 无 `Process is already running` 或 `status=10/USR1`。
+- **当前已完成与离线结果（2026-11-16）：**
+  - 已删除 `~/.config/autostart/org.fcitx.Fcitx5.desktop` 并 `systemctl --user daemon-reload`，确认 `xdg-desktop-autostart.target` `Wants` 不再含 `app-org.fcitx.Fcitx5@autostart.service`；已改 `~/.config/kscreenlockerrc` 为 `LockGrace=5` 并执行 `qdbus-qt6 org.freedesktop.ScreenSaver /ScreenSaver configure`。
+  - `./tools/build-kscreenlocker-rpm.sh --local 1` 于 Fedora 45 `aarch64` 容器成功编出 `out/rpmbuild/RPMS/aarch64/kscreenlocker-6.8.3-1.fc45.opd2413.1.aarch64.rpm`（及 `-devel` / `-debuginfo` / `-debugsource` / `.src.rpm`）；`nm -DC` 核对 `libkwin.so.6` 所需 `KSldApp` 符号零缺失；容器内装入新 RPM 编译运行 `KSldTest::testNoKillZeroAndFastRelock()`（`QT_QPA_PLATFORM=offscreen`）输出 `Totals: 3 passed, 0 failed, 0 skipped`（`317ms`）。
+
+### 平板装入 `kscreenlocker` 修复包并配置「合盖锁屏熄屏 + 10 分钟后休眠」（2026-11-16，已安装与离线验证通过，待重启会话后真机合盖实测）
+
+- **用户需求与策略设计：** 用户确认在平板安装 `kscreenlocker-6.8.3-1.fc45.opd2413.1.aarch64`，并将合盖行为调整为「合盖立即锁屏并熄屏、10 分钟后再进入休眠（短时间合盖再打开无需经历 `s2idle` 唤醒延迟）」。源码确认 KDE PowerDevil 6.8.3 `HandleButtonEvents`（`daemon/actions/bundled/handlebuttonevents.cpp` 与 `dpms.cpp`）仅支持合盖立即执行单一动作：设 `LidAction=64`（`TurnOffScreen`）+ `[Display] LockBeforeTurnOffDisplay=true` 可在合盖时立即调用 `KScreen::Dpms::Off` 熄屏并在 `250 ms`（`dimAnimationTime`）后触发 `org.freedesktop.ScreenSaver Lock` 锁屏，而 PowerDevil 无原生「合盖延迟 N 分钟休眠」配置（若改全局 `AutoSuspendAction=1` 会在开盖挂机或 SSH 跑编译时误睡眠）。
+- **预期与判据：**
+  1. 经 Polkit 授权执行 `pkexec dnf --disablerepo='*' upgrade -y ./out/rpmbuild/RPMS/aarch64/kscreenlocker-6.8.3-1.fc45.opd2413.1.aarch64.rpm` 完成装包，`rpm -q kscreenlocker` 为 `kscreenlocker-6.8.3-1.fc45.opd2413.1.aarch64`。
+  2. 通过 `kwriteconfig6` 对 `powerdevilrc` 的 `AC`/`Battery`/`LowBattery` 均写入 `[Display] LockBeforeTurnOffDisplay=true` 与 `[SuspendAndShutdown] LidAction=64`（保留 `PowerButtonAction=1` 与 `AutoSuspendAction=0`），重启 `plasma-powerdevil.service` 后 `HandleButtonEvents.lidAction()` 返回 `64`。
+  3. 新增 `device/libexec/lid-suspend` 与 `device/systemd/opd2413-lid-suspend.service`（暂用户态部署至 `~/.local/libexec/opd2413-lid-suspend` 与 `~/.config/systemd/user/opd2413-lid-suspend.service`，登记 [TECH-DEBT.md](TECH-DEBT.md) `#44`）：监听 `org.freedesktop.UPower` `LidIsClosed` 与 `login1` `PrepareForSleep`，合盖后启动 `600 s` 单调定时器，开盖或提前进入睡眠则立即取消；`600 s` 到时复查仍合盖且 `HandleButtonEvents.triggersLidAction()` 为真（无外接显示器抑制）后调用 `PowerDevil` `SuspendSession.suspendToRam()` 进 `s2idle`；若系统处于合盖态发生误唤醒并收到 `PrepareForSleep(false)`，则重新计时以便再次入睡。
+  4. **判据**：注销重登或重启整机让 `kwin_wayland` 加载新版 `libKScreenLocker.so.6` 后，实测合盖立即黑屏锁屏、10 分钟内开盖瞬时亮屏解锁（无卡死与崩溃弹窗、`fcitx5` 正常），持续合盖满 10 分钟自动进入 `s2idle`。
+- **实机操作与检验结果（2026-11-16）：**
+  1. 用户经桌面 Polkit 弹窗授权后 `pkexec dnf --disablerepo='*' upgrade -y` 成功完成事务，`rpm -q kscreenlocker` 返回 `kscreenlocker-6.8.3-1.fc45.opd2413.1.aarch64`。
+  2. `~/.config/powerdevilrc` 更新并执行 `systemctl --user restart plasma-powerdevil.service` 后，`qdbus-qt6 org.kde.Solid.PowerManagement /org/kde/Solid/PowerManagement/Actions/HandleButtonEvents lidAction` 返回 `64`。
+  3. `systemctl --user enable --now opd2413-lid-suspend.service` 后服务为 `active (running)`（日志 `watching lid events (delay=600s, lid currently open)`、零警告）；离线单元测试 `LidSuspendWatcher(delay_sec=1, dry_run=True)` 验证 `get_lid_closed()==False`、`triggers_lid_action()==True`、合盖起表/开盖撤表、`PrepareForSleep(true)` 撤表及超时触发 `trigger_suspend` 均通过（`LID_SUSPEND_TEST_PASS`）。
+
+### 修复合盖瞬间保护套误触回醒 DPMS 致合盖不熄屏及人脸识别 `"lid-closed"` 失败锁死（2026-11-16，已部署并离线验证通过，待真机合盖复测）
+
+- **复测问题与根因定位（证据位置：`journalctl -b` `21:31:48`–`21:33:17`、`libkwin.so.6` 反汇编、`LockScreenUi.qml`、`opd2413-faced`）：**
+  1. 重启后用户实测 4 轮合盖/开盖：`21:32:39` 与 `21:32:51` 两轮正常触发 `[nt36536] panel_unpreparing` + `nvt_ts_suspend` 熄屏并在开盖时由 `pam_opd2413_face` 解锁；但 `21:32:24` 与 `21:33:08` 两轮**未出现 `panel_unpreparing`**，且同秒 `kwin_wayland` 打印数十条 `Detected a touch move that never has been down, discarding` 后由 `unix_chkpwd` 密码解锁。
+  2. 反汇编确认 `KWin::DpmsInputEventFilter` 的 `pointerMotion`/`pointerButton`/`keyboardKey` 及双击 `touchUp` 会调用 `notify()` -> `Workspace::requestDpmsState(On)` 而不校验合盖状态；合盖瞬间保护套触碰玻璃或触控板/键盘微动在 DRM 完成 `panel_unpreparing` 前把 `DPMS Off` 弹回 `On`（`touchDown` 被吞而唤醒后的 `touchMotion` 报错）。
+  3. 屏幕未灭且触摸/键盘仍活跃导致 `kscreenlocker_greet` 在 `350 ms`（`pressReadyTimer`）后被合盖接触触发 `uiVisible=true` 与 `FaceBridge.armScan()`（将 `faceTriedThisOpen` 置 `true`）；`opd2413-faced` 校验 `login1.LidClosed==True` 直接返回 `failed("lid-closed")`，致使开盖后锁屏仍停留在失败态。
+- **修复预期与判据：**
+  1. 新增 `device/libexec/lid-input` 与 `device/systemd/opd2413-lid-input.service`（已直装为 `/usr/libexec/opd2413/lid-input` 与 `/etc/systemd/system/opd2413-lid-input.service`）：监听 `gpio-keys`（`SW_LID`）及 `NETLINK_KOBJECT_UEVENT` 热插拔，在 `SW_LID=1` 时向内置受盖遮挡输入设备（`NVTCapacitiveTouchScreen`、`NVTCapacitivePen`、`OnePlus Pad 2 Pro Keyboard`、`OnePlus Pad 2 Pro Keyboard Touchpad`）的 `/sys/class/input/input*/inhibited` 写 `1`，开盖或进程退出时恢复 `0`。
+  2. 在 `device/libexec/lid-suspend` 增加 `+350 ms` / `+900 ms` DPMS 复核守卫：若持续合盖且无外接屏抑制期间 `/sys/class/drm/card*-DSI-*/dpms` 仍为 `On`，自动补发 `kscreen-doctor --dpms off`。
+  3. 在 `packaging/opd2413-face/data/lockscreen/LockScreenUi.qml`（并同步直装至 `/usr/share/opd2413-face/lockscreen/` 与 `/usr/local/share/plasma/shells/org.kde.plasma.desktop/contents/lockscreen/`）增加 `onFaceStateChanged` 兜底：若出现 `faceState==="failed" && lastReason==="lid-closed"`，延迟归位 `faceTriedThisOpen=false` 与 `uiVisible=false`，避免开盖后停在失败态（已并记入 [TECH-DEBT.md](TECH-DEBT.md) `#44`）。
+- **已验证结果（2026-11-16）：**
+  - 离线模拟 sysfs 目录验证 `lid-input`（`find_lid_event_device()==/dev/input/event4`、仅对 4 个内置受盖设备写入 `inhibited=1/0`、`pmic_pwrkey` 与外接 USB 鼠标不受影响）及 `lid-suspend` `+350 ms`/`+900 ms` DPMS 守卫均通过（`LID_INPUT_AND_SUSPEND_TESTS_PASS`）；`opd2413-lid-input.service`（`active (running)`）与 `opd2413-lid-suspend.service`（`active (running)`）均无报错运行。
+
+### 复测「偶发开盖未亮屏」定位与 `lid-suspend` Wayland DPMS 状态校验修正（2026-11-16，已部署并离线验证通过）
+
+- **日志排查（证据位置：`journalctl -b` `21:45:31`–`21:47:11`）：**
+  1. `opd2413-lid-input.service` 上线后连续 10+ 轮合盖均正常执行 `[nt36536] panel_unpreparing` 与 `nvt_ts_suspend`，**全程零条 `Detected a touch move` 与零次 `unix_chkpwd` 密码回退**，人脸认证在开盖后全数通过。
+  2. 但用户在 `~1–2 s` 内快速合盖/开盖（如 `21:45:42 -> 21:45:43`、`21:45:59 -> 21:46:01`、`21:46:34 -> 21:46:35`）时出现了 `21:46:01` 开盖无 `panel_prepared`、以及 `21:45:43 -> 21:45:48` / `21:46:35 -> 21:46:39` 延迟 `4–5 s` 才亮屏。
+  3. 原因：`/sys/class/drm/card0-DSI-1/dpms` 在 `drm/msm` 下即使已执行 `panel_unpreparing` 仍固定显示 `On`，导致 `lid-suspend` 误以为面板未熄而在每次合盖 `+350 ms` / `+900 ms` 都强行触发 `kscreen-doctor --dpms off`；若用户在 `+1 s` 前后开盖，在途异步的 `--dpms off` 会与 KWin `switchEvent` 亮屏竞态，在开盖瞬间把屏幕重新关掉。
+- **修复与验证：**
+  - 将 `device/libexec/lid-suspend`（已同步至 `~/.local/libexec/opd2413-lid-suspend` 并重启 `opd2413-lid-suspend.service`）改为解析 `kscreen-doctor --dpms show` 查询 KWin 实际 Wayland DPMS 状态（实测耗时 `~30 ms`）；合盖仅在 `+400 ms`/`+1000 ms` 仍为 `on` 时补发 `--dpms off`，并新增开盖后 `+250 ms` 复查（若仍为 `off` 则自动补发 `kscreen-doctor --dpms on`）。
+  - `DPMS_WAYLAND_GUARD_PASS` 离线测试验证 `get_kwin_dpms_state()=="on"` 闭合守卫（`['off', 'off']`）与 `"off"` 开盖唤醒守卫（`['on']`）均通过，待用户快/慢速合盖开盖复测确认。
+
+### 修复「开盖停留锁屏未解锁再合盖重开」残留人脸失败提示（`opd2413-face 0.1-11`，2026-11-16，已装机与离线测试通过）
+
+- **用户定位的场景与源码根因（`LockScreenUi.qml`、`facebridge.cpp`、`opd2413-faced.py`）：**
+  1. 开盖后停留在锁屏未解锁（`faceScanDelayTimer` 已触发且 `faceTriedThisOpen=true`，处于扫描中或已以 `no-face`/`timeout` 结束并维持 `uiVisible=true`），随后直接合盖时 `kscreenlocker_greet` 保持存活且未监听合盖/DPMS 事件：`uiVisible` 与 `faceTriedThisOpen` 未归零，且运行中的相机扫描继续在黑盒内超时失败。
+  2. 再次开盖后 `uiVisible` 与 `faceTriedThisOpen` 仍为上次失败状态，界面直接提示人脸识别失败而不自动重扫。
+- **修复内容与打包验证：**
+  1. `packaging/opd2413-face/src/qml/facebridge.{h,cpp}`：新增 `FaceBridge.lidClosed` 属性（订阅系统总线 `org.freedesktop.UPower` `PropertiesChanged` 并在构造时异步拉取 `LidIsClosed`）。
+  2. `packaging/opd2413-face/src/opd2413-faced.py`：订阅 `UPower` `LidIsClosed`，合盖瞬间若正在识别立即 `active_cancel.set()` 释放摄像头并按 `lid-closed` 结束，避免在黑盖后空转 3.5 s。
+  3. `packaging/opd2413-face/data/lockscreen/LockScreenUi.qml`：新增 `onLidClosedChanged`：合盖（`lidClosed===true`）立即停表、归零 `faceTriedThisOpen=false`、`uiVisible=false` 并 `FaceBridge.resetState()`；开盖（`lidClosed===false`）时在未解锁态复位 `faceTriedThisOpen=false` 与状态，主动展示锁屏提示并在 `260 ms` 后自动拉起新一轮人脸识别（`armScan()` 也增加 `!FaceBridge.lidClosed` 守卫）。
+  4. `./tools/build-face-rpm.sh --local 0.1 11` 编出 `out/rpmbuild/RPMS/aarch64/opd2413-face-0.1-11.fc45.aarch64.rpm` 并经 `pkexec dnf upgrade -y` 装机及重启 `opd2413-face.service`（`active`）；`cmp -s` 确认 `/usr/local/share/plasma/.../LockScreenUi.qml` 已随 `%posttrans` 更新一致，`PySide6` 离线 QML 加载验证 `FaceBridge.lidClosed===false` 通过（`FACEBRIDGE_QML_OK`）；并同步将 `TECH-DEBT #44` 中的 `opd2413-face` 直装项清除。待用户实测「开盖未解锁→合盖→再开盖」闭环确认。
 
 

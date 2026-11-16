@@ -298,6 +298,25 @@ class FaceDaemon:
             self._on_name_owner_changed,
         )
 
+        self.lid_watch_sub = self.bus.signal_subscribe(
+            "org.freedesktop.UPower",
+            "org.freedesktop.DBus.Properties",
+            "PropertiesChanged",
+            "/org/freedesktop/UPower",
+            "org.freedesktop.UPower",
+            Gio.DBusSignalFlags.NONE,
+            self._on_upower_props_changed,
+        )
+
+    def _on_upower_props_changed(self, _conn, _sender, _path, _iface, _signal, params):
+        iface_name, changed, _invalidated = params.unpack()
+        if iface_name != "org.freedesktop.UPower" or "LidIsClosed" not in changed:
+            return
+        if bool(changed["LidIsClosed"]) and self.cfg.get("reject_when_lid_closed", True):
+            with self.op_lock:
+                if self.active_cancel is not None:
+                    self.active_cancel.set()
+
     def _on_name_owner_changed(self, _conn, _sender, _path, _iface, _signal, params):
         _name, old_owner, new_owner = params.unpack()
         if old_owner and not new_owner:
@@ -707,7 +726,11 @@ class FaceDaemon:
             else:
                 reason = state["last_fail"] if loop_reason == "timeout" else loop_reason
                 if reason == "cancelled":
-                    self._emit_status("idle", "cancelled")
+                    if self._is_lid_closed():
+                        reason = "lid-closed"
+                        self._emit_status("failed", reason)
+                    else:
+                        self._emit_status("idle", "cancelled")
                 else:
                     self._emit_status("failed", reason)
             self.last_reason = reason

@@ -14,6 +14,7 @@ class FaceBridge : public QObject
     Q_PROPERTY(QString faceState READ faceState NOTIFY faceStateChanged)
     Q_PROPERTY(QString lastReason READ lastReason NOTIFY lastReasonChanged)
     Q_PROPERTY(bool busy READ busy NOTIFY busyChanged)
+    Q_PROPERTY(bool lidClosed READ lidClosed NOTIFY lidClosedChanged)
 
 public:
     explicit FaceBridge(QObject *parent = nullptr);
@@ -23,6 +24,7 @@ public:
     QString faceState() const { return m_faceState; }
     QString lastReason() const { return m_lastReason; }
     bool busy() const { return m_busy; }
+    bool lidClosed() const { return m_lidClosed; }
 
     Q_INVOKABLE void setLockscreenMode(bool controlled, bool armed);
     Q_INVOKABLE void armScan();
@@ -34,13 +36,17 @@ Q_SIGNALS:
     void faceStateChanged();
     void lastReasonChanged();
     void busyChanged();
+    void lidClosedChanged();
     void scanArmed();
 
 private Q_SLOTS:
     void onStatusChanged(const QString &state, const QString &detail);
+    void onUPowerPropertiesChanged(const QString &iface, const QVariantMap &changed, const QStringList &invalidated);
 
 private:
     void setStateInternal(const QString &state, const QString &reason);
+    void setLidClosedInternal(bool closed);
+    void refreshLidClosed();
 
     QString m_username;
     bool m_enrolled = false;
@@ -48,6 +54,7 @@ private:
     QString m_faceState = QStringLiteral("ready");
     QString m_lastReason;
     bool m_busy = false;
+    bool m_lidClosed = false;
 };
 
 class Opd2413FacePlugin : public QQmlExtensionPlugin
