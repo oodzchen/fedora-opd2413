@@ -113,3 +113,6 @@
 
 # M3.4b camera rear autofocus fix: cn3927 settle delay, regulator load, sensor runtime PM link
 2435-media-i2c-cn3927-fix-power-up-delay-load-and-runtime-pm.patch
+
+# Pogo touchpad palm reporting (MT_TOOL_PALM) and heartbeat release fix
+2436-Input-oneplus-pogo-keyboard-report-palm-and-fix-touchpad.patch

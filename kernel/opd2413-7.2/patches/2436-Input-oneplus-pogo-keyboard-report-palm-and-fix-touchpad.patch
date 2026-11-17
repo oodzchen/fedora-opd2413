@@ -1,0 +1,139 @@
+From d3bf342b44d99961a2f8b3a828314450fa6e1fdc Mon Sep 17 00:00:00 2001
+From: Kholin <oodzchen@gmail.com>
+Date: Tue, 17 Nov 2026 13:23:00 +0800
+Subject: [PATCH] Input: oneplus-pogo-keyboard - report palm tool type and fix
+ heartbeat touch release
+
+Active touchpad slots carry the IC confidence bit in slot[0] bit 0: 1 for
+a confident finger contact and 0 when the IC classifies the contact as
+a palm (0x02 in the low two bits, matching ColorOS oplus_bsp_pogo_keyboard).
+Register ABS_MT_TOOL_TYPE and report MT_TOOL_PALM when bit 0 is clear so
+libinput uses PALM_TOOL_PALM instead of letting multifinger un-palm edge
+contacts during Ctrl + tap.
+
+In addition, pogo_kb_rx_sync() previously called pogo_kb_release_touches()
+unconditionally on every ~1 s keepalive heartbeat (0x2f 0x05), chopping
+ongoing drags and taps with a synthetic release. Only release stale active
+contacts on heartbeat when a UART frame/CRC error occurred and no valid
+touchpad report has arrived for 250 ms.
+
+Co-Authored-By: Antigravity <noreply@deepmind.google>
+---
+ .../input/keyboard/oneplus-pogo-keyboard.c    | 34 +++++++++++++++----
+ 1 file changed, 28 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/input/keyboard/oneplus-pogo-keyboard.c b/drivers/input/keyboard/oneplus-pogo-keyboard.c
+index 00d7b65..cba04f5 100644
+--- a/drivers/input/keyboard/oneplus-pogo-keyboard.c
++++ b/drivers/input/keyboard/oneplus-pogo-keyboard.c
+@@ -274,6 +274,8 @@ struct pogo_kb {
+ 	DECLARE_BITMAP(fn_keys, ARRAY_SIZE(pogo_kb_fn_keys));
+ 	DECLARE_BITMAP(fn_media, ARRAY_SIZE(pogo_kb_media_keys));
+ 	bool touching;
++	unsigned long last_tp_rx;
++	bool tp_rx_err;
+ 	bool caps_on;
+ 
+ 	u8 xfer_cmd;
+@@ -441,10 +443,10 @@ static void pogo_kb_report_media(struct pogo_kb *kb, const u8 *data, u8 len)
+ }
+ 
+ /*
+- * data: one five byte slot per contact (id << 4 | down << 1 | flag, x and y
++ * data: one five byte slot per contact (id << 4 | down << 1 | finger, x and y
+  * as little endian 16 bit values), then the number of slots, then the button
+- * byte.  The low bit of the first slot byte is not understood yet and is
+- * ignored.
++ * byte.  For active contacts, bit 0 is set for a confident finger touch and
++ * cleared when the touchpad IC classifies the contact as a palm.
+  */
+ static void pogo_kb_report_touchpad(struct pogo_kb *kb, const u8 *data, u8 len)
+ {
+@@ -465,12 +467,14 @@ static void pogo_kb_report_touchpad(struct pogo_kb *kb, const u8 *data, u8 len)
+ 		const u8 *slot = &data[i * POGO_KB_TP_SLOT_LEN];
+ 		unsigned int id = slot[0] >> 4;
+ 		bool down = slot[0] & BIT(1);
++		unsigned int tool = (slot[0] & BIT(0)) ? MT_TOOL_FINGER
++						       : MT_TOOL_PALM;
+ 
+ 		if (id >= POGO_KB_TP_SLOTS)
+ 			continue;
+ 
+ 		input_mt_slot(input, id);
+-		if (input_mt_report_slot_state(input, MT_TOOL_FINGER, down)) {
++		if (input_mt_report_slot_state(input, tool, down)) {
+ 			input_report_abs(input, ABS_MT_POSITION_X,
+ 					 get_unaligned_le16(&slot[1]));
+ 			input_report_abs(input, ABS_MT_POSITION_Y,
+@@ -481,6 +485,8 @@ static void pogo_kb_report_touchpad(struct pogo_kb *kb, const u8 *data, u8 len)
+ 	for (i = 0; i < POGO_KB_TP_SLOTS; i++)
+ 		touching |= input_mt_is_active(&input->mt->slots[i]);
+ 	kb->touching = touching;
++	kb->last_tp_rx = jiffies;
++	kb->tp_rx_err = false;
+ 
+ 	input_mt_sync_frame(input);
+ 	/* A clickpad: either physical button is the one button */
+@@ -552,8 +558,16 @@ static void pogo_kb_rx_sync(struct pogo_kb *kb, const u8 *data, u8 len)
+ 
+ 	kb->heartbeat_seen = true;
+ 
+-	/* Like the vendor driver, end any contact still open on a heartbeat */
+-	pogo_kb_release_touches(kb);
++	/*
++	 * End contacts left open after a malformed UART frame once touchpad
++	 * reports stop arriving, without tearing down live touches on routine
++	 * 1 s keepalive heartbeats.
++	 */
++	if (kb->touching && kb->tp_rx_err &&
++	    time_after(jiffies, kb->last_tp_rx + msecs_to_jiffies(250))) {
++		kb->tp_rx_err = false;
++		pogo_kb_release_touches(kb);
++	}
+ 
+ 	if (!!(data[2] & POGO_KB_STATUS_CAPSLOCK) != READ_ONCE(kb->caps_on) &&
+ 	    time_after(jiffies, READ_ONCE(kb->led_sent) +
+@@ -570,11 +584,15 @@ static void pogo_kb_rx_frame(struct pogo_kb *kb, const u8 *frame, unsigned int l
+ 
+ 	if (trailer[2] != POGO_KB_END || trailer[3] != POGO_KB_SYNC_TAIL ||
+ 	    trailer[4] != POGO_KB_SYNC_TAIL) {
++		if (kb->touching)
++			kb->tp_rx_err = true;
+ 		dev_dbg_ratelimited(kb->dev, "frame without end code\n");
+ 		return;
+ 	}
+ 
+ 	if (pogo_kb_crc16(frame, POGO_KB_HDR_LEN + data_len) != crc) {
++		if (kb->touching)
++			kb->tp_rx_err = true;
+ 		dev_dbg_ratelimited(kb->dev, "CRC error, command %#x\n", cmd);
+ 		return;
+ 	}
+@@ -854,6 +872,7 @@ static int pogo_kb_register_inputs(struct pogo_kb *kb, u8 brand)
+ 	input_set_abs_params(tp, ABS_MT_POSITION_Y, 0, POGO_KB_TP_Y_MAX, 0, 0);
+ 	input_abs_set_res(tp, ABS_MT_POSITION_X, POGO_KB_TP_RES);
+ 	input_abs_set_res(tp, ABS_MT_POSITION_Y, POGO_KB_TP_RES);
++	input_set_abs_params(tp, ABS_MT_TOOL_TYPE, 0, MT_TOOL_MAX, 0, 0);
+ 	input_set_capability(tp, EV_KEY, BTN_LEFT);
+ 	__set_bit(INPUT_PROP_BUTTONPAD, tp->propbit);
+ 
+@@ -877,6 +896,8 @@ static int pogo_kb_register_inputs(struct pogo_kb *kb, u8 brand)
+ 	memset(kb->media, 0, sizeof(kb->media));
+ 	kb->fn = false;
+ 	kb->touching = false;
++	kb->last_tp_rx = 0;
++	kb->tp_rx_err = false;
+ 	kb->kbd = kbd;
+ 	kb->tp = tp;
+ 	spin_unlock(&kb->rx_lock);
+@@ -988,6 +1009,7 @@ static void pogo_kb_power_up(struct pogo_kb *kb)
+ 	kb->rx_sync = 0;
+ 	kb->heartbeat_seen = false;
+ 	kb->wake_pending = false;
++	kb->tp_rx_err = false;
+ 	spin_unlock(&kb->rx_lock);
+ 
+ 	ret = regulator_enable(kb->vdd);
+-- 
+2.56.1
+
