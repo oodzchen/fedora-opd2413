@@ -35,9 +35,12 @@ SFACE_MODEL = MODEL_DIR / "face_recognition_sface_2021dec.onnx"
 
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 LOCKSCREEN_SERVICES = frozenset({"kde-face", "kde-fingerprint"})
+POLKIT_SERVICES = frozenset({"polkit-1"})
 # Must exceed kscreenlocker_greet's 2000ms fast-failure breaker while leaving headroom
 # under pam_opd2413_face's D-Bus call timeout (+6000ms slack).
 LOCKSCREEN_IDLE_WAIT_S = 2.3
+# Polkit arm token is single-use and short-lived so a clicked button cannot linger.
+POLKIT_ARM_TTL_S = 8.0
 
 # Linux <linux/dma-buf.h>: _IOW('b', 0, __u64) = 0x40086200
 DMA_BUF_IOCTL_SYNC = 0x40086200
@@ -85,6 +88,15 @@ INTROSPECTION_XML = """
       <arg type='b' name='controlled' direction='in'/>
       <arg type='b' name='armed' direction='in'/>
       <arg type='b' name='ok' direction='out'/>
+    </method>
+    <method name='SetPolkitArmed'>
+      <arg type='s' name='username' direction='in'/>
+      <arg type='b' name='armed' direction='in'/>
+      <arg type='b' name='ok' direction='out'/>
+    </method>
+    <method name='IsPolkitArmed'>
+      <arg type='s' name='username' direction='in'/>
+      <arg type='b' name='armed' direction='out'/>
     </method>
     <signal name='StatusChanged'>
       <arg type='s' name='state'/>
@@ -263,7 +275,9 @@ class FaceDaemon:
         self.active_cancel = None
         self.active_user = None
         self.active_service = None
+        self.active_polkit_owner = None
         self.lock_gates = {}
+        self.polkit_arms = {}
         self.waiting_cancels = {}
 
         DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -322,7 +336,7 @@ class FaceDaemon:
         if old_owner and not new_owner:
             with self.op_lock:
                 woke = False
-                if old_owner == self.active_sender and self.active_cancel is not None:
+                if old_owner in (self.active_sender, self.active_polkit_owner) and self.active_cancel is not None:
                     self.active_cancel.set()
                 wait_evt = self.waiting_cancels.get(old_owner)
                 if wait_evt is not None:
@@ -331,6 +345,10 @@ class FaceDaemon:
                 stale = [u for u, g in self.lock_gates.items() if g.get("owner") == old_owner]
                 for u in stale:
                     del self.lock_gates[u]
+                    woke = True
+                stale_polkit = [u for u, g in self.polkit_arms.items() if g.get("owner") == old_owner]
+                for u in stale_polkit:
+                    del self.polkit_arms[u]
                     woke = True
                 if woke:
                     self.op_cond.notify_all()
@@ -635,9 +653,19 @@ class FaceDaemon:
             if self.waiting_cancels.get(sender) is cancel_event:
                 del self.waiting_cancels[sender]
 
+    def _is_polkit_armed_locked(self, username: str) -> bool:
+        arm = self.polkit_arms.get(username)
+        if not arm:
+            return False
+        if time.monotonic() > arm.get("armed_until", 0.0):
+            del self.polkit_arms[username]
+            return False
+        return True
+
     def _do_verify(self, username: str, service: str, timeout_ms: int,
                    sender: str, invocation: Gio.DBusMethodInvocation):
         cancel_event = threading.Event()
+        polkit_owner = None
         with self.op_lock:
             self.cfg = load_config()
             if service in LOCKSCREEN_SERVICES:
@@ -646,24 +674,31 @@ class FaceDaemon:
                     GLib.idle_add(self._reply_verify, invocation, False, wait_res, 0.0)
                     return
 
+            if service in POLKIT_SERVICES:
+                if not self._is_polkit_armed_locked(username):
+                    GLib.idle_add(self._reply_verify, invocation, False, "polkit-unarmed", 0.0)
+                    return
+                arm = self.polkit_arms.pop(username, None)
+                polkit_owner = arm.get("owner") if arm else None
+
             if self.busy and self.active_cancel is not None and self.active_cancel.is_set():
                 self.op_cond.wait_for(lambda: not self.busy, timeout=0.9)
 
             if self.busy:
-                if service in LOCKSCREEN_SERVICES:
+                if service in LOCKSCREEN_SERVICES or service in POLKIT_SERVICES:
                     self._emit_status("failed", "busy")
                 GLib.idle_add(self._reply_verify, invocation, False, "busy", 0.0)
                 return
 
             tmpls = self._load_templates(username)
             if not tmpls:
-                if service in LOCKSCREEN_SERVICES:
+                if service in LOCKSCREEN_SERVICES or service in POLKIT_SERVICES:
                     self._emit_status("failed", "not-enrolled")
                 GLib.idle_add(self._reply_verify, invocation, False, "not-enrolled", 0.0)
                 return
 
             if self._is_lid_closed():
-                if service in LOCKSCREEN_SERVICES:
+                if service in LOCKSCREEN_SERVICES or service in POLKIT_SERVICES:
                     self._emit_status("failed", "lid-closed")
                 GLib.idle_add(self._reply_verify, invocation, False, "lid-closed", 0.0)
                 return
@@ -674,6 +709,7 @@ class FaceDaemon:
             self.active_cancel = cancel_event
             self.active_user = username
             self.active_service = service
+            self.active_polkit_owner = polkit_owner if service in POLKIT_SERVICES else None
             self._emit_status("scanning", service)
 
         state = {
@@ -717,6 +753,7 @@ class FaceDaemon:
             self.active_cancel = None
             self.active_user = None
             self.active_service = None
+            self.active_polkit_owner = None
             if state["matched"]:
                 reason = f"matched:{state['best_score']:.3f}"
                 self._emit_status("matched", f"{state['best_score']:.3f}")
@@ -899,6 +936,38 @@ class FaceDaemon:
                     self.lock_gates.pop(username, None)
                 self.op_cond.notify_all()
             invocation.return_value(GLib.Variant("(b)", (True,)))
+            return
+
+        if method == "SetPolkitArmed":
+            username, armed = params.unpack()
+            pw = validate_username(username)
+            if pw is None or (caller_uid != 0 and caller_uid != pw.pw_uid):
+                invocation.return_value(GLib.Variant("(b)", (False,)))
+                return
+            with self.op_lock:
+                if armed:
+                    self.polkit_arms[username] = {
+                        "owner": sender,
+                        "armed_until": time.monotonic() + POLKIT_ARM_TTL_S,
+                    }
+                else:
+                    self.polkit_arms.pop(username, None)
+                    if self.busy and self.active_user == username and self.active_service in POLKIT_SERVICES:
+                        if self.active_cancel is not None:
+                            self.active_cancel.set()
+                self.op_cond.notify_all()
+            invocation.return_value(GLib.Variant("(b)", (True,)))
+            return
+
+        if method == "IsPolkitArmed":
+            username = params.unpack()[0]
+            pw = validate_username(username)
+            if pw is None or (caller_uid != 0 and caller_uid != pw.pw_uid):
+                invocation.return_value(GLib.Variant("(b)", (False,)))
+                return
+            with self.op_lock:
+                armed = self._is_polkit_armed_locked(username)
+            invocation.return_value(GLib.Variant("(b)", (armed,)))
             return
 
         invocation.return_dbus_error(

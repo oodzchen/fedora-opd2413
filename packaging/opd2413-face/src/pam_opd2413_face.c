@@ -68,7 +68,8 @@ static bool is_remote_session(pam_handle_t *pamh)
 	       has_nonempty_env(pamh, "SSH_TTY");
 }
 
-static int bus_has_enrolled(sd_bus *bus, const char *user, bool *enrolled)
+static int bus_query_user_bool(sd_bus *bus, const char *method, const char *user,
+			       bool *out)
 {
 	sd_bus_error error = SD_BUS_ERROR_NULL;
 	sd_bus_message *call = NULL;
@@ -76,10 +77,10 @@ static int bus_has_enrolled(sd_bus *bus, const char *user, bool *enrolled)
 	int val = 0;
 	int r;
 
-	*enrolled = false;
+	*out = false;
 	r = sd_bus_message_new_method_call(bus, &call, FACE_BUS_NAME,
 					   FACE_BUS_PATH, FACE_BUS_IFACE,
-					   "HasEnrolled");
+					   method);
 	if (r < 0)
 		goto out;
 
@@ -93,7 +94,7 @@ static int bus_has_enrolled(sd_bus *bus, const char *user, bool *enrolled)
 
 	r = sd_bus_message_read(reply, "b", &val);
 	if (r >= 0)
-		*enrolled = (val != 0);
+		*out = (val != 0);
 
 out:
 	sd_bus_error_free(&error);
@@ -186,7 +187,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
 		return PAM_IGNORE;
 	}
 
-	r = bus_has_enrolled(bus, user, &enrolled);
+	r = bus_query_user_bool(bus, "HasEnrolled", user, &enrolled);
 	if (r < 0 || !enrolled) {
 		if (opts.debug && r < 0)
 			pam_syslog(pamh, LOG_DEBUG, "HasEnrolled failed: %s",
@@ -195,7 +196,20 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
 		return PAM_IGNORE;
 	}
 
-	if (!opts.quiet)
+	const bool is_polkit = (strcmp(service, "polkit-1") == 0);
+	if (is_polkit) {
+		bool polkit_armed = false;
+		r = bus_query_user_bool(bus, "IsPolkitArmed", user, &polkit_armed);
+		if (r < 0 || !polkit_armed) {
+			if (opts.debug && r < 0)
+				pam_syslog(pamh, LOG_DEBUG, "IsPolkitArmed failed: %s",
+					   strerror(-r));
+			sd_bus_flush_close_unref(bus);
+			return PAM_IGNORE;
+		}
+	}
+
+	if (!opts.quiet && !is_polkit)
 		pam_info(pamh, "Verifying face...");
 
 	r = bus_verify(bus, user, service, opts.timeout_ms,
@@ -217,6 +231,9 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
 	if (opts.debug)
 		pam_syslog(pamh, LOG_DEBUG, "Face not matched for %s (%s): %s",
 			   user, service, reason);
+
+	if (strcmp(reason, "polkit-unarmed") == 0)
+		return PAM_IGNORE;
 
 	if (strcmp(reason, "not-enrolled") == 0)
 		return PAM_AUTHINFO_UNAVAIL;

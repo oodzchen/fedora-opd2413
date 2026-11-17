@@ -2359,3 +2359,24 @@ mpv、Firefox 仍是软解（Fedora `ffmpeg-free` 的专利限制），用户选
   4. **设为默认启动项（2026-11-17，经用户确认执行）**：经用户确认仅写入 ESP `loader.conf` 后，通过 `pkexec /usr/libexec/opd2413/boot-select default fedora-7.2.15-30.opd2413.conf && sync` 固化默认引导项；核验 `/boot/efi/loader/loader.conf` 为 `default fedora-7.2.15-30.opd2413.conf`，`boot-select status` 显示 `booted_entry: "fedora-7.2.15-30.opd2413.conf"`、`loader_default: "fedora-7.2.15-30.opd2413.conf"`、`pending_next: null`、`kshim_remembered: "Fedora"`，`/boot/efi/KSHIM.CHO` 写前后 SHA-256 完全一致且保持 `1 extent`（`16384 B`），`loader/entries/` 保留 `fedora-7.2.15-{28,29,30}.opd2413.conf`（ESP `370M / 512M`，剩余 `143M`）；常规冷启动走默认项可于下次断电重启时一并复核。
 
 
+
+### Polkit 授权弹窗显式“开始人脸识别”确认机制（`opd2413-face-0.1-12` + `polkit-kde-6.8.3-1.fc45.opd2413.1`）
+
+- **问题根因：** `authselect` 配置 `opd2413-face` 在 `system-auth` 中先于 `pam_unix.so` 调用 `pam_opd2413_face.so`，而 `polkit-kde-authentication-agent-1` 弹出授权框时立即执行 `Session::initiate()`（`PAM_SERVICE=polkit-1`），导致尚未看清授权动作即在后台完成人脸比对并直接放行。
+- **方案与改动：**
+  1. **服务端与 PAM 门控（`packaging/opd2413-face`）**：在 `opd2413-faced`（[opd2413-faced.py](../packaging/opd2413-face/src/opd2413-faced.py)）与 [org.opd2413.Face1.conf](../packaging/opd2413-face/data/org.opd2413.Face1.conf) 新增 `SetPolkitArmed(username, armed)` / `IsPolkitArmed(username)` 接口；`service == "polkit-1"` 默认拦截（`polkit-unarmed`），仅当收到显式单次放行令牌（`POLKIT_ARM_TTL_S = 8.0`，`Verify` 启动时原子消费）才开启前摄识别。[pam_opd2413_face.c](../packaging/opd2413-face/src/pam_opd2413_face.c) 在 `polkit-1` 未放行时静默返回 `PAM_IGNORE`（不发 `Verifying face...`，直接交由 `pam_unix.so` 等待密码输入）。锁屏（`kde-fingerprint`）与终端 `sudo` 保持原有行为不变。
+  2. **Polkit 弹窗确认按钮（`packaging/opd2413-polkit-kde`）**：新增下游补丁 [0001-add-explicit-face-recognition-confirmation-button.patch](../packaging/opd2413-polkit-kde/patches/0001-add-explicit-face-recognition-confirmation-button.patch)、[polkit-kde.spec](../packaging/opd2413-polkit-kde/polkit-kde.spec) 与 [build-polkit-kde-rpm.sh](../tools/build-polkit-kde-rpm.sh)。弹窗打开后不触发扫脸，检测到用户已录入人脸时显示 `Start Face Recognition` 按钮（支持随时直接输入密码）；点击按钮后调用 `SetPolkitArmed(user, true)` 并重启当前 `PolkitQt1::Agent::Session` 触发人脸识别；识别失败后可点击 `Retry Face Recognition` 或直接输入密码，点击 `Cancel`/切换用户/合盖均正确解除放行并取消相机扫描。
+- **离线构建与预期/判据（待用户确认装包后真机验收）：**
+  - 已在平板本地容器完成编译：`out/rpmbuild/RPMS/aarch64/opd2413-face-0.1-12.fc45.aarch64.rpm` 与 `out/rpmbuild/RPMS/aarch64/polkit-kde-6.8.3-1.fc45.opd2413.1.aarch64.rpm`。
+  - **预期与判据：**
+    1. 安装上述两包并重启 `opd2413-face.service` 与用户级 `plasma-polkit-agent.service` 后，运行 `pkexec id`（或图形提权操作）弹出授权窗口时，不自动调用摄像头/不自动解锁，可先查看请求动作与 `Details`，并可见 `Start Face Recognition` 按钮与密码输入框；
+    2. 在弹窗未点按钮时直接输入密码可正常授权；
+    3. 点击 `Start Face Recognition` 后按钮切换为 `Scanning Face…`，正对前摄即完成识别并授权放行；遮挡摄像头超时或失败后保留密码输入与 `Retry Face Recognition` 按钮，且 `Cancel` 能立即中止扫描；
+    4. 终端 `sudo` 与锁屏人脸解锁仍按原有方式正常工作；SELinux `Enforcing` 无新增 AVC 拒绝。
+- **实机验证结果（2026-11-17，真机通过）：**
+  1. **装包与服务重启**：经 `pkexec dnf --disablerepo="*" upgrade -y` 装入 `opd2413-face-0.1-12.fc45.aarch64` 与 `polkit-kde-6.8.3-1.fc45.opd2413.1.aarch64`（`rpm -V opd2413-face polkit-kde` 零输出通过）；`opd2413-face.service`（`PID 191533`）与用户级 `plasma-polkit-agent.service`（`PID 191846`）均 `active (running)`。`gdbus` 查询确认 `HasEnrolled("colin") = true`、`IsPolkitArmed("colin") = false`。
+  2. **显式点击确认验收（`pkexec id`）**：
+     - `22:22:30` 触发 `pkexec id` 弹出新版 `QuickAuthDialog.qml`，在随后 9 秒停留期间未触发人脸扫描与自动授权（用户有充足时间查看动作内容）；
+     - `22:22:39` 用户点击 **Start Face Recognition** 后，`polkit-agent-helper-1[192249]` 记录 `pam_opd2413_face(polkit-1:auth): Face authenticated user colin (polkit-1)`，审核日志 `grantors=pam_opd2413_face res=success`，`pkexec id` 返回 `uid=0(root)`；
+     - 验证完成后复查 `IsPolkitArmed("colin") = false`（单次令牌已原子消费并复位）。
+  3. **整机健康度**：`getenforce = Enforcing`、相关时段 journal 零 `avc: denied`、`systemctl is-system-running = running`、`systemctl --failed` 为 `0 loaded units listed`。

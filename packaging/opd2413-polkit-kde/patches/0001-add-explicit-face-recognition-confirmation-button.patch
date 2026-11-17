@@ -1,0 +1,566 @@
+diff --git a/QuickAuthDialog.cpp b/QuickAuthDialog.cpp
+index ca430b1..6d1107a 100644
+--- a/QuickAuthDialog.cpp
++++ b/QuickAuthDialog.cpp
+@@ -71,6 +71,7 @@ QuickAuthDialog::QuickAuthDialog(const QString &actionId,
+     connect(m_theDialog, SIGNAL(accept()), this, SIGNAL(okClicked()));
+     connect(m_theDialog, SIGNAL(reject()), this, SIGNAL(rejected()));
+     connect(m_theDialog, SIGNAL(userSelected()), this, SIGNAL(userSelected()));
++    connect(m_theDialog, SIGNAL(faceRequested()), this, SIGNAL(faceAuthRequested()));
+ }
+ 
+ enum KirigamiInlineMessageTypes { Information = 0, Positive = 1, Warning = 2, Error = 3 };
+@@ -97,6 +98,29 @@ void QuickAuthDialog::showInfo(const QString &message)
+     m_theDialog->setProperty("inlineMessageText", message);
+ }
+ 
++void QuickAuthDialog::clearInlineMessage()
++{
++    m_theDialog->setProperty("inlineMessageText", QString());
++}
++
++void QuickAuthDialog::setFaceAvailable(bool available)
++{
++    m_theDialog->setProperty("faceAvailable", available);
++}
++
++void QuickAuthDialog::setFaceScanning(bool scanning)
++{
++    m_theDialog->setProperty("faceScanning", scanning);
++}
++
++void QuickAuthDialog::setFaceFailed(bool failed, const QString &message)
++{
++    m_theDialog->setProperty("faceFailed", failed);
++    if (!message.isEmpty()) {
++        showError(message);
++    }
++}
++
+ PolkitQt1::Identity QuickAuthDialog::adminUserSelected() const
+ {
+     return PolkitQt1::Identity::fromString(m_theDialog->property("selectedIdentity").toString());
+diff --git a/QuickAuthDialog.h b/QuickAuthDialog.h
+index 51a1e23..2f2cdfc 100644
+--- a/QuickAuthDialog.h
++++ b/QuickAuthDialog.h
+@@ -30,6 +30,10 @@ public:
+     QString password() const;
+     void showError(const QString &message);
+     void showInfo(const QString &message);
++    void clearInlineMessage();
++    void setFaceAvailable(bool available);
++    void setFaceScanning(bool scanning);
++    void setFaceFailed(bool failed, const QString &message = QString());
+     void authenticationFailure();
+     void show();
+     void hide();
+@@ -39,6 +43,7 @@ Q_SIGNALS:
+     void okClicked();
+     void rejected();
+     void userSelected();
++    void faceAuthRequested();
+ 
+ private:
+     QWindow *m_theDialog = nullptr;
+diff --git a/policykitlistener.cpp b/policykitlistener.cpp
+index 0fc8b51..f52d432 100644
+--- a/policykitlistener.cpp
++++ b/policykitlistener.cpp
+@@ -6,6 +6,10 @@
+ */
+ 
+ #include <QDBusConnection>
++#include <QDBusMessage>
++#include <QDBusPendingCall>
++#include <QDBusPendingCallWatcher>
++#include <QDBusPendingReply>
+ #include <QDebug>
+ #include <QGuiApplication>
+ #include <QQmlEngine>
+@@ -41,11 +45,19 @@ PolicyKitListener::PolicyKitListener(QObject *parent)
+     qmlRegisterType<IdentitiesModel>("org.kde.polkitkde", 1, 0, "IdentitiesModel");
+     qmlRegisterUncreatableType<PolkitQt1::ActionDescription>("org.kde.polkitkde", 1, 0, "ActionDescription", "nope!");
+ 
++    QDBusConnection::systemBus().connect(QStringLiteral("org.opd2413.Face1"),
++                                         QStringLiteral("/org/opd2413/Face1"),
++                                         QStringLiteral("org.opd2413.Face1"),
++                                         QStringLiteral("StatusChanged"),
++                                         this,
++                                         SLOT(onFaceStatusChanged(QString, QString)));
++
+     qDebug() << "Listener online";
+ }
+ 
+ PolicyKitListener::~PolicyKitListener()
+ {
++    disarmFaceAuth();
+ }
+ 
+ void PolicyKitListener::setWIdForAction(const QString &action, qulonglong wID)
+@@ -114,6 +126,7 @@ void PolicyKitListener::initiateAuthentication(const QString &actionId,
+     connect(m_dialog.data(), SIGNAL(okClicked()), SLOT(dialogAccepted()));
+     connect(m_dialog.data(), SIGNAL(rejected()), SLOT(dialogCanceled()));
+     connect(m_dialog.data(), SIGNAL(userSelected()), SLOT(userSelected()));
++    connect(m_dialog.data(), SIGNAL(faceAuthRequested()), SLOT(startFaceAuth()));
+ 
+     m_dialog->show();
+ 
+@@ -127,6 +140,12 @@ void PolicyKitListener::initiateAuthentication(const QString &actionId,
+         m_selectedUser = m_dialog.data()->adminUserSelected();
+     }
+ 
++    ++m_authSeq;
++    m_faceScanning = false;
++    m_expectingFaceStatus = false;
++    m_armedUser.clear();
++    refreshFaceAvailability();
++
+     m_numTries = 0;
+     tryAgain();
+ }
+@@ -179,6 +198,10 @@ void PolicyKitListener::finishObtainPrivilege()
+     }
+ 
+     if (!m_gainedAuthorization && !m_wasCancelled && !m_dialog.isNull()) {
++        m_faceScanning = false;
++        m_expectingFaceStatus = false;
++        disarmFaceAuth();
++        m_dialog.data()->setFaceScanning(false);
+         m_dialog.data()->authenticationFailure();
+ 
+         if (m_numTries < 3) {
+@@ -189,6 +212,11 @@ void PolicyKitListener::finishObtainPrivilege()
+         }
+     }
+ 
++    ++m_authSeq;
++    m_faceScanning = false;
++    m_expectingFaceStatus = false;
++    disarmFaceAuth();
++
+     if (!m_session.isNull()) {
+         m_session.data()->result()->setCompleted();
+         m_session.data()->deleteLater();
+@@ -223,6 +251,12 @@ void PolicyKitListener::cancelAuthentication()
+ void PolicyKitListener::request(const QString &request, bool echo)
+ {
+     qDebug() << "Request: " << request << " echo: " << echo;
++    if (m_faceScanning) {
++        m_faceScanning = false;
++        if (!m_dialog.isNull()) {
++            m_dialog.data()->setFaceScanning(false);
++        }
++    }
+     if (!m_dialog.isNull()) {
+         m_dialog.data()->request(request, echo);
+     }
+@@ -257,6 +291,10 @@ void PolicyKitListener::dialogAccepted()
+ {
+     qDebug() << "Dialog accepted";
+ 
++    if (m_faceScanning) {
++        return;
++    }
++
+     if (!m_session.isNull() && !m_dialog.isNull()) {
+         m_session.data()->setResponse(m_dialog.data()->password());
+     }
+@@ -266,6 +304,11 @@ void PolicyKitListener::dialogCanceled()
+ {
+     qDebug() << "Dialog cancelled";
+ 
++    ++m_authSeq;
++    m_faceScanning = false;
++    m_expectingFaceStatus = false;
++    disarmFaceAuth();
++
+     m_wasCancelled = true;
+     if (!m_session.isNull()) {
+         m_session.data()->cancel();
+@@ -276,7 +319,13 @@ void PolicyKitListener::dialogCanceled()
+ 
+ void PolicyKitListener::userSelected()
+ {
++    ++m_authSeq;
++    m_faceScanning = false;
++    m_expectingFaceStatus = false;
++    disarmFaceAuth();
++
+     m_selectedUser = m_dialog.data()->adminUserSelected();
++    refreshFaceAvailability();
+     // If some user is selected we must destroy existing session
+     if (!m_session.isNull()) {
+         m_session.data()->deleteLater();
+@@ -284,4 +333,179 @@ void PolicyKitListener::userSelected()
+     tryAgain();
+ }
+ 
++namespace {
++
++QDBusMessage createFaceMethodCall(const QString &method)
++{
++    return QDBusMessage::createMethodCall(QStringLiteral("org.opd2413.Face1"),
++                                          QStringLiteral("/org/opd2413/Face1"),
++                                          QStringLiteral("org.opd2413.Face1"),
++                                          method);
++}
++
++} // namespace
++
++QString PolicyKitListener::selectedUsername() const
++{
++    if (!m_selectedUser.isValid()) {
++        return {};
++    }
++    QString idStr = m_selectedUser.toString();
++    if (idStr.startsWith(QLatin1String("unix-user:"))) {
++        return idStr.mid(10);
++    }
++    return idStr;
++}
++
++void PolicyKitListener::disarmFaceAuth()
++{
++    if (m_armedUser.isEmpty()) {
++        return;
++    }
++    QDBusMessage msg = createFaceMethodCall(QStringLiteral("SetPolkitArmed"));
++    msg << m_armedUser << false;
++    m_armedUser.clear();
++    QDBusConnection::systemBus().asyncCall(msg, 1500);
++}
++
++void PolicyKitListener::refreshFaceAvailability()
++{
++    if (m_dialog.isNull()) {
++        return;
++    }
++    m_dialog.data()->setFaceAvailable(false);
++    m_dialog.data()->setFaceScanning(false);
++    m_dialog.data()->setFaceFailed(false);
++
++    const QString username = selectedUsername();
++    if (username.isEmpty()) {
++        return;
++    }
++
++    const quint64 seq = m_authSeq;
++    QDBusMessage msg = createFaceMethodCall(QStringLiteral("HasEnrolled"));
++    msg << username;
++    QDBusPendingCall call = QDBusConnection::systemBus().asyncCall(msg, 1200);
++    auto *watcher = new QDBusPendingCallWatcher(call, this);
++    connect(watcher, &QDBusPendingCallWatcher::finished, this, [this, seq](QDBusPendingCallWatcher *w) {
++        QDBusPendingReply<bool> reply(*w);
++        const bool enrolled = !reply.isError() && reply.value();
++        w->deleteLater();
++        if (!m_inProgress || m_dialog.isNull() || seq != m_authSeq) {
++            return;
++        }
++        m_dialog.data()->setFaceAvailable(enrolled);
++    });
++}
++
++void PolicyKitListener::startFaceAuth()
++{
++    if (!m_inProgress || m_dialog.isNull() || !m_selectedUser.isValid() || m_faceScanning) {
++        return;
++    }
++    const QString username = selectedUsername();
++    if (username.isEmpty()) {
++        return;
++    }
++
++    m_faceScanning = true;
++    m_expectingFaceStatus = true;
++    m_armedUser = username;
++    m_dialog.data()->setFaceFailed(false);
++    m_dialog.data()->setFaceScanning(true);
++    m_dialog.data()->showInfo(i18n("Look at the camera to verify your face…"));
++
++    const quint64 seq = m_authSeq;
++    QDBusMessage msg = createFaceMethodCall(QStringLiteral("SetPolkitArmed"));
++    msg << username << true;
++    QDBusPendingCall call = QDBusConnection::systemBus().asyncCall(msg, 1500);
++    auto *watcher = new QDBusPendingCallWatcher(call, this);
++    connect(watcher, &QDBusPendingCallWatcher::finished, this, [this, seq, username](QDBusPendingCallWatcher *w) {
++        QDBusPendingReply<bool> reply(*w);
++        const bool ok = !reply.isError() && reply.value();
++        w->deleteLater();
++
++        if (!m_inProgress || m_dialog.isNull() || seq != m_authSeq || !m_faceScanning) {
++            if (ok) {
++                QDBusMessage disarm = createFaceMethodCall(QStringLiteral("SetPolkitArmed"));
++                disarm << username << false;
++                QDBusConnection::systemBus().asyncCall(disarm, 1500);
++            }
++            return;
++        }
++
++        if (!ok) {
++            m_faceScanning = false;
++            m_expectingFaceStatus = false;
++            m_armedUser.clear();
++            m_dialog.data()->setFaceScanning(false);
++            m_dialog.data()->setFaceFailed(true, i18n("Face recognition service is unavailable. Please enter your password."));
++            return;
++        }
++
++        if (!m_session.isNull()) {
++            disconnect(m_session.data(), nullptr, this, nullptr);
++            m_session.data()->cancel();
++            m_session.data()->deleteLater();
++            m_session.clear();
++        }
++        tryAgain();
++    });
++}
++
++void PolicyKitListener::onFaceStatusChanged(const QString &state, const QString &detail)
++{
++    if (!m_inProgress || m_dialog.isNull()) {
++        return;
++    }
++    if (!m_expectingFaceStatus && !m_faceScanning) {
++        return;
++    }
++
++    if (state == QLatin1String("scanning")) {
++        if (detail == QLatin1String("polkit-1")) {
++            m_faceScanning = true;
++            m_dialog.data()->setFaceScanning(true);
++        }
++        return;
++    }
++
++    if (state == QLatin1String("matched")) {
++        m_faceScanning = false;
++        m_expectingFaceStatus = false;
++        m_armedUser.clear();
++        m_dialog.data()->setFaceScanning(false);
++        m_dialog.data()->showInfo(i18n("Face recognized, completing authorization…"));
++        return;
++    }
++
++    if (state == QLatin1String("failed") || state == QLatin1String("idle")) {
++        m_faceScanning = false;
++        m_expectingFaceStatus = false;
++        m_armedUser.clear();
++        m_dialog.data()->setFaceScanning(false);
++
++        if (state == QLatin1String("idle")) {
++            return;
++        }
++
++        if (detail == QLatin1String("cancelled")) {
++            m_dialog.data()->clearInlineMessage();
++            return;
++        }
++
++        QString msg;
++        if (detail == QLatin1String("lid-closed")) {
++            msg = i18n("Lid is closed. Open the lid to retry face recognition, or enter your password.");
++        } else if (detail == QLatin1String("busy")) {
++            msg = i18n("Camera is busy. Click Retry Face Recognition or enter your password.");
++        } else if (detail == QLatin1String("timeout") || detail == QLatin1String("no-face")) {
++            msg = i18n("Face not detected. Click Retry Face Recognition or enter your password.");
++        } else {
++            msg = i18n("Face verification failed. Click Retry Face Recognition or enter your password.");
++        }
++        m_dialog.data()->setFaceFailed(true, msg);
++    }
++}
++
+ #include "moc_policykitlistener.cpp"
+diff --git a/policykitlistener.h b/policykitlistener.h
+index 339cf52..01c6ed5 100644
+--- a/policykitlistener.h
++++ b/policykitlistener.h
+@@ -63,14 +63,24 @@ private:
+     QHash<QString /*action*/, QString /*window handle*/> m_windowHandles;
+     QHash<QString /*action*/, QString /*activation token*/> m_activationTokens;
+ 
++    quint64 m_authSeq = 0;
++    bool m_faceScanning = false;
++    bool m_expectingFaceStatus = false;
++    QString m_armedUser;
++
+ private Q_SLOTS:
+     void dialogAccepted();
+     void dialogCanceled();
+     void userSelected();
++    void startFaceAuth();
++    void onFaceStatusChanged(const QString &state, const QString &detail);
+ 
+ private:
+     void handleParentWindow(const QString &action, const QString &handle);
+     void handleWaylandActivation(const QString &action, const QString &token);
++    QString selectedUsername() const;
++    void refreshFaceAvailability();
++    void disarmFaceAuth();
+ };
+ 
+ #endif
+diff --git a/qml/MediacenterQuickAuthDialog.qml b/qml/MediacenterQuickAuthDialog.qml
+index 6ceeb1a..839b023 100644
+--- a/qml/MediacenterQuickAuthDialog.qml
++++ b/qml/MediacenterQuickAuthDialog.qml
+@@ -25,6 +25,9 @@ Window {
+     property alias selectedIdentity: identitiesCombo.currentValue
+ 
+     property bool waitingForAuthentication: false
++    property bool faceAvailable: false
++    property bool faceScanning: false
++    property bool faceFailed: false
+ 
+     // passed in by QuickAuthDialog.cpp
+     property alias mainText: dialogHeading.text
+@@ -36,6 +39,7 @@ Window {
+     signal accept()
+     signal reject()
+     signal userSelected()
++    signal faceRequested()
+ 
+     onSelectedIdentityChanged: userSelected()
+ 
+diff --git a/qml/MobileQuickAuthDialog.qml b/qml/MobileQuickAuthDialog.qml
+index 93c9c8a..2a56a17 100644
+--- a/qml/MobileQuickAuthDialog.qml
++++ b/qml/MobileQuickAuthDialog.qml
+@@ -24,6 +24,10 @@ MobileDialogWindow {
+     property alias identitiesCurrentIndex: identitiesCombo.currentIndex
+     property alias selectedIdentity: identitiesCombo.currentValue
+ 
++    property bool faceAvailable: false
++    property bool faceScanning: false
++    property bool faceFailed: false
++
+     // passed in by QuickAuthDialog.cpp
+     property string mainText
+     property string subtitle
+@@ -35,8 +39,13 @@ MobileDialogWindow {
+     signal accept()
+     signal reject()
+     signal userSelected()
++    signal faceRequested()
+ 
+-    onSelectedIdentityChanged: userSelected()
++    onSelectedIdentityChanged: {
++        faceFailed = false;
++        faceScanning = false;
++        userSelected();
++    }
+ 
+     onAccept: {
+         // disable password field while password is being checked
+@@ -161,12 +170,26 @@ MobileDialogWindow {
+ 
+         Kirigami.PasswordField {
+             id: passwordField
+-            Layout.bottomMargin: Kirigami.Units.largeSpacing
++            Layout.bottomMargin: root.faceAvailable ? Kirigami.Units.smallSpacing : Kirigami.Units.largeSpacing
+             Layout.fillWidth: true
++            enabled: !root.faceScanning
+             onAccepted: root.accept()
+             placeholderText: i18n("Password…")
+         }
+ 
++        QQC2.Button {
++            id: faceAuthButton
++            Layout.fillWidth: true
++            Layout.bottomMargin: Kirigami.Units.largeSpacing
++            visible: root.faceAvailable
++            enabled: !root.faceScanning
++            icon.name: "edit-image-face-recognize"
++            text: root.faceScanning
++                ? i18n("Scanning Face…")
++                : (root.faceFailed ? i18n("Retry Face Recognition") : i18n("Start Face Recognition"))
++            onClicked: root.faceRequested()
++        }
++
+         RowLayout {
+             Layout.fillWidth: true
+ 
+@@ -184,6 +207,7 @@ MobileDialogWindow {
+             QQC2.Button {
+                 text: i18n("OK")
+                 icon.name: "dialog-ok"
++                enabled: !root.faceScanning
+                 onClicked: root.accept()
+             }
+ 
+diff --git a/qml/QuickAuthDialog.qml b/qml/QuickAuthDialog.qml
+index 283b9c2..8ccd3c2 100644
+--- a/qml/QuickAuthDialog.qml
++++ b/qml/QuickAuthDialog.qml
+@@ -31,6 +31,9 @@ Kirigami.AbstractApplicationWindow {
+     property alias selectedIdentity: identitiesCombo.currentValue
+ 
+     property bool waitingForAuthentication: false
++    property bool faceAvailable: false
++    property bool faceScanning: false
++    property bool faceFailed: false
+ 
+     // passed in by QuickAuthDialog.cpp
+     property string mainText
+@@ -43,8 +46,19 @@ Kirigami.AbstractApplicationWindow {
+     signal accept()
+     signal reject()
+     signal userSelected()
++    signal faceRequested()
+ 
+-    onSelectedIdentityChanged: userSelected()
++    onSelectedIdentityChanged: {
++        faceFailed = false;
++        faceScanning = false;
++        userSelected();
++    }
++
++    onFaceScanningChanged: {
++        if (!faceScanning && visible) {
++            passwordField.forceActiveFocus();
++        }
++    }
+ 
+     onAccept: {
+         waitingForAuthentication = true;
+@@ -180,6 +194,7 @@ Kirigami.AbstractApplicationWindow {
+                         id: switchButton
+                         text: i18n("Switch…")
+                         visible: identitiesCombo.count > 1
++                        enabled: !root.faceScanning
+                         onClicked: {
+                             identitiesCombo.popup.parent = switchButton;
+                             identitiesCombo.popup.open();
+@@ -197,10 +212,23 @@ Kirigami.AbstractApplicationWindow {
+                 Kirigami.PasswordField {
+                     id: passwordField
+                     Layout.fillWidth: true
++                    enabled: !root.waitingForAuthentication && !root.faceScanning
+                     onAccepted: root.accept()
+                     placeholderText: i18n("Password…")
+                 }
+ 
++                QQC2.Button {
++                    id: faceAuthButton
++                    Layout.fillWidth: true
++                    visible: root.faceAvailable
++                    enabled: !root.waitingForAuthentication && !root.faceScanning
++                    icon.name: "edit-image-face-recognize"
++                    text: root.faceScanning
++                        ? i18n("Scanning Face…")
++                        : (root.faceFailed ? i18n("Retry Face Recognition") : i18n("Start Face Recognition"))
++                    onClicked: root.faceRequested()
++                }
++
+                 RowLayout {
+                     id: passwordRow
+                     Layout.fillWidth: true
+@@ -221,6 +249,7 @@ Kirigami.AbstractApplicationWindow {
+                     QQC2.Button {
+                         text: i18n("OK")
+                         icon.name: "dialog-ok"
++                        enabled: !root.waitingForAuthentication && !root.faceScanning
+                         onClicked: root.accept()
+                     }
+ 

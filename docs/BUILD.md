@@ -12,6 +12,7 @@
 | `tools/build-netshare-rpm.sh` | `opd2413-netshare` | 宿主机 | `noarch` Python/systemd 包 |
 | `tools/build-camera-rpm.sh` | `opd2413-camera` | **平板原生（默认）** | 传 `--local` 退回宿主机 `arm64` 容器 |
 | `tools/build-face-rpm.sh` | `opd2413-face` | **平板原生（默认）** | 传 `--local` 退回宿主机 `arm64` 容器 |
+| `tools/build-polkit-kde-rpm.sh` | `polkit-kde` | **平板原生（默认）** | 传 `--local` 退回宿主机 `arm64` 容器 |
 | `tools/build-libcamera-rpm.sh` | `libcamera*` / `python3-libcamera` | **平板原生（默认）** | 支持 `REUSE_BUILD=1` 复用编译树及 `--local` |
 | `tools/build-sensors-rpm.sh` | `opd2413-sensors` | **平板原生（默认）** | 传 `--local` 退回宿主机 `arm64` 容器 |
 

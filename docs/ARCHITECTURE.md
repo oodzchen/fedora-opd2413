@@ -122,6 +122,7 @@ Fedora 是在运行中的 Armada 里装进新子卷的（没有重新 mkfs），
 | `opd2413-libcamera` | 定制 `libcamera` / `python3-libcamera`（含 Adreno 830 GPU ISP 着色器/调校与 simple 管线 ZSL 双流适配） | 设备 / 媒体 |
 | `opd2413-camera` | 原生 `PySide6` 双流 ZSL 多帧 RAW10 HDR+ 相机 GUI（`opd-camera`）与命令行工具（`opd-camera-cli`） | 桌面应用 |
 | `opd2413-face` | 锁屏/PAM/polkit 人脸认证守护进程与 Qt 录入向导 | 设备 / 安全 |
+| `opd2413-polkit-kde` | 带“开始人脸识别”显式确认按钮的 `polkit-kde` 下游补丁包 | 桌面 / 安全 |
 | `opd2413-netshare` | 跨设备 BLE + 5 GHz P2P 自动网络共享服务与托盘界面 | 设备 / 网络 |
 | `opd2413-desktop` | KDE 默认值：缩放、电源键与合盖行为、屏幕键盘 | 桌面策略 |
 | `opd2413-mesa`（仅在需要时） | 带补丁的 Mesa。先验证 Fedora 45 自带的 26.2.6 能否驱动 Adreno 830 | 设备 |
