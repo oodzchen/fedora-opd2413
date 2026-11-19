@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+"""opd-power — fanless SM8750 power, GPU clock, thermal & bypass-charging tool
+for the OnePlus Pad 2 Pro (OPD2413) running Fedora.
+
+Passive-cooling design rule:
+  Never pin Oryon Prime cores (policy6) to the 'performance' governor. On
+  fanless SM8750 tablets, pinning Prime cores saturates the thermal envelope
+  and triggers GPU throttling, yielding lower sustained FPS than schedutil.
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Any
+
+# qcom_battmgr enforces a ~55 % minimum stop threshold on SM8750.
+CHARGE_FLOOR = 55
+PROFILES = ("silent", "balanced", "sustained", "performance")
+
+
+class Sysfs:
+    def __init__(self, root: str = "/"):
+        self.root = Path(root)
+
+    def path(self, abs_path: str) -> Path:
+        return self.root / abs_path.lstrip("/")
+
+    def glob(self, pattern: str) -> list[Path]:
+        return [Path(p) for p in sorted(glob.glob(str(self.path(pattern))))]
+
+    def read(self, p: Path | str, default: str = "") -> str:
+        target = p if isinstance(p, Path) else self.path(p)
+        try:
+            return target.read_text(encoding="utf-8").strip()
+        except OSError:
+            return default
+
+    def write(self, p: Path | str, value: Any) -> None:
+        target = p if isinstance(p, Path) else self.path(p)
+        target.write_text(str(value), encoding="utf-8")
+
+
+def require_root_if_real(sysfs_root: str) -> None:
+    if sysfs_root == "/" and os.geteuid() != 0:
+        sys.stderr.write("opd-power: root privileges required (run via: pkexec opd-power ...)\n")
+        sys.exit(1)
+
+
+def find_gpu_devfreq(sf: Sysfs) -> Path | None:
+    for d in sf.glob("/sys/class/devfreq/*"):
+        if "3d00000.gpu" in d.name or "gpu" in d.name:
+            return d
+    return None
+
+
+def find_battery(sf: Sysfs) -> Path | None:
+    for b in sf.glob("/sys/class/power_supply/*"):
+        if sf.read(b / "type") == "Battery":
+            return b
+    return None
+
+
+def collect_status(sf: Sysfs) -> dict[str, Any]:
+    cpus = []
+    for pol in sf.glob("/sys/devices/system/cpu/cpufreq/policy*"):
+        cpus.append({
+            "policy": pol.name,
+            "cpus": sf.read(pol / "related_cpus"),
+            "governor": sf.read(pol / "scaling_governor"),
+            "cur_khz": int(sf.read(pol / "scaling_cur_freq", "0") or 0),
+            "min_khz": int(sf.read(pol / "scaling_min_freq", "0") or 0),
+            "max_khz": int(sf.read(pol / "scaling_max_freq", "0") or 0),
+            "hw_max_khz": int(sf.read(pol / "cpuinfo_max_freq", "0") or 0),
+            "rate_limit_us": sf.read(pol / "schedutil/rate_limit_us"),
+        })
+
+    cpuidle = {
+        "current": sf.read("/sys/devices/system/cpu/cpuidle/current_governor"),
+        "available": sf.read("/sys/devices/system/cpu/cpuidle/available_governors").split(),
+    }
+
+    gpu_dir = find_gpu_devfreq(sf)
+    gpu: dict[str, Any] = {}
+    if gpu_dir:
+        avail = sorted(int(x) for x in sf.read(gpu_dir / "available_frequencies").split() if x.isdigit())
+        gpu = {
+            "device": gpu_dir.name,
+            "governor": sf.read(gpu_dir / "governor"),
+            "polling_interval_ms": int(sf.read(gpu_dir / "polling_interval", "0") or 0),
+            "cur_mhz": int(sf.read(gpu_dir / "cur_freq", "0") or 0) // 1_000_000,
+            "min_mhz": int(sf.read(gpu_dir / "min_freq", "0") or 0) // 1_000_000,
+            "max_mhz": int(sf.read(gpu_dir / "max_freq", "0") or 0) // 1_000_000,
+            "available_mhz": [f // 1_000_000 for f in avail],
+        }
+
+    temps: dict[str, float] = {}
+    cpu_hot = (-100.0, "")
+    gpu_hot = (-100.0, "")
+    for z in sf.glob("/sys/class/thermal/thermal_zone*"):
+        tname = sf.read(z / "type")
+        raw = sf.read(z / "temp")
+        try:
+            c = int(raw) / 1000.0
+        except ValueError:
+            continue
+        if not (-20.0 <= c <= 150.0):
+            continue
+        if tname.startswith(("cpu-", "cpuss")) and c > cpu_hot[0]:
+            cpu_hot = (c, tname)
+        elif tname.startswith("gpuss") and c > gpu_hot[0]:
+            gpu_hot = (c, tname)
+        elif tname in ("ddr-thermal", "xo-thermal", "skin-thermal"):
+            temps[tname] = round(c, 1)
+    if cpu_hot[1]:
+        temps["cpu_max"] = round(cpu_hot[0], 1)
+        temps["cpu_max_zone"] = cpu_hot[1]  # type: ignore[assignment]
+    if gpu_hot[1]:
+        temps["gpu_max"] = round(gpu_hot[0], 1)
+        temps["gpu_max_zone"] = gpu_hot[1]  # type: ignore[assignment]
+
+    batt_dir = find_battery(sf)
+    battery: dict[str, Any] = {}
+    if batt_dir:
+        v_uv = int(sf.read(batt_dir / "voltage_now", "0") or 0)
+        i_ua = int(sf.read(batt_dir / "current_now", "0") or 0)
+        start_thr = sf.read(batt_dir / "charge_control_start_threshold")
+        end_thr = sf.read(batt_dir / "charge_control_end_threshold")
+        battery = {
+            "device": batt_dir.name,
+            "status": sf.read(batt_dir / "status"),
+            "capacity_pct": int(sf.read(batt_dir / "capacity", "0") or 0),
+            "voltage_v": round(v_uv / 1_000_000.0, 3),
+            "current_ma": round(i_ua / 1000.0, 1),
+            "power_w": round((v_uv / 1_000_000.0) * (i_ua / 1_000_000.0), 2),
+            "charge_start_pct": int(start_thr) if start_thr.isdigit() else None,
+            "charge_end_pct": int(end_thr) if end_thr.isdigit() else None,
+        }
+
+    sysctl = {
+        "sched_util_clamp_min_rt_default": sf.read("/proc/sys/kernel/sched_util_clamp_min_rt_default"),
+        "swappiness": sf.read("/proc/sys/vm/swappiness"),
+        "dirty_bytes": sf.read("/proc/sys/vm/dirty_bytes"),
+        "dirty_background_bytes": sf.read("/proc/sys/vm/dirty_background_bytes"),
+        "rmem_max": sf.read("/proc/sys/net/core/rmem_max"),
+    }
+
+    ntsync = sf.path("/dev/ntsync").exists()
+
+    return {
+        "cpus": cpus,
+        "cpuidle": cpuidle,
+        "gpu": gpu,
+        "thermals": temps,
+        "battery": battery,
+        "sysctl": sysctl,
+        "ntsync_present": ntsync,
+    }
+
+
+def print_status(data: dict[str, Any], as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(data, indent=2, ensure_ascii=False))
+        return
+
+    print("CPU:")
+    for c in data["cpus"]:
+        print(
+            f"  {c['policy']} (cpus {c['cpus']}): gov={c['governor']} "
+            f"{c['cur_khz']//1000} MHz [range {c['min_khz']//1000}..{c['max_khz']//1000} / hw {c['hw_max_khz']//1000}] "
+            f"rate_limit_us={c['rate_limit_us'] or '-'}"
+        )
+    idle = data["cpuidle"]
+    print(f"CPUIDLE: {idle['current']} (available: {' '.join(idle['available'])})")
+
+    g = data["gpu"]
+    if g:
+        print(
+            f"GPU ({g['device']}): gov={g['governor']} poll={g['polling_interval_ms']} ms "
+            f"{g['cur_mhz']} MHz [range {g['min_mhz']}..{g['max_mhz']} MHz]"
+        )
+
+    th = data["thermals"]
+    if th:
+        parts = []
+        if "cpu_max" in th:
+            parts.append(f"CPU={th['cpu_max']}°C ({th.get('cpu_max_zone', '')})")
+        if "gpu_max" in th:
+            parts.append(f"GPU={th['gpu_max']}°C ({th.get('gpu_max_zone', '')})")
+        for k in ("ddr-thermal", "xo-thermal", "skin-thermal"):
+            if k in th:
+                parts.append(f"{k}={th[k]}°C")
+        print("THERMALS: " + ", ".join(parts))
+
+    b = data["battery"]
+    if b:
+        thr = ""
+        if b["charge_start_pct"] is not None and b["charge_end_pct"] is not None:
+            thr = f" thresholds={b['charge_start_pct']}%..{b['charge_end_pct']}%"
+        print(
+            f"BATTERY ({b['device']}): {b['capacity_pct']}% ({b['status']}) "
+            f"{b['voltage_v']} V / {b['current_ma']} mA ({b['power_w']} W){thr}"
+        )
+
+    sc = data["sysctl"]
+    print(
+        f"TUNING: ntsync={'yes' if data['ntsync_present'] else 'no'} "
+        f"rt_uclamp_min={sc['sched_util_clamp_min_rt_default']} "
+        f"swappiness={sc['swappiness']} "
+        f"dirty={sc['dirty_bytes']}/{sc['dirty_background_bytes']} "
+        f"rmem_max={sc['rmem_max']}"
+    )
+
+
+def apply_profile(sf: Sysfs, profile: str) -> None:
+    for pol in sf.glob("/sys/devices/system/cpu/cpufreq/policy*"):
+        avail_govs = sf.read(pol / "scaling_available_governors").split()
+        if "schedutil" in avail_govs:
+            sf.write(pol / "scaling_governor", "schedutil")
+        avail_freqs = sorted(int(x) for x in sf.read(pol / "scaling_available_frequencies").split() if x.isdigit())
+        hw_max = int(sf.read(pol / "cpuinfo_max_freq", "0") or 0)
+        cpus = sf.read(pol / "related_cpus")
+        is_prime = "6" in cpus.split() or "7" in cpus.split()
+
+        if profile == "silent" and is_prime and avail_freqs:
+            # Cap Prime cluster around 2.9 GHz to keep passive heat very low.
+            candidates = [f for f in avail_freqs if f <= 2_900_000]
+            cap = candidates[-1] if candidates else avail_freqs[0]
+            sf.write(pol / "scaling_max_freq", cap)
+        elif profile == "sustained" and is_prime and avail_freqs:
+            # Cap Prime cluster around 3.51 GHz to stay below the 3.8-4.09 GHz
+            # voltage/heat cliff on passive-cooled long 3D gaming sessions.
+            candidates = [f for f in avail_freqs if f <= 3_520_000]
+            cap = candidates[-1] if candidates else avail_freqs[0]
+            sf.write(pol / "scaling_max_freq", cap)
+        elif hw_max:
+            sf.write(pol / "scaling_max_freq", hw_max)
+
+    gpu_dir = find_gpu_devfreq(sf)
+    if gpu_dir:
+        sf.write(gpu_dir / "polling_interval", 16)
+        freqs = sorted(int(x) for x in sf.read(gpu_dir / "available_frequencies").split() if x.isdigit())
+        if freqs:
+            lo, hi = freqs[0], freqs[-1]
+            # Always relax ceiling before raising floor, and floor before lowering ceiling.
+            sf.write(gpu_dir / "min_freq", lo)
+            sf.write(gpu_dir / "max_freq", hi)
+            if profile == "silent":
+                cap = next((f for f in freqs if f >= 832_000_000), hi)
+                sf.write(gpu_dir / "max_freq", cap)
+            elif profile == "balanced":
+                pass
+            elif profile in ("sustained", "performance"):
+                floor = next((f for f in freqs if f >= 443_000_000), lo)
+                sf.write(gpu_dir / "min_freq", floor)
+
+
+def apply_gpu_clock(sf: Sysfs, target: str) -> None:
+    gpu_dir = find_gpu_devfreq(sf)
+    if not gpu_dir:
+        sys.stderr.write("opd-power: GPU devfreq node not found\n")
+        sys.exit(1)
+    freqs = sorted(int(x) for x in sf.read(gpu_dir / "available_frequencies").split() if x.isdigit())
+    if not freqs:
+        sys.stderr.write("opd-power: no available GPU frequencies\n")
+        sys.exit(1)
+
+    sf.write(gpu_dir / "min_freq", freqs[0])
+    sf.write(gpu_dir / "max_freq", freqs[-1])
+    if target == "auto":
+        print(f"GPU clock restored to auto ({freqs[0]//1_000_000}..{freqs[-1]//1_000_000} MHz)")
+        return
+
+    try:
+        want_hz = int(target) * 1_000_000
+    except ValueError:
+        sys.stderr.write(f"opd-power: invalid GPU clock '{target}' (use 'auto' or MHz integer)\n")
+        sys.exit(2)
+
+    snapped = min(freqs, key=lambda f: abs(f - want_hz))
+    sf.write(gpu_dir / "min_freq", snapped)
+    sf.write(gpu_dir / "max_freq", snapped)
+    print(f"GPU clock locked to {snapped // 1_000_000} MHz")
+
+
+def write_charge_thresholds(sf: Sysfs, batt_dir: Path, start: int, end: int) -> None:
+    cur_end = int(sf.read(batt_dir / "charge_control_end_threshold", "100") or 100)
+    writes = [
+        (batt_dir / "charge_control_start_threshold", start),
+        (batt_dir / "charge_control_end_threshold", end),
+    ]
+    # Keep start < end at every intermediate step.
+    if end > cur_end:
+        writes.reverse()
+    for p, val in writes:
+        sf.write(p, val)
+
+
+def apply_bypass(sf: Sysfs, mode: str, level: int | None) -> None:
+    batt_dir = find_battery(sf)
+    if not batt_dir or not (batt_dir / "charge_control_end_threshold").exists():
+        sys.stderr.write("opd-power: battery charge_control_end_threshold not available\n")
+        sys.exit(1)
+
+    if mode == "off":
+        write_charge_thresholds(sf, batt_dir, 0, 100)
+        print("Bypass charging OFF (thresholds restored to 0%..100%)")
+        return
+
+    cap = int(sf.read(batt_dir / "capacity", str(CHARGE_FLOOR)) or CHARGE_FLOOR)
+    target_end = cap if level is None else level
+    target_end = max(CHARGE_FLOOR, min(100, target_end))
+    target_start = max(0, target_end - 1) if target_end < 100 else 99
+    write_charge_thresholds(sf, batt_dir, target_start, target_end)
+    print(f"Bypass charging ON (holding around {target_end}%, thresholds {target_start}%..{target_end}%)")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="OPD2413 fanless SM8750 power & gaming control")
+    ap.add_argument("--sysfs-root", default="/", help=argparse.SUPPRESS)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p_st = sub.add_parser("status", help="Show CPU, GPU, thermal, battery, and tuning status")
+    p_st.add_argument("--json", action="store_true", help="Output machine-readable JSON")
+
+    p_pr = sub.add_parser("profile", help="Apply fanless power profile (requires root)")
+    p_pr.add_argument("name", choices=PROFILES)
+
+    p_gpu = sub.add_parser("gpu-clock", help="Set GPU clock to 'auto' or lock to MHz (requires root)")
+    p_gpu.add_argument("target", help="'auto' or frequency in MHz (e.g. 832, 900, 1100)")
+
+    p_bp = sub.add_parser("bypass", help="Toggle bypass charging via charge_control thresholds (requires root)")
+    p_bp.add_argument("mode", choices=("on", "off"))
+    p_bp.add_argument("--level", type=int, default=None, help="Hold percentage (55..100, default: current battery %%)")
+
+    args = ap.parse_args()
+    sf = Sysfs(args.sysfs_root)
+
+    if args.cmd == "status":
+        print_status(collect_status(sf), args.json)
+        return 0
+
+    require_root_if_real(args.sysfs_root)
+    if args.cmd == "profile":
+        apply_profile(sf, args.name)
+        print(f"Applied profile: {args.name}")
+    elif args.cmd == "gpu-clock":
+        apply_gpu_clock(sf, args.target)
+    elif args.cmd == "bypass":
+        apply_bypass(sf, args.mode, args.level)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

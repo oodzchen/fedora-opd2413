@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# OPD2413 system-wide `steam` entrypoint for desktop shortcuts and steam:// URIs.
+# Delegates to the per-user native ARM64 Steam launcher installed by
+# tools/gaming/install-steam-arm64.py.
+set -euo pipefail
+
+USER_LAUNCHER="${HOME}/.local/bin/steam-arm64"
+if [[ -x "${USER_LAUNCHER}" ]]; then
+    exec "${USER_LAUNCHER}" "$@"
+fi
+
+echo "steam: ${USER_LAUNCHER} not found. Run tools/gaming/install-steam-arm64.py first." >&2
+exit 127

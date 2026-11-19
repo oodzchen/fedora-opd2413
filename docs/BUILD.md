@@ -10,6 +10,7 @@
 | `tools/build-firmware-rpm.sh` | `opd2413-firmware` | 宿主机 | 从本地固件目录按清单打包 |
 | `tools/build-device-rpms.sh` | `opd2413-device`、`opd2413-audio` | 宿主机 | `noarch` 配置包 |
 | `tools/build-netshare-rpm.sh` | `opd2413-netshare` | 宿主机 | `noarch` Python/systemd 包 |
+| `tools/build-gaming-rpm.sh` | `opd2413-gaming` | 宿主机 / 本机 | `noarch` 游戏性能基座包（`tests/gaming-test.sh`） |
 | `tools/build-camera-rpm.sh` | `opd2413-camera` | **平板原生（默认）** | 传 `--local` 退回宿主机 `arm64` 容器 |
 | `tools/build-face-rpm.sh` | `opd2413-face` | **平板原生（默认）** | 传 `--local` 退回宿主机 `arm64` 容器 |
 | `tools/build-polkit-kde-rpm.sh` | `polkit-kde` | **平板原生（默认）** | 传 `--local` 退回宿主机 `arm64` 容器 |

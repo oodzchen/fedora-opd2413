@@ -1,0 +1,5 @@
+# OPD2413 runs a native 4 KiB page-size ARM64 kernel (CONFIG_ARM64_4K_PAGES=y).
+# Disable Asahi/16 KiB muvm wrapping so binfmt-dispatcher invokes native
+# /usr/bin/FEXInterpreter directly.
+[interpreters.fex]
+use_muvm = false

@@ -1,0 +1,6 @@
+# Ensure Proton can open /dev/ntsync as an unprivileged user.
+KERNEL=="ntsync", MODE="0666"
+
+# Sample Adreno 830 GPU load every 16 ms (~1 frame at 60 Hz) instead of 50 ms
+# so devfreq ramps clocks without frame-time lag.
+ACTION=="add|change", SUBSYSTEM=="devfreq", KERNEL=="3d00000.gpu", ATTR{polling_interval}="16"

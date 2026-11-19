@@ -1,0 +1,277 @@
+#!/usr/bin/env bash
+# opd-game — per-game launch wrapper for OnePlus Pad 2 Pro (SM8750 / Fedora 45).
+#
+# Usage:
+#   opd-game [options] [preset] [--] <command> [args...]
+#
+# Steam Launch Options examples:
+#   opd-game %command%
+#   opd-game fast %command%
+#   opd-game --gamescope --res 1696x1200 --fps 60 fast %command%
+#   opd-game --gamescope --res 1920x1200 --scaler fsr fastest %command%
+#
+# Presets:
+#   balanced  (default) ntsync + WineD3D Vulkan + x87 reduced precision + uclamp 256
+#   fast      balanced + uclamp 448 (faster big-core ramp for demanding 3D titles)
+#   fastest   fast + FEX_TSOENABLED=0 (largest x86 CPU win; test per game)
+#   compat    strict FEX TSO + split locks + full x87 precision + uclamp 256
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage: opd-game [options] [balanced|fast|fastest|compat] [--] <command> [args...]
+
+Options:
+  --gamescope           Wrap the game in a nested gamescope compositor
+  --res WxH             Internal gamescope render size (default: 1696x1200)
+  --out-res WxH         Output gamescope display size (default: 3392x2400)
+  --scaler MODE         Gamescope scaler: fsr|nis|integer|linear|pixel (default: fsr)
+  --fps N               Limit gamescope framerate (passes -r N)
+  --uclamp N            Override task uclamp.min (0..1024; 0 disables uclampset)
+  --mangohud            Enable MangoHud overlay (if installed)
+  --log-perf DIR        Enable MangoHud CSV logging into DIR (toggle with Shift+F2)
+  --wayland             Enable Proton native Wayland driver (PROTON_ENABLE_WAYLAND=1)
+  --vk-icd PATH         Override Vulkan ICD JSON for this game only
+  --dry-run             Print the resolved environment and command, then exit
+  -h, --help            Show this help message
+EOF
+}
+
+PRESET="balanced"
+PRESET_SET=0
+USE_GAMESCOPE=0
+INT_RES="1696x1200"
+OUT_RES="3392x2400"
+SCALER="fsr"
+FPS_LIMIT=""
+UCLAMP_OVERRIDE=""
+USE_MANGOHUD=0
+LOG_PERF_DIR=""
+USE_WAYLAND=0
+VK_ICD_OVERRIDE=""
+DRY_RUN=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        balanced|fast|fastest|compat)
+            if [[ "$PRESET_SET" -eq 0 ]]; then
+                PRESET="$1"
+                PRESET_SET=1
+                shift
+            else
+                break
+            fi
+            ;;
+        --gamescope)
+            USE_GAMESCOPE=1
+            shift
+            ;;
+        --res)
+            INT_RES="${2:?--res requires WxH}"
+            shift 2
+            ;;
+        --out-res)
+            OUT_RES="${2:?--out-res requires WxH}"
+            shift 2
+            ;;
+        --scaler)
+            SCALER="${2:?--scaler requires a mode}"
+            shift 2
+            ;;
+        --fps)
+            FPS_LIMIT="${2:?--fps requires an integer}"
+            shift 2
+            ;;
+        --uclamp)
+            UCLAMP_OVERRIDE="${2:?--uclamp requires 0..1024}"
+            shift 2
+            ;;
+        --mangohud)
+            USE_MANGOHUD=1
+            shift
+            ;;
+        --log-perf)
+            LOG_PERF_DIR="${2:?--log-perf requires a directory path}"
+            USE_MANGOHUD=1
+            shift 2
+            ;;
+        --wayland)
+            USE_WAYLAND=1
+            shift
+            ;;
+        --vk-icd)
+            VK_ICD_OVERRIDE="${2:?--vk-icd requires a file path}"
+            shift 2
+            ;;
+        --dry-run)
+            DRY_RUN=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            echo "opd-game: unknown option: $1" >&2
+            usage >&2
+            exit 2
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+if [[ $# -eq 0 ]]; then
+    usage >&2
+    exit 2
+fi
+
+if [[ ! "$INT_RES" =~ ^([0-9]+)x([0-9]+)$ ]]; then
+    echo "opd-game: invalid --res '$INT_RES' (expected WxH)" >&2
+    exit 2
+fi
+INT_W="${BASH_REMATCH[1]}"
+INT_H="${BASH_REMATCH[2]}"
+
+if [[ ! "$OUT_RES" =~ ^([0-9]+)x([0-9]+)$ ]]; then
+    echo "opd-game: invalid --out-res '$OUT_RES' (expected WxH)" >&2
+    exit 2
+fi
+OUT_W="${BASH_REMATCH[1]}"
+OUT_H="${BASH_REMATCH[2]}"
+
+if [[ -n "$FPS_LIMIT" && ! "$FPS_LIMIT" =~ ^[0-9]+$ ]]; then
+    echo "opd-game: invalid --fps '$FPS_LIMIT'" >&2
+    exit 2
+fi
+
+# Base Proton / WineD3D defaults
+export PROTON_USE_NTSYNC="${PROTON_USE_NTSYNC:-1}"
+export PROTON_NO_ESYNC="${PROTON_NO_ESYNC:-0}"
+# Default to stable winepulse (via pipewire-pulse) rather than experimental
+# winepipewire.drv, which segfaults on teardown in Proton-CachyOS arm64.
+export PROTON_USE_PIPEWIRE="${PROTON_USE_PIPEWIRE:-0}"
+export WINE_D3D_CONFIG="${WINE_D3D_CONFIG:-renderer=vulkan}"
+
+UCLAMP_MIN=256
+case "$PRESET" in
+    balanced)
+        export FEX_X87REDUCEDPRECISION=1
+        export FEX_PROFILESTATS="${FEX_PROFILESTATS:-0}"
+        UCLAMP_MIN=256
+        ;;
+    fast)
+        export FEX_X87REDUCEDPRECISION=1
+        export FEX_PROFILESTATS="${FEX_PROFILESTATS:-0}"
+        UCLAMP_MIN=320
+        ;;
+    fastest)
+        export FEX_X87REDUCEDPRECISION=1
+        export FEX_PROFILESTATS="${FEX_PROFILESTATS:-0}"
+        export FEX_TSOENABLED=0
+        export FEX_VECTORTSOENABLED=0
+        export FEX_MEMCPYSETTSOENABLED=0
+        export FEX_HALFBARRIERTSOENABLED=0
+        UCLAMP_MIN=320
+        ;;
+    compat)
+        export FEX_TSOENABLED=1
+        export FEX_VECTORTSOENABLED=1
+        export FEX_STRICTINPROCESSSPLITLOCKS=1
+        export FEX_X87REDUCEDPRECISION=0
+        UCLAMP_MIN=256
+        ;;
+esac
+
+if [[ "$USE_WAYLAND" -eq 1 ]]; then
+    export PROTON_ENABLE_WAYLAND=1
+fi
+
+if [[ -n "$UCLAMP_OVERRIDE" ]]; then
+    if [[ ! "$UCLAMP_OVERRIDE" =~ ^[0-9]+$ ]] || (( UCLAMP_OVERRIDE > 1024 )); then
+        echo "opd-game: invalid --uclamp '$UCLAMP_OVERRIDE' (expected 0..1024)" >&2
+        exit 2
+    fi
+    UCLAMP_MIN="$UCLAMP_OVERRIDE"
+fi
+
+if [[ -n "$VK_ICD_OVERRIDE" ]]; then
+    export VK_DRIVER_FILES="$VK_ICD_OVERRIDE"
+    export VK_ICD_FILENAMES="$VK_ICD_OVERRIDE"
+fi
+
+CMD=("$@")
+
+if [[ -n "$LOG_PERF_DIR" ]]; then
+    if [[ "$DRY_RUN" -eq 0 ]]; then
+        mkdir -p "$LOG_PERF_DIR"
+    fi
+    # Use manual toggle (Shift_L+F2) instead of log_duration auto-stop to avoid
+    # Fedora 45 mangohud 0.8.3~rc1's ImGui empty-ID assertion on timer expiry.
+    MH_BASE="output_folder=${LOG_PERF_DIR},toggle_logging=Shift_L+F2,log_interval=100,fps,frametime,frame_timing,gpu_stats,gpu_temp,gpu_core_clock,cpu_stats,cpu_temp,cpu_mhz"
+    export MANGOHUD_CONFIG="${MANGOHUD_CONFIG:+${MANGOHUD_CONFIG},}${MH_BASE}"
+fi
+
+if [[ "$USE_MANGOHUD" -eq 1 ]]; then
+    export MANGOHUD=1
+    if command -v mangohud >/dev/null 2>&1; then
+        CMD=(mangohud "${CMD[@]}")
+    fi
+fi
+
+if [[ "$USE_GAMESCOPE" -eq 1 ]]; then
+    if ! command -v gamescope >/dev/null 2>&1 && [[ "$DRY_RUN" -eq 0 ]]; then
+        echo "opd-game: --gamescope requested but 'gamescope' is not installed" >&2
+        exit 127
+    fi
+    GS=(gamescope -W "$OUT_W" -H "$OUT_H" -w "$INT_W" -h "$INT_H" -f)
+    case "$SCALER" in
+        fsr)     GS+=(-F fsr) ;;
+        nis)     GS+=(-F nis) ;;
+        integer) GS+=(-S integer) ;;
+        linear)  GS+=(-F linear) ;;
+        pixel)   GS+=(-F pixel) ;;
+        *)
+            echo "opd-game: invalid --scaler '$SCALER'" >&2
+            exit 2
+            ;;
+    esac
+    if [[ -n "$FPS_LIMIT" ]]; then
+        GS+=(-r "$FPS_LIMIT")
+    fi
+    CMD=("${GS[@]}" -- "${CMD[@]}")
+fi
+
+if (( UCLAMP_MIN > 0 )) && command -v uclampset >/dev/null 2>&1; then
+    CMD=(uclampset -m "$UCLAMP_MIN" -- "${CMD[@]}")
+fi
+
+if [[ "$DRY_RUN" -eq 1 ]]; then
+    printf 'PRESET=%s\n' "$PRESET"
+    printf 'PROTON_USE_NTSYNC=%s\n' "${PROTON_USE_NTSYNC:-}"
+    printf 'WINE_D3D_CONFIG=%s\n' "${WINE_D3D_CONFIG:-}"
+    printf 'FEX_X87REDUCEDPRECISION=%s\n' "${FEX_X87REDUCEDPRECISION:-}"
+    printf 'FEX_PROFILESTATS=%s\n' "${FEX_PROFILESTATS:-}"
+    printf 'FEX_TSOENABLED=%s\n' "${FEX_TSOENABLED:-}"
+    printf 'FEX_VECTORTSOENABLED=%s\n' "${FEX_VECTORTSOENABLED:-}"
+    printf 'FEX_STRICTINPROCESSSPLITLOCKS=%s\n' "${FEX_STRICTINPROCESSSPLITLOCKS:-}"
+    printf 'PROTON_ENABLE_WAYLAND=%s\n' "${PROTON_ENABLE_WAYLAND:-}"
+    printf 'MANGOHUD_CONFIG=%s\n' "${MANGOHUD_CONFIG:-}"
+    printf 'VK_DRIVER_FILES=%s\n' "${VK_DRIVER_FILES:-}"
+    printf 'UCLAMP_MIN=%s\n' "$UCLAMP_MIN"
+    printf 'EXEC:'
+    printf ' %q' "${CMD[@]}"
+    printf '\n'
+    exit 0
+fi
+
+# Prevent Wine/Proton teardown SIGSEGVs from dumping hundreds of MB of corefiles
+# and triggering KDE DrKonqi crash dialogs on normal game exit.
+ulimit -c 0 2>/dev/null || true
+
+exec "${CMD[@]}"

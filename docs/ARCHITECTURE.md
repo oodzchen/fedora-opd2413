@@ -124,6 +124,7 @@ Fedora 是在运行中的 Armada 里装进新子卷的（没有重新 mkfs），
 | `opd2413-face` | 锁屏/PAM/polkit 人脸认证守护进程与 Qt 录入向导 | 设备 / 安全 |
 | `opd2413-polkit-kde` | 带“开始人脸识别”显式确认按钮的 `polkit-kde` 下游补丁包 | 桌面 / 安全 |
 | `opd2413-netshare` | 跨设备 BLE + 5 GHz P2P 自动网络共享服务与托盘界面 | 设备 / 网络 |
+| `opd2413-gaming` | 游戏性能基座：sysctl、udev（16 ms GPU polling/`/dev/ntsync`）、`teo` tmpfiles、PipeWire 防爆音底限、`opd-game` 与无风扇 `opd-power` | 设备 / 性能 |
 | `opd2413-desktop` | KDE 默认值：缩放、电源键与合盖行为、屏幕键盘 | 桌面策略 |
 | `opd2413-mesa`（仅在需要时） | 带补丁的 Mesa。先验证 Fedora 45 自带的 26.2.6 能否驱动 Adreno 830 | 设备 |
 

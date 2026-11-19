@@ -2380,3 +2380,74 @@ mpv、Firefox 仍是软解（Fedora `ffmpeg-free` 的专利限制），用户选
      - `22:22:39` 用户点击 **Start Face Recognition** 后，`polkit-agent-helper-1[192249]` 记录 `pam_opd2413_face(polkit-1:auth): Face authenticated user colin (polkit-1)`，审核日志 `grantors=pam_opd2413_face res=success`，`pkexec id` 返回 `uid=0(root)`；
      - 验证完成后复查 `IsPolkitArmed("colin") = false`（单次令牌已原子消费并复位）。
   3. **整机健康度**：`getenforce = Enforcing`、相关时段 journal 零 `avc: denied`、`systemctl is-system-running = running`、`systemctl --failed` 为 `0 loaded units listed`。
+
+
+## 2026-11-19
+
+### Steam 客户端与大型 3D 游戏适配立项及阶段 1 离线准备（`opd2413-gaming-0.1-1` + 内核 `7.2.15-31.opd2413`）
+
+- **现网基线核对（只读，`7.2.15-30.opd2413`）：**
+  - 已确认当前内核已原生命中 SM8750 Oryon `ssbd_sigreturn`（`cpu0-5` `0x514f0014`、`cpu6-7` `0x513f0014` 匹配 `MIDR_QCOM_ORYON_X1`），且已包含 `0505`/`0505a` 非对齐原子模拟、`0504` 兼容输入、`CONFIG_NTSYNC=y`（`/dev/ntsync` `0666`）、`CONFIG_UCLAMP_TASK=y`（普通用户实测 `uclampset -m 256` 生效）、`CONFIG_TRANSPARENT_HUGEPAGE_MADVISE=y`、UFS MCQ、`zram0` `8 GiB zstd`、Adreno 830 `1100 MHz` OPP 与 `qcom-battmgr-bat` `charge_control_{start,end}_threshold`。
+  - 已确认 Fedora 45 官方仓库自带 `fex-emu 2604`、`fex-emu-rootfs-fedora`、`fex-emu-thunks`、`gamescope 3.16.31`、`gamemode 1.8.2`、`mangohud 0.8.3`、`box64 0.3.6`、`vulkan-tools`。
+  - 现网待补齐缺口：`CONFIG_CPU_IDLE_GOV_TEO` 未编入（仅 `menu`）、`3d00000.gpu/polling_interval=50` ms、`kernel.sched_util_clamp_min_rt_default=1024`、`vm.swappiness=60`、`vm.dirty_bytes=0`（`dirty_ratio=20`）、`net.core.rmem_max=4194304`、PipeWire 游戏音频缓冲底限及无风扇专用启动/功耗工具。
+- **总体文档与阶段 1 改动：**
+  1. 新增总体路线文档 [GAMING-STEAM.md](GAMING-STEAM.md)，明确 4 阶段路线（阶段 1 性能基座 → 阶段 2 Steam ARM64 + ARM64EC Proton / FEX + SELinux 策略 → 阶段 3 Gamescope/MangoHud/外设 → 阶段 4 大型 3D 游戏长时热稳态与旁路供电）。
+  2. 新增独立性能基座包 `packaging/opd2413-gaming/` 与 [build-gaming-rpm.sh](../tools/build-gaming-rpm.sh)（`opd2413-gaming-0.1-1.noarch.rpm`，SHA-256 `f116b1e3…`）：
+     - `60-opd2413-gaming.conf`（sysctl：`sched_util_clamp_min_rt_default=64`、`vm.swappiness=150`、`vm.dirty_bytes=536870912`、`vm.dirty_background_bytes=67108864`、`net.core.rmem_max=33554432`）；
+     - `60-opd2413-gaming.rules`（udev：`/dev/ntsync` `0666`、`3d00000.gpu` `polling_interval=16`）；
+     - `60-opd2413-gaming.conf`（tmpfiles：`cpuidle=teo` 与 `polling_interval=16`）；
+     - `61-opd2413-gaming.conf`（environment.d：`WINE_D3D_CONFIG=renderer=vulkan`）；
+     - PipeWire / pipewire-pulse 1024 帧底限配置（防 Q6APM 游戏音频欠载爆音）；
+     - `/usr/bin/opd-game`（`balanced`/`fast`/`fastest`/`compat`、`uclamp.min`、FEX/Proton 参数、`--gamescope`、`--vk-icd`）与 `/usr/bin/opd-power`（无风扇安全档位 `silent`/`balanced`/`performance`、GPU 锁频、旁路充电阈值、状态遥测）。
+     - 离线测试 [tests/gaming-test.sh](../tests/gaming-test.sh) 通过（`PASS: opd2413-gaming offline tests`）。
+  3. 新增 `kernel/opd2413-7.2/config/m4-gaming.config`（仅开启 `CONFIG_CPU_IDLE_GOV_TEO=y`），于本地容器离线构建 `kernel-opd2413-7.2.15-31.opd2413.aarch64.rpm`。
+- **上机预期与判据（待用户确认写入后按阶段 1A → 1B 分步上机）：**
+  1. **阶段 1A（安装 `opd2413-gaming-0.1-1`）**：安装后 sysctl/udev/tmpfiles 立即生效，`opd-power status` 显示 `polling_interval=16 ms`、`rt_uclamp_min=64`、`swappiness=150`、`dirty=536870912/67108864`、`rmem_max=33554432`；重启 PipeWire 后扬声器播放正常无爆音；`opd-power bypass on` / `off` 可正常切换 `charge_control_{start,end}_threshold`；SELinux `Enforcing` 零新增 AVC。
+  2. **阶段 1B（清理旧回退 `-28`、安装 `7.2.15-31.opd2413` 并经 `boot-select next` 安全单次引导 + 冷启动复核）**：开机后 `uname -r = 7.2.15-31.opd2413`、`/sys/devices/system/cpu/cpuidle/current_governor = teo`、`running`、`0 failed`、`Enforcing` 零 AVC、`KSHIM.CHO` 哈希与 `1 extent` 不变、`s2idle` 短休眠唤醒与显示/触控/触摸板/Wi-Fi/蓝牙/GPU/相机均无回归。
+- **阶段 1A 实机验证结果（2026-11-19，经用户确认装机，真机通过）：**
+  - 通过 `pkexec dnf --disablerepo="*" install -y out/rpmbuild/RPMS/noarch/opd2413-gaming-0.1-1.noarch.rpm` 完成安装（`rpm -V opd2413-gaming` 零输出）。
+  - sysctl/udev 即时生效：`3d00000.gpu/polling_interval = 16` ms、`kernel.sched_util_clamp_min_rt_default = 64`、`vm.swappiness = 150`、`vm.dirty_bytes = 536870912`、`vm.dirty_background_bytes = 67108864`、`net.core.rmem_max = 33554432`、`/dev/ntsync` 可访问（`0666`）；`60-opd2413-gaming.conf` tmpfiles 写入 `cpuidle=teo` 在当前 `7.2.15-30` 上按预期返回 `Invalid argument`（待 1B 内核 `7.2.15-31` 启用后自动切入）。
+  - `opd-power bypass on` 将阈值置为 `93%..94%`，`opd-power bypass off` 恢复至 `50%..100%`（`qcom_battmgr` 固件将 `start=0` 钳位至 `50`）；`opd-power profile performance` 保持 `policy6` 为 `schedutil` 并将 GPU 最低频提至 `443 MHz`，切回 `balanced` 恢复全范围。
+  - 重启用户级 `pipewire`/`pipewire-pulse`/`wireplumber` 均 `active`，`pw-metadata -n settings 0` 确认 `clock.min-quantum = 1024`、`clock.quantum = 1024`、`clock.rate = 48000`；`opd-game fast` 实测 `PROTON_USE_NTSYNC=1`、`WINE_D3D_CONFIG=renderer=vulkan`、`FEX_X87REDUCEDPRECISION=1` 与 `uclampset util_clamp: min: 448 max: 1024`。
+  - 整机状态：`systemctl is-system-running = running`、`0 failed`、`SELinux Enforcing` 零新增 AVC。
+- **阶段 1B 离线构建与装机就绪（2026-11-19，待重启验收）：**
+  - 本地容器离线完成 `kernel-opd2413-7.2.15-31.opd2413.aarch64.rpm` 构建（SHA-256 `5355fe70…`），`diff -u` 确认 `.config` 相对 `7.2.15-30.opd2413` 仅 `CONFIG_CPU_IDLE_GOV_TEO=y` 一行变化。
+  - 已通过单次 `pkexec` 固化 `boot-select default fedora-7.2.15-30.opd2413.conf`、卸载最旧回退 `7.2.15-28`、装入 `7.2.15-31.opd2413` 并设置一次性引导 `boot-select next fedora-7.2.15-31.opd2413.conf`；ESP `/dev/sda16` 保留 `-29`/`-30`/`-31`（`370M / 512M`，剩余 `143M`），`/boot/efi/KSHIM.CHO` 写前后 SHA-256 完全一致且保持 `1 extent`（`16384 B`）。待用户重启平板后核验 `uname -r = 7.2.15-31.opd2413`、`cpuidle=teo`、`opd2413-gaming` 冷启动持久化与整机健康度。
+- **阶段 1B 重启验收结果（2026-11-19 09:20:59 开机，真机通过）：**
+  - 重启直接进入 `uname -r = 7.2.15-31.opd2413`；`opd-power status` 核验 `CPUIDLE: teo (available: menu teo)`、`3d00000.gpu/polling_interval = 16 ms`、`ntsync=yes`、`rt_uclamp_min=64`、`swappiness=150`、`dirty=536870912/67108864`、`rmem_max=33554432`；
+  - `systemctl --user show-environment` 含 `WINE_D3D_CONFIG=renderer=vulkan`，PipeWire `clock.min-quantum = 1024`（`48000 Hz`）；
+  - 整机健康度：`systemctl is-system-running = running`、`0 failed`、`SELinux Enforcing` 零 `avc: denied`，`bluetooth`/`opd-netshare`/`opd2413-face`/`opd2413-lid-input`/`pipewire`/`wireplumber`/`opd2413-lid-suspend`、`OnePlusPad2Pro` 扬声器、`Adreno (TM) 830 Mesa 26.2.6` 与 Wi-Fi 全部正常。待同阶段 2 授权时一并固化 `boot-select default fedora-7.2.15-31.opd2413.conf`。
+- **阶段 1B 固化默认项与阶段 2 实机部署及冒烟（2026-11-19，经用户确认，阶段 2 达 `真机启动`）：**
+  1. **固化默认引导项**：`boot-select default fedora-7.2.15-31.opd2413.conf` 完成，`KSHIM.CHO` 写前后哈希一致且保持 `1 extent`（保留 `-30`、`-29` 回退）。
+  2. **Fedora 官方游戏/转译栈与 FEX `binfmt_misc` 修复**：安装 `fex-emu 2604`、`fex-emu-rootfs-fedora`（`default.erofs`）、`fex-emu-thunks`、`gamescope 3.16.31`、`mangohud 0.8.3`、`gamemode 1.8.2`、`vulkan-headers`。排查并解决两项关键坑：
+     - Fedora 默认 `binfmt-dispatcher` 为 16 KB 页（Apple Silicon）开启 `use_muvm = true`，且屏蔽后字母序靠后的 `qemu-x86_64-static.conf` 在 `binfmt_misc` LIFO 队列中排在 `FEX-x86_64.conf` 之上；升级 `opd2413-gaming-0.1-4.noarch`（屏蔽 `zz-binfmt-dispatcher-x86{,_64}` 与早位 `FEX-x86{,_64}`，并在最末注册 `zz-opd2413-FEX-x86{,_64}.conf`）后，原生 `/usr/bin/FEX` 稳居 LIFO 最高优先级；
+     - 实测开启 FEX Vulkan HostThunks 在 X11 显示初始化阶段触发 `SIGILL`（rc=132），而关闭 Thunks 后 `fex-emu-rootfs-fedora` 内置的 x86_64 `libvulkan_freedreno.so`（Mesa 26.2.2）直接经 `/dev/dri/renderD128` 驱动 `Adreno (TM) 830`（Vulkan 1.4.354）且零警告、零 AVC。
+  3. **Steam ARM64 + `webhelper_acquire` + ARM64EC Proton + Gamescope 实机冒烟**：
+     - [install-steam-arm64.py](../tools/gaming/install-steam-arm64.py)（改用 Akamai HTTP/2 CDN）完成 `steam_client_linuxarm64`（version `1794536281`）全部 34 包 SHA-256 校验并解压 13,653 个文件至 `~/.local/share/Steam`；[install-webhelper-layer.sh](../tools/gaming/install-webhelper-layer.sh) 将 `libVkLayer_webhelper_acquire.so` 隔离安装至 `~/.local/share/opd2413-steam-layer`（仅由 `steam-arm64` 经 `VK_ADD_IMPLICIT_LAYER_PATH` 加载，避免影响其他/x86_64 Vulkan 进程）。
+     - [install-proton-arm.py](../tools/gaming/install-proton-arm.py) 安装 `proton-cachyos-11.0-20261015-slr-arm64`（含原生 ARM64 Wine 11.0、`libarm64ecfex`/`libwow64fex`、ARM64 DXVK 与 VKD3D-Proton Low-Latency），自动剥离 `require_tool_appid` 并建立 `files/bin -> bin-arm64` 软链；实测临时前缀执行 Windows `cmd.exe` 输出 `ntsync: up and running.`、`ARM64EC_OK`，`SELinux Enforcing` 零 AVC。
+     - 提前完成阶段 3 核心冒烟：`opd-game --gamescope --res 1696x1200 --fps 60 --mangohud -- vkcube --c 120` 在 KDE Wayland 上 60 Hz（`16.67 ms`）FSR 全屏嵌套渲染正常退出且零 AVC。
+     - 启动 `~/.local/bin/steam-arm64`：`steam` 与 `steamwebhelper` 动态库 100% 解析，`steamsysinfo` 识别 `Adreno (TM) 830 (k_EGpuDriverId_MesaTurnip 26.2.6, 11.7 GB VRAM)`，`Enforcing` 零 AVC；待用户登录 Steam 账户下载/运行 3D 游戏完成阶段 2/3/4 实机验证。
+
+### 阶段 2 真机实玩排障验收（《黑暗之魂 3》）与阶段 3 Adreno MangoHud v0.8.4 部署
+
+- **Steam 客户端与桌面集成问题闭环**：
+  1. KRunner 反复启动未弹窗：实证 `zipfile` 解压未保留 `steamerrorreporter` 可执行位，`crashhandler.so` 在 `CefCrashReportingEnabled()` 断言时退回进程内同步上传至 `crash.steampowered.com` 阻塞超过 3 分钟；在 [tools/gaming/install-steam-arm64.py](../tools/gaming/install-steam-arm64.py) 中替换为非阻塞桩（保留 `.orig`）并仅在无运行中实例时清理 `Singleton*` 锁文件，实测登录窗 `1.01 s` 弹出。
+  2. 图标与托盘：从 `public/steam_tray.ico` 生成 `16..256` 七档 PNG 安装至用户 `hicolor` 主题，统一桌面项为 `steam.desktop`（`StartupWMClass=steam`），并安装 Fedora 官方 `libappindicator-12.10.1-11.fc45.aarch64`（满足 GTK2 `steamui.so` 对 `libappindicator.so.1` 的动态加载），实测 Plasma `StatusNotifierWatcher` 注册 `:1.290/org/ayatana/NotificationItem/steam`。
+  3. 游戏快捷方式启动：在 `opd2413-gaming-0.1-5` 中新增 `/usr/bin/steam` 分发入口（及 `~/.local/bin/steam`），满足 Steam 生成的 `Exec=steam steam://rungameid/...`。
+  4. 着色器卡 0% 与启动秒退：扫描出 28 个 ZIP 属性 `0644` 的 ELF/脚本（含 `steamrtarm64/fossilize_replay`、`linuxarm64/steam-launch-wrapper`、`steamrtarm64/reaper`、`steamrtarm64/gameoverlayui`），改为自动遍历补齐 `0755`（剩余缺失 `0`）。
+  5. Steam 内置性能面板不显示：核实 Valve ARM64 `steamui.so` 漏写 `steamoverlay_arm64.json`，已自动注册指向 `steamrtarm64/steamoverlayvulkanlayer.so`，实测游戏内原生帧率正常显示。
+  6. 游戏退出弹 DrKonqi 崩溃窗：定位为 `DarkSoulsIII.exe` 在 ARM64EC Wine 收尾时音频线程（`winepipewire_ti` / `audio_client_ma`）触发 `SIGSEGV`（原落盘 `453.6M` core）；在 `opd-game` 加 `ulimit -c 0` 并默认 `PROTON_USE_PIPEWIRE=0`，同时通过用户级 `opd-drkonqi-filter` + `drkonqi-coredump-launcher@.service.d` 仅静默过滤 Wine/Proton 退出包（`SOCK_SEQPACKET` 自测 `PASS`）。
+- **《黑暗之魂 3》（AppID 374320）性能剖析与 `opd2413-gaming-0.1-7` 调优**：
+  - 基线 720p 最低画质未挂 `opd-game` 时约 `55 FPS`；启用 `opd-game fastest`（`FEX_TSOENABLED=0`）后达到 `60 FPS`，60 s MangoHud CSV 显示 `6.4s..40.8s` 连续 34.4 s 稳态中位帧时间 `16.78 ms`（`59.6 FPS`），同时暴露两个卡顿源：（a）`uclamp=512` 让 `policy6` 轻载常驻 `4089 MHz` 于 45 s 撞 `96°C` 降频至 `3513 MHz`；（b）`vm.swappiness=150` 在后台浏览器占内存叠加游戏加载至 `12.6 GiB` 时触发 `kswapd` 1.3 s 猛压 `340 MiB` 进 `zram0`（`30–155 ms` 尖刺）。
+  - 升级装入 `opd2413-gaming-0.1-7.noarch`（`vm.swappiness=60`、`uclamp=320`、`FEX_PROFILESTATS=0`、`fastest` 零 TSO 屏障、`opd-power profile sustained` 设 `policy6 <= 3.51 GHz` + GPU `443..1100 MHz`）并关闭黑魂 3 `Auto-detectBestRenderingSettings`，用户实测卡顿频率明显下降，阶段 2 升格为 **`真机通过`**（全程 `SELinux Enforcing` 零 AVC）。
+- **阶段 3 高通 Adreno 830 真实 GPU 监控（`MangoHud v0.8.4`）**：
+  - 新增 [tools/gaming/build-mangohud-adreno.sh](../tools/gaming/build-mangohud-adreno.sh)，预缓存 GitHub wrap 并在 `fedora:45` 容器中以 `-j7` 原生编译 Zaviya `MangoHud v0.8.4`（含高通 `msm_dpu` + `3d00000.gpu/cur_freq` + `gpuss` 温区 + `drm-engine-gpu` 补丁）至用户态 `~/.local/lib/opd2413-mangohud/` 与 `~/.local/share/vulkan/implicit_layer.d/MangoHud.aarch64.json`，并写入默认 `~/.config/MangoHud/MangoHud.conf`。
+  - 真机 `vkcube` 冒烟通过：`gpu_temp=40°C`、`gpu_core_clock=443 MHz`、自动日志零崩溃完成，且核实内核 `/proc/<pid>/fdinfo` 正常输出 `drm-driver: msm` 与 `drm-engine-gpu` 递增纳秒计数。
+
+### 阶段 3–4 关键突破：`FEX_SMCCHECKS=none` 消除黑魂 3 周期卡顿与 `opd-drkonqi-filter` 实机验收
+
+- **退出崩溃弹窗彻底静默**：升级 `opd-drkonqi-filter` 循环读取 `QLocalSocket` 分片并在命中 `wine-preloader` 时立即退出；`15:08:42` 实机退出《黑魂 3》时 `journalctl --user` 明确打印 `opd-drkonqi-filter: suppressed harmless Wine/Proton teardown crash`，无 DrKonqi 弹窗。
+- **FSR 功耗对比与 `FEX_SMCCHECKS=none` 实测**：
+  - 实测 `--gamescope` FSR 升频到 `3392×2400` 肉眼帧节奏更顺（精确 60 Hz 2:1 对齐 120 Hz 面板），但在无风扇机身下功耗与 CPU/GPU 温升明显更高，日常更适合直出渲染。
+  - 关闭 FSR 后在《黑魂 3》启用 `PROTON_DISABLE_HIDRAW=1 FEX_SMCCHECKS=none opd-game --mangohud fastest %command%`，彻底消除 FEX 默认 `mtrack` 自修改代码页追踪与 Arxan 定时内存校验叠加引发的周期性卡顿，用户实测**几乎不再卡顿、稳定 60 FPS**（注意 `FEX_SMCCHECKS=none` 应按游戏单独启用，避免影响依赖实时自修改代码/JIT 的游戏）。
+- **冷启动持久化复核**：平板于 `15:02` 重启后，`opd-power status` 确认 `CPUIDLE: teo`、`3d00000.gpu/polling_interval=16 ms`、`ntsync=yes`、`rt_uclamp_min=64`、`vm.swappiness=60`、`dirty=512M/64M`、`rmem_max=32M` 全部自动持久化生效。
