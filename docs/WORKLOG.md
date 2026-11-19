@@ -2451,3 +2451,16 @@ mpv、Firefox 仍是软解（Fedora `ffmpeg-free` 的专利限制），用户选
   - 实测 `--gamescope` FSR 升频到 `3392×2400` 肉眼帧节奏更顺（精确 60 Hz 2:1 对齐 120 Hz 面板），但在无风扇机身下功耗与 CPU/GPU 温升明显更高，日常更适合直出渲染。
   - 关闭 FSR 后在《黑魂 3》启用 `PROTON_DISABLE_HIDRAW=1 FEX_SMCCHECKS=none opd-game --mangohud fastest %command%`，彻底消除 FEX 默认 `mtrack` 自修改代码页追踪与 Arxan 定时内存校验叠加引发的周期性卡顿，用户实测**几乎不再卡顿、稳定 60 FPS**（注意 `FEX_SMCCHECKS=none` 应按游戏单独启用，避免影响依赖实时自修改代码/JIT 的游戏）。
 - **冷启动持久化复核**：平板于 `15:02` 重启后，`opd-power status` 确认 `CPUIDLE: teo`、`3d00000.gpu/polling_interval=16 ms`、`ntsync=yes`、`rt_uclamp_min=64`、`vm.swappiness=60`、`dirty=512M/64M`、`rmem_max=32M` 全部自动持久化生效。
+
+### 人脸解锁锁屏与 Polkit 授权弹窗图标统一（`opd2413-face 0.1-13`、`polkit-kde 6.8.3-1.fc45.opd2413.2`）
+
+- **问题根因与选型**：录入向导（`opd-face-enroll.desktop` / `opd-face-enroll-gui.py`）使用 `face-smile`（Breeze 中软链到 `preferences-desktop-emoticons.svg`，圆形微笑脸）；此前锁屏 [MainBlock.qml](../packaging/opd2413-face/data/lockscreen/MainBlock.qml) 使用 `edit-image-face-recognize-symbolic`（方框问号）/`edit-image-face-detect-symbolic`，Polkit 弹窗补丁 [0001-add-explicit-face-recognition-confirmation-button.patch](../packaging/opd2413-polkit-kde/patches/0001-add-explicit-face-recognition-confirmation-button.patch) 使用 `edit-image-face-recognize`。核实 `breeze` / `breeze-dark` 内置的 `preferences-desktop-emoticons-symbolic` 与 `face-smile` 造型完全一致，且在 KDE `KIconEngine` 下 `16/22/24/32/48 px` 均以单色 `.ColorScheme-Text` 矢量渲染、不回退彩色（而 `face-smile-symbolic` 在 Breeze 下缺失会回退到黄色彩色版）。
+- **源码改动与离线通过**：
+  - [MainBlock.qml](../packaging/opd2413-face/data/lockscreen/MainBlock.qml)：将非匹配态的 `iconSource()` 统一为 `preferences-desktop-emoticons-symbolic`（匹配解锁瞬间保留 `object-unlocked-symbolic`）。
+  - [0001-add-explicit-face-recognition-confirmation-button.patch](../packaging/opd2413-polkit-kde/patches/0001-add-explicit-face-recognition-confirmation-button.patch) 与 [polkit-kde.spec](../packaging/opd2413-polkit-kde/polkit-kde.spec)：将 `QuickAuthDialog.qml` 与 `MobileQuickAuthDialog.qml` 中 `faceAuthButton` 的 `icon.name` 改为 `preferences-desktop-emoticons-symbolic`。
+  - 原生构建产出 `out/rpmbuild/RPMS/aarch64/opd2413-face-0.1-13.fc45.aarch64.rpm`（SHA-256 `baf4c473...`）与 `out/rpmbuild/RPMS/aarch64/polkit-kde-6.8.3-1.fc45.opd2413.2.aarch64.rpm`（SHA-256 `f89123c0...`）；离线解包并解压 `.qrc` zstd 资源验证两包均仅含新图标、无旧 `edit-image-face-*` 残留（`离线通过`）。
+- **上机预期与判据**：装入两包并重启 `plasma-polkit-agent.service` 后，（1）`rpm -q` 为 `opd2413-face-0.1-13` 与 `polkit-kde-6.8.3-1.fc45.opd2413.2`；（2）`/usr/local/share/plasma/shells/org.kde.plasma.desktop/contents/lockscreen/MainBlock.qml` 已刷新为 `preferences-desktop-emoticons-symbolic`；（3）触发 `pkexec` 授权弹窗与锁屏界面目视确认均为黑白单色微笑脸且人脸解锁正常；（4）`SELinux Enforcing` 零新增 AVC。
+- **装机与实机验收结果（2026-11-19，经用户确认与目视验收，达 `真机通过`）**：
+  - 通过单次 `pkexec` 完成 `dnf -y upgrade --nogpgcheck`，`rpm -q` 确认为 `opd2413-face-0.1-13.fc45.aarch64` 与 `polkit-kde-6.8.3-1.fc45.opd2413.2.aarch64`；
+  - `/usr/share/opd2413-face/lockscreen/MainBlock.qml` 与 `/usr/local/share/plasma/shells/org.kde.plasma.desktop/contents/lockscreen/MainBlock.qml` 均已更新为 `preferences-desktop-emoticons-symbolic`；
+  - `systemctl --user restart plasma-polkit-agent.service` 后 `active`（新进程 `/usr/libexec/kf6/polkit-kde-authentication-agent-1` 已接管），`opd2413-face.service` 为 `active`，`SELinux Enforcing` 零新增 AVC；用户目视验收锁屏与授权弹窗黑白微笑脸图标均符合预期。

@@ -221,10 +221,7 @@ SessionManagementScreen {
             if (isMatched) {
                 return "object-unlocked-symbolic";
             }
-            if (isScanning) {
-                return "edit-image-face-recognize-symbolic";
-            }
-            return "edit-image-face-detect-symbolic";
+            return "preferences-desktop-emoticons-symbolic";
         }
 
         onClicked: sessionManager.faceRetryRequested()

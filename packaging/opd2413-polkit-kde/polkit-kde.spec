@@ -70,6 +70,9 @@ Provides Policy Kit Authentication Agent that nicely fits to KDE.
 
 
 %changelog
+* Thu Nov 19 2026 OPD2413 Maintainer <opd2413@local> - 6.8.3-1.opd2413.2
+- Use monochrome symbolic smile icon (preferences-desktop-emoticons-symbolic) on face recognition button
+
 * Tue Nov 17 2026 OPD2413 Maintainer <opd2413@local> - 6.8.3-1.opd2413.1
 - Require explicit button click in authentication dialog before running OPD2413 face verification
 

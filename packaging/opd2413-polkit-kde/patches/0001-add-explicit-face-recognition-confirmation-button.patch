@@ -471,7 +471,7 @@ index 93c9c8a..2a56a17 100644
 +            Layout.bottomMargin: Kirigami.Units.largeSpacing
 +            visible: root.faceAvailable
 +            enabled: !root.faceScanning
-+            icon.name: "edit-image-face-recognize"
++            icon.name: "preferences-desktop-emoticons-symbolic"
 +            text: root.faceScanning
 +                ? i18n("Scanning Face…")
 +                : (root.faceFailed ? i18n("Retry Face Recognition") : i18n("Start Face Recognition"))
@@ -546,7 +546,7 @@ index 283b9c2..8ccd3c2 100644
 +                    Layout.fillWidth: true
 +                    visible: root.faceAvailable
 +                    enabled: !root.waitingForAuthentication && !root.faceScanning
-+                    icon.name: "edit-image-face-recognize"
++                    icon.name: "preferences-desktop-emoticons-symbolic"
 +                    text: root.faceScanning
 +                        ? i18n("Scanning Face…")
 +                        : (root.faceFailed ? i18n("Retry Face Recognition") : i18n("Start Face Recognition"))
