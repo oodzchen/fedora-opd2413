@@ -69,4 +69,5 @@
 | `7.2.15-29` | 后摄音圈对焦修复（`TECH-DEBT #42`）：`2435`（修正 `cn3927` `device_link_add` 中 `consumer`/`supplier` 方向为 `sc1300cs -> cn3927` 并在传感器已激活时附加 `DL_FLAG_RPM_ACTIVE`，补上 `0x08=0x6f` 解锁后 OEM `100 us` 稳定延时、`CN3927_PARK_STEP=64` 与 `cn3927_write()` I2C 重试，消除 `ac7b000.cci` 超时） |
 | `7.2.15-30` | Pogo 键盘触摸板修复：`2436`（注册 `ABS_MT_TOOL_TYPE` 按 `slot[0] & BIT(0)` 上报手指/掌触置信位，并将 `0x2f` 1 s 心跳抬指限定在 `tp_rx_err` 且超 `250 ms` 无新触控帧时） |
 | `7.2.15-31` | 游戏性能基座（阶段 1B）：`m4-gaming.config`（仅新增 `CONFIG_CPU_IDLE_GOV_TEO=y`，零代码改动，配合 `opd2413-gaming` tmpfiles 开机切换 `cpuidle=teo`） |
+| `7.2.15-32` | 启动偶发黑屏硬复位修复（`TECH-DEBT #39`）：`2437`（板级 DTS 新增原厂 `splash@fc800000` `0x2b00000` `no-map` 保留区，消除全局 CMA 与活跃 144 Hz bootloader 显存重叠导致 `qcom_scm_pas_init_image()` 期间触发 XPU 硬件复位） |
 | `7.2.15-30` | Pogo 键盘触摸板掌触与心跳修复：`2436`（`oneplus-pogo-keyboard.c` 按 `slot[0] & BIT(0)` 上报 `ABS_MT_TOOL_TYPE`=`MT_TOOL_PALM`/`MT_TOOL_FINGER`，且仅在 UART 帧/CRC 错误 `tp_rx_err` 并超时 `250 ms` 无新触控帧时于 `0x2f` 心跳释放残余触点，消除 1 s 周期性断触） |

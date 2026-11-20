@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Kholin <oodzchen@gmail.com>
+Date: Fri, 20 Nov 2026 12:18:00 +0800
+Subject: [PATCH] arm64: dts: qcom: sm8750-oneplus-pad2pro: reserve bootloader
+ splash framebuffer
+
+ABL leaves the DPU continuously scanning out the 3392x2400 bootloader
+framebuffer at 0xfc800000..0xfe70dfff (31,800 KiB) at 144 Hz until
+drm/msm tears down bootloader scanout at ~0.48 s. Without matching the
+stock splash_region reservation (0xfc800000, size 0x2b00000), Linux
+exposes 0xfc800000..0xff7fffff as System RAM and places both the 32 MiB
+global CMA pool (0xfcc00000..0xfebfffff) and adsp-rpc-remote-heap
+(0xfec00000..0xff7fffff) directly on top of the active scanout range.
+
+During early boot (~0.35-0.36 s, before drm/msm stops scanout),
+qcom_scm_pas_init_image() for soccp/adsp calls dma_alloc_coherent(),
+which allocates 4K metadata pages out of global CMA (0xfcc00000+) and
+hands them to TrustZone. TZ enables XPU memory protection on those pages
+during the SCM call; whenever the 144 Hz DPU scanout DMA (or an active
+efifb console) accesses that page while XPU-locked, the resulting
+hardware XPU violation triggers an immediate silent SoC reset.
+
+Reserve 0xfc800000..0xff2fffff as no-map (matching the stock ColorOS DT)
+so Linux places global CMA and adsp-rpc-remote-heap safely below
+0xf3800000, completely outside the active bootloader framebuffer.
+
+Co-Authored-By: Antigravity <noreply@deepmind.google>
+---
+ .../boot/dts/qcom/sm8750-oneplus-pad2pro.dts  | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/qcom/sm8750-oneplus-pad2pro.dts b/arch/arm64/boot/dts/qcom/sm8750-oneplus-pad2pro.dts
+--- a/arch/arm64/boot/dts/qcom/sm8750-oneplus-pad2pro.dts
++++ b/arch/arm64/boot/dts/qcom/sm8750-oneplus-pad2pro.dts
+@@ -31,6 +31,21 @@
+ 	};
+ 
+ 	reserved-memory {
++		/*
++		 * ABL leaves DPU scanning out the 3392x2400 framebuffer at
++		 * 0xfc800000 until drm/msm tears down bootloader scanout
++		 * (~0.48 s). Matching the stock splash_region reservation
++		 * (0xfc800000, 0x2b00000) prevents Linux from placing global
++		 * CMA (0xfcc00000) and adsp-rpc-remote-heap inside the live
++		 * scanout range, where qcom_scm_pas_init_image() DMA metadata
++		 * allocations get XPU-locked by TZ and trigger an immediate
++		 * hardware reset on DPU/efifb access.
++		 */
++		splash_mem: splash@fc800000 {
++			reg = <0x0 0xfc800000 0x0 0x2b00000>;
++			no-map;
++		};
++
+ 		ramoops@bfff00000 {
+ 			compatible = "ramoops";
+ 			reg = <0xb 0xfff00000 0x0 0x100000>;
+-- 
+2.47.0

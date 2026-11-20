@@ -2464,3 +2464,79 @@ mpv、Firefox 仍是软解（Fedora `ffmpeg-free` 的专利限制），用户选
   - 通过单次 `pkexec` 完成 `dnf -y upgrade --nogpgcheck`，`rpm -q` 确认为 `opd2413-face-0.1-13.fc45.aarch64` 与 `polkit-kde-6.8.3-1.fc45.opd2413.2.aarch64`；
   - `/usr/share/opd2413-face/lockscreen/MainBlock.qml` 与 `/usr/local/share/plasma/shells/org.kde.plasma.desktop/contents/lockscreen/MainBlock.qml` 均已更新为 `preferences-desktop-emoticons-symbolic`；
   - `systemctl --user restart plasma-polkit-agent.service` 后 `active`（新进程 `/usr/libexec/kf6/polkit-kde-authentication-agent-1` 已接管），`opd2413-face.service` 为 `active`，`SELinux Enforcing` 零新增 AVC；用户目视验收锁屏与授权弹窗黑白微笑脸图标均符合预期。
+
+## 2026-11-20 `#39` 启动偶发黑屏自动重启专项取证与排查
+
+- **现象与离线排查结论**：
+  - 用户反馈偶发在引导界面选择 Linux 后黑屏数秒、无内核日志、自动重启后正常进入 Fedora（冷启动与热重启均遇过，概率较低；与 [TECH-DEBT.md](TECH-DEBT.md) `#39` 一致）。
+  - 离线代码审计与只读基线核对已排除物理 KASLR 撞保留区（U-Boot 无 `EFI_RNG_PROTOCOL`，内核物理地址固定在 `0xbf2a00000`）、U-Boot 常规加载失败（会切 `vidconsole` 显示错误并等待 8 s）及 `kShimC` 软件/异常复位（全部为 `while (1)` 停机）。
+  - 现网 `7.2.15-31.opd2413` 带 `quiet loglevel=3` 且 `CONFIG_PANIC_TIMEOUT=0`、无运行时看门狗，导致早期硬件/TZ/SMMU/时钟/电源域复位时 `console-ramoops-0` 为 `0` 字节；同时审计出 `7.2.15-31` 尚未合入的 3 处 `erhai` 早期竞态修复候选（`qcom_tzmem` `DO_ONCE` 关中断睡眠、`drivers/clk/clk.c` 孤儿时钟重挂 ABBA 死锁与 `#32` 的 8 条 `mdss_probe` WARNING、`ufshcd` 时钟缩放死锁）。
+- **取证方案与写入范围（2026-11-20 经用户批准方案 A）**：
+  - 仅在 ESP `/boot/efi/loader/entries/` 新增临时诊断条目 `opd2413-bootdiag.conf`（复用现役 `7.2.15-31` 内核、initrd 与 DTB，仅去掉 `quiet loglevel=3` 改为 `loglevel=7 ignore_loglevel initcall_debug panic=10`），通过 `boot-select default opd2413-bootdiag.conf` 临时切为默认，不改动 `boot_b`、`KSHIM.CHO` 及原有 `-31`/`-30`/`-29` 条目。
+  - 由主机经 SSH 运行最多 25 轮无人值守热重启循环，每轮核验启动耗时、`pstore` 序号递增、`console-ramoops-0` 尾部是否正常结束于 `reboot: Restarting system` 及 `dmesg` 异常；**命中任一异常立即停止**、将完整现场拉回 `private/bootdiag-20261120/`，并恢复 `default fedora-7.2.15-31.opd2413.conf`、删除临时条目、复核 `KSHIM.CHO` 哈希与 `1 extent`。
+- **预期与判据**：
+  - 正常轮次：单次热重启耗时稳定（预期约 35–55 s），`pstore` `.seq` 每次 `+1`，`console-ramoops-0` 末行为 `reboot: Restarting system`。
+  - **分支 A（内核早期复位）**：某轮 `console-ramoops-0` 不以 `reboot: Restarting system` 结尾（或出现 `dmesg-ramoops-*`），直接给出复位前最后执行的函数/驱动与时间戳。
+  - **分支 B（内核 `ramoops` 之前复位）**：某轮耗时明显跃升（`> 基线 + 18 s`）且 `console-ramoops-0` 仍保留上一轮正常重启记录，锁定故障位于 U-Boot / `systemd-boot` / EFI stub。
+  - **分支 C（非保内存硬复位）**：热重启后 `pstore` `.seq` 未递增（空 `pstore`）且耗时跃升，锁定触发了不保内存的硬件/PMIC 掉电复位。
+- **第 1 轮取证结果与恢复（2026-11-20 `10:32`–`10:57`）**：
+  - 写入 `opd2413-bootdiag.conf`（`console=tty0 loglevel=7 ignore_loglevel initcall_debug panic=10`）并设为默认后，Run 1 触发**100% 必现的灰屏→自动重启死循环**（240 s 未回 SSH）；用户经 `Fedora boot menu` 手选回到正常 `7.2.15-31.opd2413` 后，已立即恢复 `loader.conf` 为 `default fedora-7.2.15-31.opd2413.conf` 并删除 `opd2413-bootdiag.conf`（此时 `kshim_remembered` 停在 `"Fedora boot menu"` 待确认恢复）。
+  - **完整证据已持久化归档**：`private/bootdiag-20261120/captured/000095-b2137f8adb994cba87d0299170c05978/console-ramoops-0`（满 `262,132` 字节，3,761 行，同步逐行落盘无滞后）。
+  - **现场剖析**：
+    1. 去掉 `quiet` 且保留 `console=tty0` 后，`fbcon` 在 `0.099 s` 接管、`efifb` 在 `0.274 s` 接管 3392×2400 帧缓冲并逐行滚屏（约 `0.8–1.3 ms/行`），叠加 `initcall_debug` 把 `deferred_probe_initcall` 从正常 `0.26 s` 拖慢到 `0.62 s`。
+    2. `Freeing initrd memory` 在 `0.417 s` 先于 `remoteproc-soccp` 探针（`0.755 s`）完成（正常启动为 `remoteproc-soccp` `0.295 s` 先探针、`regulators-0/2` `0.307 s` 就绪、63 ms 后的 `0.358 s` 才 `Freeing initrd`）。
+    3. `0.755011 s` `remoteproc0: soccp is available` → `0.756088 s` `powering up soccp` → `0.757235 s` `Booting fw image qcom/sm8750/erhai/soccp.mbn` → `0.758127 s` `probe of qcom_common.pd-mapper.0 returned 0` → `0.759011 s` `probe of remoteproc-soccp returned 0`，**随即整机硬复位**（无 Oops/panic，且因 `ktz8866 6-0011` 与 `dispcc` 尚未探针、背光仍亮，复位断扫瞬间呈现灰屏；此时 `dispcc`/`mdss`/`gmu`/`ufs`/`pcie` 均未探针）。
+  - **待验证的下一步（需用户确认）**：使用 `video=efifb:off loglevel=7 ignore_loglevel panic=10`（关闭 `efifb` 刷屏且不加 `initcall_debug`，保持正常启动时序同时全速写 `ramoops`）做单次冒烟确认不死循环，再继续无人值守复现以区分“原始 `#39` 是否同样死于 `soccp` 抢跑竞态”与“`efifb` 活跃写入干扰”。
+- **第 2 轮单步冒烟方案（2026-11-20，经用户确认）**：
+  - **写入范围**：（1）`/usr/libexec/opd2413/boot-select kshim Fedora` 将 `KSHIM.CHO` 记忆从 `"Fedora boot menu"` 恢复回 `"Fedora"`（原地覆写，核验保持 `1 extent`）；（2）新增临时条目 `/boot/efi/loader/entries/opd2413-bootdiag2.conf`（复用 `7.2.15-31`，仅将 `quiet loglevel=3` 替换为 `video=efifb:off loglevel=7 ignore_loglevel panic=10`，**不加** `initcall_debug`）；（3）`/usr/libexec/opd2413/boot-select next opd2413-bootdiag2.conf` 执行 1 次热重启冒烟。
+  - **预期与判据**：（1）无灰屏、无死循环，约 35–55 s 内正常进 Fedora 且 `systemctl is-system-running` 为 `running`、`booted_entry = opd2413-bootdiag2.conf`、`loader.conf` 已自动恢复为 `default fedora-7.2.15-31.opd2413.conf`；（2）`dmesg` 中无 `efifb` 接管记录，且 `remoteproc-soccp` 探针与 `Freeing initrd` 时序与日常 `-31` 一致；（3）随后再重启一次或检查本轮 `console-ramoops-0` 能完整录下 `loglevel=7` 早期启动日志。
+  - **单步冒烟结果（2026-11-20 `11:16`–`11:17`）**：
+    - `KSHIM.CHO` 已恢复为 `"Fedora"`（`sequence=48`、`1 extent`）。
+    - 热重启 `opd2413-bootdiag2.conf` 耗时 **`38.8 s`** 正常上线（`boot_id` 前缀 `671e5e8d`），无灰屏、无死循环；`loader.conf` 已由服务自动恢复为 `default fedora-7.2.15-31.opd2413.conf`。
+    - `dmesg` 确认 `video=efifb:off` 生效（零 `efifb` 接管），`console [ramoops-1] enabled`（`0.0468 s`），关键时序与日常 `-31` 完全一致：`remoteproc0: soccp`（`0.2995 s`）→ `adsp`（`0.3003 s`）→ `ktz8866 6-0011`（`0.3066 s`）→ `Freeing initrd`（`0.3609 s`）→ `adsp`（`0.3611 s`）与 `soccp`（`0.3673 s`）启动并完成（`soccp is now up` `0.4588 s`、`in D3, boot bus vote dropped` `0.4593 s`）→ `msm-mdss bootloader scanout`（`0.4824 s`），零严重内核报错。
+- **测试 A：原生态时序 25 轮无人值守热重启复现（2026-11-20，经用户确认）**：
+  - **写入范围**：复用 `opd2413-bootdiag2.conf` 并临时设为默认，连跑最多 25 轮热重启；命中任一异常或跑满 25 轮均自动还原 `default fedora-7.2.15-31.opd2413.conf`、删除 `opd2413-bootdiag2.conf` 并校验 `KSHIM.CHO` 哈希与 `1 extent`。
+  - **预期与判据**：首轮校验 `console-ramoops-0` 大小显著大于正常 `41 B`（确认全量 `loglevel=7` 落盘）；正常轮次耗时稳定在基线 `+14 s` 内、`pstore` 序号逐轮 `+1` 且尾部为 `reboot: Restarting system`；若命中 `#39`，自动落盘完整 `pstore` 与当前 `journalctl -k` 至 `private/bootdiag-20261120/testA/anomaly-runXX/` 并立即停止。
+  - **测试 A 结果（2026-11-20 `11:19`–`11:21`，第 2 轮即命中原生态 `#39` 现场并自动清理恢复）**：
+    - Run 01/25：`dt=38.7 s`，`seq=97(+1)`，`console-ramoops-0 = 17,874 B`，尾部为 `reboot: Restarting system`（`OK`，验证全量 `loglevel=7` 落盘正常）。
+    - **Run 02/25（命中异常）**：`dt=87.3 s`（基线 `38.7 s`，典型双启动），`seq=98(+1)`，完整未卷绕的 `console-ramoops-0 = 67,739 B` 已归档至 `private/bootdiag-20261120/testA/anomaly-run02/000098-458b6933083b445d9f936c761332ba03/console-ramoops-0`。脚本随即自动恢复 `default fedora-7.2.15-31.opd2413.conf`、删除 `opd2413-bootdiag2.conf`，复核 `KSHIM.CHO` 哈希不变且保持 `1 extent`。
+    - **决定性结论**：在完全关闭 `efifb`（`video=efifb:off`）、不加 `initcall_debug`、`ktz8866 6-0011`/`regulators-0,2`/`ufs`/`adsp` 全部正常就绪的原生态时序下，硬复位仍精确发生在 **`0.364065 s` `remoteproc remoteproc0: Booting fw image qcom/sm8750/erhai/soccp.mbn, size 565924`** 之后数毫秒内（与第 1 轮 `000095` 的 `0.757235 s` 现场 100% 重合）。由此**彻底排除 `efifb`、时序倒置及 `regulators`/`adsp` 未就绪**，故障 100% 锁定在 `qcom_pas_start()` 加载/鉴权/复位 `soccp.mbn`（`pas_id=51`、`0x9ec00000`）路径内部。
+- **测试 B：`soccp` 启动路径细粒度同步埋点定位（2026-11-20，经用户确认）**：
+  - **方案与写入范围**：基于 `out/m3k/build`（保持 `7.2.15-31.opd2413` ABI 不变，编完即回滚主机源码树）编译临时诊断内核 `Image-soccp-diag`，仅对 `pas_id == 51` 在 `qcom_pas_start()` 与 `mdt_loader.c` 注入 9 处 `pr_emerg("soccp-diag: ...")` 同步埋点（覆盖 `prepare`、`pd/clk`、`qcom_scm_pas_init_image(51)`、`memcpy 0x9ec00000`、`pil_info`、`qcom_scm_pas_auth_and_reset(51)`、`wait_for_start` 及 `TCSR dstate` 读值）；上传至 ESP `/boot/efi/fedora/7.2.15-31.opd2413/linux-soccp-diag` 并配置临时条目 `opd2413-bootdiag3.conf`（`video=efifb:off loglevel=7 ignore_loglevel panic=10`），先单步冒烟再最多连跑 25 轮，命中首例即停并自动删除临时内核与条目、还原 `default fedora-7.2.15-31.opd2413.conf`。
+  - **预期与判据**：单步冒烟在 `dmesg` 可见完整 `soccp-diag: 1..9` 序列及正常启动；复现命中后 `console-ramoops-0` 末条 `soccp-diag` 编号直接锁定唯一致死调用（如停在 `4a`→`init_image` SMC、停在 `5`→`memcpy 0x9ec00000` 覆盖运行中固件、停在 `7`→`auth_and_reset` SMC、停在 `8`→复位后启动期）。
+  - **首次裸 `Image` 试跑收获（2026-11-20 `11:53`–`12:01`）**：
+    - 仅换裸 `Image` 时因 `CONFIG_DEBUG_INFO_BTF=y` 校验拒绝原有 `-31` 模块（`failed to validate module [raid6_pq] BTF: -22`），导致 initrd 无法加载 `btrfs` 挂载根分区；已手动回 `-31` 并清理。
+    - 归档日志 `private/bootdiag-20261120/testB-smoke/000099-3caa761b56544c3cad23d12d59a46701/console-ramoops-0` 已打出关键硬件状态：`1 pre-prepare dstate=0x2`（D0）→ `4a..4b` `init_image(51)` 耗时 `35 ms` 返回 `0`（`reloc=0`）→ `5..6` `memcpy/memset 0x9ec00000` 耗时 `2.08 ms` → **`7 pre-auth-reset dstate=0x2`**（实锤 `init_image(51)` 不停机，覆写 `0x9ec00000` 全程早期 SoCCP 仍处于 D0 运行态）→ `8 post-auth-reset`（`8.18 ms`）→ 36 ms 后进 D3（`dstate=0x8`）。
+  - **BTF 配套重跑方案（经用户确认）**：编译独立临时版本 `7.2.15-31diag.opd2413`（配套 `Image + modules` 并于平板 `dracut` 生成 `initrd-soccp-diag`，不经 `dnf`、不动 `-29`/`-30`/`-31`），恢复 `kshim Fedora` 后先单步冒烟再最多连跑 25 轮抓精确致死埋点，退出自动全量清理。
+  - **测试 B 结果与根因完全定案（2026-11-20 `12:07`–`12:13`，第 1 轮即命中）**：
+    - 单步冒烟 `7.2.15-31diag.opd2413` 耗时 `38.3 s` 正常上线，零 BTF 报错，完整打印 `soccp-diag: 1..9`。
+    - **Run 01/25（即刻命中）**：`dt=87.3 s`，`seq=101(+1)`，`console-ramoops-0 = 68,873 B` 归档至 `private/bootdiag-20261120/testB/anomaly-run01/000101-a87f3957.../console-ramoops-0`，脚本自动恢复 `default fedora-7.2.15-31.opd2413.conf` 并删除全部临时内核/initrd/模块/启动项（`KSHIM.CHO` 哈希不变、`1 extent`）。
+    - **精确致死点**：`0.359876 s` 打印 `soccp-diag: 4a pre-scm-init-image len=5016` 后，其他 CPU 继续完成 `sdd`/`sda`/`sde` 扫描至 `0.375018 s`（`15.1 ms`），**始终未到达 `4b post-scm-init-image`** 即发生整机硬复位。
+    - **完整根因链（100% 闭环解释冷/热偶发与第 1 轮 100% 死循环）**：
+      1. 原厂 `runtime.dts` 明确保留了 bootloader 连续显示显存 `splash_region@fc800000`（`0xfc800000` 大小 `0x2b00000`，即 `0xfc800000..0xff2fffff`），而我方 `sm8750-oneplus-pad2pro.dts`（及上游 `sm8750.dtsi`/`erhai`）均遗漏了该保留区，导致 `/proc/iomem` 将 `fc800000-ff7fffff` 暴露为 `System RAM`。
+      2. 内核自顶向下在 `< 4 GiB` 保留 32 MiB 全局 CMA，直接落在了 **`0xfcc00000..0xfebfffff`**——与仍在 144 Hz 扫描输出的 bootloader 显存 **`0xfc800000..0xfe70dfff`**（`sspp 0xf fc800000`，直到 `0.482 s` 才由 `msm-mdss` 停扫）**重叠 27.05 MiB**（这也是每次启动都报错 `simple-framebuffer.0: failed to claim resource 0` 的原因）。
+      3. `0.35–0.36 s`（停扫前约 120 ms），`remoteproc_adsp`/`remoteproc_soccp` 调用 `qcom_scm_pas_init_image()` → `dma_alloc_coherent(__scm->dev, 5016)` → `dma_alloc_contiguous()` 从全局 CMA（`0xfcc00000+`）分配元数据物理页，随后 `__qcom_scm_pas_init_image()` 进 TrustZone 对该页开启 XPU 内存保护。
+      4. 一旦 144 Hz DPU 扫描光束在 TZ 锁定该页的瞬间读到 `0xfcc00000+`（或如第 1 轮 `000095` 中 `efifb` CPU 持续写显存必撞该页），即触发硬件 XPU 访问违规并由 TZ 直接硬复位整机；重启后 90%+ 概率未撞到扫描窗口，从而表现为“黑屏数秒自动重启后正常进 Fedora”。
+- **修复补丁与离线打包（`7.2.15-32.opd2413`，`离线通过`）**：
+  - 新增最小精准补丁 [2437-arm64-dts-qcom-sm8750-oneplus-pad2pro-reserve-bootlo.patch](../kernel/opd2413-7.2/patches/2437-arm64-dts-qcom-sm8750-oneplus-pad2pro-reserve-bootlo.patch)（仅向板级 DTS `/reserved-memory` 新增与原厂一致的 `splash_mem: splash@fc800000`、`reg = <0x0 0xfc800000 0x0 0x2b00000>`、`no-map`），并登记至 `series`、[PATCHES.md](../kernel/PATCHES.md) 与 [README.md](../kernel/opd2413-7.2/README.md)。
+  - 严格 `-F0` 打入并编译产出 `out/rpmbuild/RPMS/aarch64/kernel-opd2413-7.2.15-32.opd2413.aarch64.rpm`（最终纯净版 SHA-256 `33b6a9ca6b34142411dfcb81a693d67afc1a22a11830ced89198c35147d3be9d`，1,775 个模块，零 `soccp-diag` 字符串）；离线解包反编译 DTB 确认含 `splash@fc800000 { reg = <0x00 0xfc800000 0x00 0x2b00000>; no-map; };`。
+- **上机安装与回归验收预期与判据（2026-11-20 经用户确认）**：
+  1. 以 `boot-select next fedora-7.2.15-32.opd2413.conf` 首次重启进入 `7.2.15-32.opd2413`，核验：（a）`dmesg` 显示 `OF: reserved mem: 0x00000000fc800000..0x00000000ff2fffff (44032 KiB) nomap non-reusable splash@fc800000`；（b）`cma: Reserved 32 MiB` 与 `adsp-rpc-remote-heap` 均退至 `0xf3800000` 以下、与 `0xfc800000..0xff2fffff` 零重叠；（c）无 `simple-framebuffer.0: failed to claim resource 0` 报错，且 `msm` 正常接管、背光/无灰闪、触控、Wi-Fi/蓝牙、音频、Pogo 键盘正常，`systemctl is-system-running = running`、`0 failed`、`SELinux Enforcing` 零新增 AVC。
+  2. 强回归压测：（a）用临时项在 `7.2.15-32` 上复测此前 100% 必现死循环的 `console=tty0 loglevel=7 ignore_loglevel initcall_debug`（预期 1 次即直接正常进桌面，证明 XPU 碰撞彻底消除）；（b）在 `video=efifb:off loglevel=7 ignore_loglevel` 下连跑 20 轮无人值守热重启（此前第 1–2 轮即命中），预期 **20/20 零异常**、全员正常结束于 `reboot: Restarting system`，随后切 `default fedora-7.2.15-32.opd2413.conf` 并由用户做 1 次冷启动验收。
+- **装机与实机回归验收结果（2026-11-20 `12:27`–`13:06`，全项达 `真机通过`）**：
+  1. **安全装机**：卸载最旧回退 `7.2.15-29`，装入 `kernel-opd2413-7.2.15-32.opd2413`（保留 `-31` 与 `-30` 两级回退，ESP `370M / 512M` 剩余 `143M`，`KSHIM.CHO` 前后 SHA-256 一致且保持 `1 extent`）。
+  2. **物理内存映射核验**：首次 `boot-select next` `40.3 s` 上线，`journalctl -k` 实测 `OF: reserved mem: 0x00000000fc800000..0x00000000ff2fffff (44032 KiB) nomap non-reusable splash@fc800000`、`adsp-rpc-remote-heap` 迁至 `0x00000000f2c00000..0x00000000f37fffff`、`cma: Reserved 32 MiB at 0x00000000f0c00000`，`/proc/iomem` `f3800000-ff2fffff : reserved`，`simple-framebuffer.0` 正常初始化后由 `msm` `aperture_remove_all_conflicting_devices()` 无缝接管，`kwin_wayland` 正常拉起。
+  3. **必现场景强回归**：在 `-32` 上加载此前在 `-31` 100% 必现灰屏死循环的 `console=tty0 loglevel=7 ignore_loglevel initcall_debug`，**第 1 次即以 `43.5 s` 顺利越过 `soccp` 并进入系统**（零硬复位）。
+  4. **纯净版重装与 20 轮压力回归**：发现首版 `-32` 因增量源码还原保留旧 mtime 残留了 `soccp-diag` 调试打印，随即清除两份 `.o` 重编并离线验证零 `soccp-diag` 字符串后覆盖重装至平板；在纯净版 `-32`（`#62`）上使用 `video=efifb:off loglevel=7 ignore_loglevel` 连跑 20 轮无人值守热重启（日志 `private/bootdiag-20261120/reg32/runs.log`），**20/20 全部通过、零异常**（单轮耗时稳定在 `39.6–41.0 s`，中位数 `40.0 s`，全部 `seq +1` 且正常结束于 `reboot: Restarting system`），退出已自动删除临时项。
+  5. **默认项固化、生产全检与 2 次冷启动终验**：切换 `boot-select default fedora-7.2.15-32.opd2413.conf` 并标准参数（`quiet loglevel=3`）重启，`38.7 s` 上线：`uname -r = 7.2.15-32.opd2413`（`#62`，零 `soccp-diag`）、`running`、`0 failed`、`SELinux Enforcing` 零 AVC、`opd2413-sensors-gate`/`bluetooth`/`opd2413-face`/`NetworkManager` 全 `active`、`cpuidle=teo`、`card 0: OnePlusPad2Pro` 音频正常、`KSHIM.CHO` 保持 `1 extent`。随后用户实机执行 **2 次冷启动复核均无异常**，[TECH-DEBT.md](TECH-DEBT.md) `#39` 彻底关闭。
+
+
+
+
+
+
+
+
+
+
+

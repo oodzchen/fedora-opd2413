@@ -116,3 +116,7 @@
 
 # Pogo touchpad palm reporting (MT_TOOL_PALM) and heartbeat release fix
 2436-Input-oneplus-pogo-keyboard-report-palm-and-fix-touchpad.patch
+
+# Early boot XPU reset fix (#39): reserve ABL splash framebuffer at 0xfc800000
+2437-arm64-dts-qcom-sm8750-oneplus-pad2pro-reserve-bootlo.patch
+
