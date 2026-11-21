@@ -17,11 +17,16 @@ import cv2
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, "/usr/libexec/opd2413")
 from hdrplus_isp import (  # noqa: E402
     SENSOR_PROFILES,
     process_raw10_burst,
     save_jpeg_with_exif,
+)
+from video_recorder import (  # noqa: E402
+    VideoRecorder,
+    should_mirror_front,
 )
 
 
@@ -117,7 +122,9 @@ class CameraController(QtCore.QObject):
     camera_error = QtCore.Signal(str)
     camera_started = QtCore.Signal(str, int, int)
     photo_saved = QtCore.Signal(str, QtGui.QImage, str)
+    video_saved = QtCore.Signal(str, QtGui.QImage, str)
     capture_busy = QtCore.Signal(bool, str)
+    recording_state_changed = QtCore.Signal(bool, str)
 
     def __init__(self) -> None:
         super().__init__()
@@ -133,6 +140,11 @@ class CameraController(QtCore.QObject):
         self._pending_post: Optional[Tuple[int, int, str, bool, float, List[Tuple[bytes, Dict[str, Any]]], int, int, int]] = None
         self._save_lock = threading.Lock()
         self._available_models: List[str] = []
+        self._vf_info: Optional[Tuple[int, int, str]] = None
+        self._recorder: Optional[VideoRecorder] = None
+        self._rec_thumb_rgb: Optional[np.ndarray] = None
+        self._rec_mirror_active = False
+        self._stopping_recording = False
 
     def probe_available(self) -> List[str]:
         import libcamera as lc
@@ -165,10 +177,107 @@ class CameraController(QtCore.QObject):
             self._refocus_pending = True
 
     def stop_camera(self) -> None:
+        self._stop_recording_sync()
         self._stop_event.set()
         if self._thread is not None and self._thread.is_alive():
             self._thread.join(timeout=4.0)
         self._thread = None
+        with self._lock:
+            self._vf_info = None
+
+    def is_recording(self) -> bool:
+        with self._lock:
+            return self._recorder is not None and self._recorder.is_active
+
+    def recording_elapsed_s(self) -> float:
+        with self._lock:
+            return self._recorder.elapsed_s if self._recorder is not None else 0.0
+
+    def start_recording(self, mirror_front: bool, enable_audio: bool = True) -> bool:
+        with self._lock:
+            if self._recorder is not None or self._stopping_recording or self._vf_info is None:
+                return False
+            vw, vh, pix_fmt = self._vf_info
+            model = self._active_model
+            mirror_video = should_mirror_front(model, mirror_front)
+            vid_dir = Path.home() / "Videos" / "OPD_Camera"
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            side = "FRONT" if model == "sc820cs" else "REAR"
+            out_path = vid_dir / f"VID_{ts}_{side}.mp4"
+            rec = VideoRecorder()
+            try:
+                rec.start(
+                    output_path=out_path,
+                    width=vw,
+                    height=vh,
+                    pix_fmt=pix_fmt,
+                    mirror_horizontal=mirror_video,
+                    enable_audio=enable_audio,
+                    bitrate="8M",
+                )
+            except Exception as exc:
+                self.camera_error.emit(f"Video start error: {exc}")
+                return False
+            self._recorder = rec
+            self._rec_thumb_rgb = None
+            self._rec_mirror_active = mirror_video
+        self.recording_state_changed.emit(True, "Recording...")
+        return True
+
+    def stop_recording(self) -> None:
+        with self._lock:
+            if self._recorder is None or self._stopping_recording:
+                return
+            self._stopping_recording = True
+            rec = self._recorder
+            self._recorder = None
+            thumb_rgb = self._rec_thumb_rgb
+            self._rec_thumb_rgb = None
+        self.recording_state_changed.emit(False, "Saving video...")
+        threading.Thread(
+            target=self._finalize_recording,
+            args=(rec, thumb_rgb),
+            name="rec-finalize",
+            daemon=True,
+        ).start()
+
+    def _stop_recording_sync(self) -> None:
+        with self._lock:
+            rec = self._recorder
+            self._recorder = None
+            self._rec_thumb_rgb = None
+            self._stopping_recording = False
+        if rec is not None:
+            try:
+                rec.stop()
+            except Exception:
+                pass
+
+    def _finalize_recording(
+        self,
+        rec: VideoRecorder,
+        thumb_rgb: Optional[np.ndarray],
+    ) -> None:
+        try:
+            res = rec.stop()
+            if res.ok:
+                if thumb_rgb is not None:
+                    thumb_np = cv2.resize(thumb_rgb, (160, 120), interpolation=cv2.INTER_AREA)
+                    thumb_np = np.ascontiguousarray(thumb_np)
+                    thumb_q = QtGui.QImage(thumb_np.data, 160, 120, 160 * 3, QtGui.QImage.Format_RGB888).copy()
+                else:
+                    thumb_q = QtGui.QImage()
+                audio_tag = "" if res.has_audio else " [no audio]"
+                msg = f"Saved {res.path.name} ({res.duration_s:.1f}s){audio_tag}"
+                self.video_saved.emit(str(res.path), thumb_q, msg)
+            else:
+                self.camera_error.emit(f"Video error: {res.error}")
+        except Exception as exc:
+            self.camera_error.emit(f"Video error: {exc}")
+        finally:
+            with self._lock:
+                self._stopping_recording = False
+            self.recording_state_changed.emit(False, "Ready")
 
     @staticmethod
     def _filter_focus_consistent(
@@ -190,7 +299,7 @@ class CameraController(QtCore.QObject):
     def trigger_shutter(self, hdr_mode: bool, mirror_front: bool) -> None:
         target_frames = self._hdr_frames if hdr_mode else 1
         with self._lock:
-            if self._pending_post is not None:
+            if self._pending_post is not None or self._recorder is not None:
                 return
             recent = list(self._ring)
             if not recent:
@@ -252,6 +361,9 @@ class CameraController(QtCore.QObject):
             raw_sc = cfg.at(1)
             vw, vh, vstride, vsize = vf_sc.size.width, vf_sc.size.height, vf_sc.stride, vf_sc.frame_size
             vfmt = str(vf_sc.pixel_format)
+            vf_pix_fmt = "bgr0" if ("XRGB8888" in vfmt or "ARGB8888" in vfmt) else "rgb0"
+            with self._lock:
+                self._vf_info = (vw, vh, vf_pix_fmt)
             rw, rh, rstride, rsize = raw_sc.size.width, raw_sc.size.height, raw_sc.stride, raw_sc.frame_size
 
             alloc = lc.FrameBufferAllocator(cam)
@@ -299,20 +411,28 @@ class CameraController(QtCore.QObject):
                     fps = (len(fps_times) - 1) / max(1e-4, fps_times[-1] - fps_times[0]) if len(fps_times) > 1 else 0.0
                     meta = _extract_meta(req.metadata)
 
-                    # Read compact RAW10 bytes into ZSL ring
-                    fb_raw = req.buffers[s_raw]
-                    p_raw = fb_raw.planes[0]
-                    with mmap.mmap(p_raw.fd, rsize, mmap.MAP_SHARED, mmap.PROT_READ) as mm:
-                        raw_bytes = bytes(mm[:rsize])
+                    with self._lock:
+                        active_rec = self._recorder
+                        rec_need_thumb = active_rec is not None and self._rec_thumb_rgb is None
+                        rec_mirror = self._rec_mirror_active
+
+                    # Skip heavy RAW10 memcpy while actively recording video
+                    raw_bytes: Optional[bytes] = None
+                    if active_rec is None:
+                        fb_raw = req.buffers[s_raw]
+                        p_raw = fb_raw.planes[0]
+                        with mmap.mmap(p_raw.fd, rsize, mmap.MAP_SHARED, mmap.PROT_READ) as mm:
+                            raw_bytes = bytes(mm[:rsize])
 
                     dispatch_job = None
                     do_refocus = False
                     with self._lock:
-                        self._ring.append((raw_bytes, meta))
+                        if raw_bytes is not None:
+                            self._ring.append((raw_bytes, meta))
                         if self._refocus_pending:
                             self._refocus_pending = False
                             do_refocus = True
-                        if self._pending_post is not None:
+                        if self._pending_post is not None and raw_bytes is not None:
                             post_left, tot_f, mdl, mir, evc, flist, _, _, _ = self._pending_post
                             if post_left > 0:
                                 flist.append((raw_bytes, meta))
@@ -331,33 +451,48 @@ class CameraController(QtCore.QObject):
                             daemon=True,
                         ).start()
 
-                    # Throttle UI QImage dispatch slightly to avoid backlog on busy UI
-                    if now - last_vf_emit >= 0.020:
-                        last_vf_emit = now
+                    # Push every viewfinder frame to recorder, and throttle UI QImage dispatch
+                    emit_ui = (now - last_vf_emit) >= 0.020
+                    if active_rec is not None or emit_ui:
                         fb_vf = req.buffers[s_vf]
                         p_vf = fb_vf.planes[0]
                         with mmap.mmap(p_vf.fd, vsize, mmap.MAP_SHARED, mmap.PROT_READ) as mm:
-                            row = np.frombuffer(mm[:vsize], dtype=np.uint8).reshape(vh, vstride)
-                            if "XRGB8888" in vfmt or "ARGB8888" in vfmt:
-                                bgra = row[:, : vw * 4].reshape(vh, vw, 4)
-                                rgb = bgra[:, :, 2::-1]
-                            else:
-                                rgba = row[:, : vw * 4].reshape(vh, vw, 4)
-                                rgb = rgba[:, :, :3]
-                            if self._active_model == "sc820cs" and self._mirror_preview:
-                                rgb = rgb[:, ::-1]
-                            rgb = np.ascontiguousarray(rgb)
-                        qimg = QtGui.QImage(rgb.data, vw, vh, vw * 3, QtGui.QImage.Format_RGB888).copy()
-                        hud = {
-                            "fps": round(fps, 1),
-                            "exp_us": int(meta.get("ExposureTime", 0) or 0),
-                            "again": round(float(meta.get("AnalogueGain", 1.0) or 1.0), 1),
-                            "ct": int(meta.get("ColourTemperature", 0) or 0),
-                            "has_af": has_af,
-                            "af_state": meta.get("AfState"),
-                            "lens_pos": meta.get("LensPosition"),
-                        }
-                        self.frame_ready.emit(qimg, hud)
+                            if active_rec is not None:
+                                if vstride == vw * 4:
+                                    active_rec.push_frame(bytes(mm[:vsize]))
+                                else:
+                                    row_rec = np.frombuffer(mm[:vsize], dtype=np.uint8).reshape(vh, vstride)
+                                    active_rec.push_frame(np.ascontiguousarray(row_rec[:, : vw * 4]).tobytes())
+
+                            if emit_ui or rec_need_thumb:
+                                row = np.frombuffer(mm[:vsize], dtype=np.uint8).reshape(vh, vstride)
+                                if vf_pix_fmt == "bgr0":
+                                    bgra = row[:, : vw * 4].reshape(vh, vw, 4)
+                                    rgb = bgra[:, :, 2::-1]
+                                else:
+                                    rgba = row[:, : vw * 4].reshape(vh, vw, 4)
+                                    rgb = rgba[:, :, :3]
+                                if rec_need_thumb:
+                                    thumb_src = rgb[:, ::-1] if rec_mirror else rgb
+                                    with self._lock:
+                                        if self._rec_thumb_rgb is None:
+                                            self._rec_thumb_rgb = np.ascontiguousarray(thumb_src)
+                                if emit_ui:
+                                    last_vf_emit = now
+                                    if should_mirror_front(self._active_model, self._mirror_preview):
+                                        rgb = rgb[:, ::-1]
+                                    rgb = np.ascontiguousarray(rgb)
+                                    qimg = QtGui.QImage(rgb.data, vw, vh, vw * 3, QtGui.QImage.Format_RGB888).copy()
+                                    hud = {
+                                        "fps": round(fps, 1),
+                                        "exp_us": int(meta.get("ExposureTime", 0) or 0),
+                                        "again": round(float(meta.get("AnalogueGain", 1.0) or 1.0), 1),
+                                        "ct": int(meta.get("ColourTemperature", 0) or 0),
+                                        "has_af": has_af,
+                                        "af_state": meta.get("AfState"),
+                                        "lens_pos": meta.get("LensPosition"),
+                                    }
+                                    self.frame_ready.emit(qimg, hud)
 
                     if not self._stop_event.is_set():
                         req.reuse()
@@ -409,7 +544,7 @@ class CameraController(QtCore.QObject):
                     rstride,
                     model,
                     metadata=meta,
-                    mirror_selfie=(mirror_front and model == "sc820cs"),
+                    mirror_selfie=should_mirror_front(model, mirror_front),
                     ev_comp=ev_comp,
                 )
                 pic_dir = Path.home() / "Pictures" / "OPD_Camera"
@@ -472,8 +607,13 @@ class CameraMainWindow(QtWidgets.QMainWindow):
         self._available = self._ctrl.probe_available()
         self._current_model = "sc820cs" if "sc820cs" in self._available else (self._available[0] if self._available else "sc820cs")
         self._hdr_mode = True
+        self._video_mode = False
+        self._is_recording = False
         self._mirror_front = True
-        self._last_photo_path: Optional[str] = None
+        self._last_media_path: Optional[str] = None
+        self._rec_timer = QtCore.QTimer(self)
+        self._rec_timer.setInterval(250)
+        self._rec_timer.timeout.connect(self._update_rec_timer)
 
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
@@ -530,8 +670,8 @@ class CameraMainWindow(QtWidgets.QMainWindow):
         self._btn_thumb.setFixedSize(68, 52)
         self._btn_thumb.setIconSize(QtCore.QSize(64, 48))
         self._btn_thumb.setStyleSheet("border-radius: 10px; padding: 0px; background-color: #16191f;")
-        self._btn_thumb.setToolTip("Open last photo")
-        self._btn_thumb.clicked.connect(self._open_last_photo)
+        self._btn_thumb.setToolTip("Open last photo or video")
+        self._btn_thumb.clicked.connect(self._open_last_media)
         dock.addWidget(self._btn_thumb)
 
         self._status_label = QtWidgets.QLabel("Ready")
@@ -540,22 +680,22 @@ class CameraMainWindow(QtWidgets.QMainWindow):
 
         dock.addStretch(1)
 
+        self._btn_photo_mode = QtWidgets.QPushButton("Photo")
+        self._btn_photo_mode.setCheckable(True)
+        self._btn_photo_mode.setChecked(True)
+        self._btn_photo_mode.clicked.connect(lambda: self._set_capture_mode(False))
+        dock.addWidget(self._btn_photo_mode)
+
         self._btn_shutter = QtWidgets.QPushButton("")
         self._btn_shutter.setFixedSize(78, 78)
-        self._btn_shutter.setStyleSheet(
-            """
-            QPushButton {
-                background-color: #f4f6f8;
-                border: 5px solid #596373;
-                border-radius: 39px;
-            }
-            QPushButton:pressed {
-                background-color: #b8c2cf;
-            }
-            """
-        )
         self._btn_shutter.clicked.connect(self._on_shutter)
         dock.addWidget(self._btn_shutter)
+
+        self._btn_video_mode = QtWidgets.QPushButton("Video")
+        self._btn_video_mode.setCheckable(True)
+        self._btn_video_mode.setChecked(False)
+        self._btn_video_mode.clicked.connect(lambda: self._set_capture_mode(True))
+        dock.addWidget(self._btn_video_mode)
 
         dock.addStretch(1)
 
@@ -566,13 +706,71 @@ class CameraMainWindow(QtWidgets.QMainWindow):
 
         root.addLayout(dock)
 
+        self._update_shutter_style()
+        self._btn_mirror.setVisible(self._current_model == "sc820cs")
+
         self._ctrl.frame_ready.connect(self._on_frame)
         self._ctrl.camera_started.connect(self._on_started)
         self._ctrl.camera_error.connect(self._on_error)
         self._ctrl.photo_saved.connect(self._on_saved)
+        self._ctrl.video_saved.connect(self._on_saved)
         self._ctrl.capture_busy.connect(self._on_busy)
+        self._ctrl.recording_state_changed.connect(self._on_recording_state)
 
         QtCore.QTimer.singleShot(80, lambda: self._ctrl.start_camera(self._current_model, self._mirror_front))
+
+    def _update_shutter_style(self) -> None:
+        if not self._video_mode:
+            self._btn_shutter.setStyleSheet(
+                """
+                QPushButton {
+                    background-color: #f4f6f8;
+                    border: 5px solid #596373;
+                    border-radius: 39px;
+                }
+                QPushButton:pressed {
+                    background-color: #b8c2cf;
+                }
+                """
+            )
+        elif self._is_recording:
+            self._btn_shutter.setStyleSheet(
+                """
+                QPushButton {
+                    background-color: #e53935;
+                    border: 6px solid #f4f6f8;
+                    border-radius: 18px;
+                }
+                QPushButton:pressed {
+                    background-color: #b71c1c;
+                }
+                """
+            )
+        else:
+            self._btn_shutter.setStyleSheet(
+                """
+                QPushButton {
+                    background-color: #e53935;
+                    border: 5px solid #f4f6f8;
+                    border-radius: 39px;
+                }
+                QPushButton:pressed {
+                    background-color: #b71c1c;
+                }
+                """
+            )
+
+    def _set_capture_mode(self, video_mode: bool) -> None:
+        if self._is_recording:
+            self._btn_photo_mode.setChecked(not self._video_mode)
+            self._btn_video_mode.setChecked(self._video_mode)
+            return
+        self._video_mode = video_mode
+        self._btn_photo_mode.setChecked(not video_mode)
+        self._btn_video_mode.setChecked(video_mode)
+        self._btn_mode.setVisible(not video_mode)
+        self._combo_ev.setVisible(not video_mode)
+        self._update_shutter_style()
 
     def _toggle_mode(self, checked: bool) -> None:
         self._hdr_mode = checked
@@ -592,7 +790,7 @@ class CameraMainWindow(QtWidgets.QMainWindow):
             self._ctrl.trigger_refocus()
 
     def _switch_camera(self) -> None:
-        if len(self._available) < 2:
+        if len(self._available) < 2 or self._is_recording:
             return
         idx = self._available.index(self._current_model)
         self._current_model = self._available[(idx + 1) % len(self._available)]
@@ -602,12 +800,45 @@ class CameraMainWindow(QtWidgets.QMainWindow):
         self._ctrl.start_camera(self._current_model, self._mirror_front)
 
     def _on_shutter(self) -> None:
-        self._canvas.trigger_flash()
-        self._ctrl.trigger_shutter(self._hdr_mode, self._mirror_front)
+        if self._video_mode:
+            if self._is_recording:
+                self._ctrl.stop_recording()
+            else:
+                self._ctrl.start_recording(self._mirror_front, enable_audio=True)
+        else:
+            self._canvas.trigger_flash()
+            self._ctrl.trigger_shutter(self._hdr_mode, self._mirror_front)
 
-    def _open_last_photo(self) -> None:
-        if self._last_photo_path:
-            QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(self._last_photo_path))
+    def _open_last_media(self) -> None:
+        if self._last_media_path:
+            QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(self._last_media_path))
+
+    def _update_rec_timer(self) -> None:
+        if not self._is_recording:
+            self._rec_timer.stop()
+            return
+        secs = int(self._ctrl.recording_elapsed_s())
+        self._status_label.setText(f"● REC {secs // 60:02d}:{secs % 60:02d}")
+        self._status_label.setStyleSheet("color: #ff5252; font-weight: 600;")
+
+    @QtCore.Slot(bool, str)
+    def _on_recording_state(self, recording: bool, msg: str) -> None:
+        self._is_recording = recording
+        saving = (not recording) and (msg == "Saving video...")
+        self._btn_shutter.setEnabled(not saving)
+        self._btn_photo_mode.setEnabled(not recording and not saving)
+        self._btn_video_mode.setEnabled(not recording and not saving)
+        self._btn_switch.setEnabled(len(self._available) > 1 and not recording and not saving)
+        self._btn_mirror.setEnabled(not recording and not saving)
+        self._update_shutter_style()
+        if recording:
+            self._rec_timer.start()
+            self._update_rec_timer()
+        else:
+            self._rec_timer.stop()
+            self._status_label.setStyleSheet("color: #d8dee6;")
+            if msg != "Ready":
+                self._status_label.setText(msg)
 
     @QtCore.Slot(QtGui.QImage, dict)
     def _on_frame(self, img: QtGui.QImage, hud: dict) -> None:
@@ -642,8 +873,9 @@ class CameraMainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot(str, QtGui.QImage, str)
     def _on_saved(self, path: str, thumb: QtGui.QImage, msg: str) -> None:
-        self._last_photo_path = path
-        self._btn_thumb.setIcon(QtGui.QIcon(QtGui.QPixmap.fromImage(thumb)))
+        self._last_media_path = path
+        if not thumb.isNull():
+            self._btn_thumb.setIcon(QtGui.QIcon(QtGui.QPixmap.fromImage(thumb)))
         self._status_label.setText(msg)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:

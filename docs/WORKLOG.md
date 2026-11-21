@@ -2530,6 +2530,23 @@ mpv、Firefox 仍是软解（Fedora `ffmpeg-free` 的专利限制），用户选
   4. **纯净版重装与 20 轮压力回归**：发现首版 `-32` 因增量源码还原保留旧 mtime 残留了 `soccp-diag` 调试打印，随即清除两份 `.o` 重编并离线验证零 `soccp-diag` 字符串后覆盖重装至平板；在纯净版 `-32`（`#62`）上使用 `video=efifb:off loglevel=7 ignore_loglevel` 连跑 20 轮无人值守热重启（日志 `private/bootdiag-20261120/reg32/runs.log`），**20/20 全部通过、零异常**（单轮耗时稳定在 `39.6–41.0 s`，中位数 `40.0 s`，全部 `seq +1` 且正常结束于 `reboot: Restarting system`），退出已自动删除临时项。
   5. **默认项固化、生产全检与 2 次冷启动终验**：切换 `boot-select default fedora-7.2.15-32.opd2413.conf` 并标准参数（`quiet loglevel=3`）重启，`38.7 s` 上线：`uname -r = 7.2.15-32.opd2413`（`#62`，零 `soccp-diag`）、`running`、`0 failed`、`SELinux Enforcing` 零 AVC、`opd2413-sensors-gate`/`bluetooth`/`opd2413-face`/`NetworkManager` 全 `active`、`cpuidle=teo`、`card 0: OnePlusPad2Pro` 音频正常、`KSHIM.CHO` 保持 `1 extent`。随后用户实机执行 **2 次冷启动复核均无异常**，[TECH-DEBT.md](TECH-DEBT.md) `#39` 彻底关闭。
 
+## 2026-11-21 `opd2413-camera` 0.1-3：新增录像功能并统一前摄镜像朝向（`真机启动`）
+
+- **问题根因定位**：
+  - 底层 `libcamera` / PipeWire 经硬件 `HFLIP+VFLIP` 补偿 `Rotation=180` 后，前摄 `sc820cs` 与后摄 `sc1300cs` 均输出正立非镜像流。
+  - GNOME Camera（`snapshot-51.0`）仅在 GTK 预览层 `Viewfinder::snapshot()` 对前摄做 `scale(-1.0, 1.0)` 水平镜像，而 `camerabin` 的 `image-filter`/`video-filter` 均不做翻转；本项目自带 `opd-camera` 默认开启 `Selfie Mirror`（预览与拍照均水平镜像）但此前不含录像功能，导致用户跨应用拍照与录像时前摄成片与预览朝向不一致。
+  - 经用户确认方案：为 `opd-camera` 新增原生录像功能，使前摄在开启 `Selfie Mirror` 时预览、拍照、录像朝向完全一致（所见即所得）。
+- **实现与离线验证（`离线通过`）**：
+  - 新增 [packaging/opd2413-camera/src/video_recorder.py](../packaging/opd2413-camera/src/video_recorder.py)：统一 `should_mirror_front(model, mirror_front)` 判定，并以非阻塞异步队列将视图流（`bgr0`/`rgb0`）经管道送入 `ffmpeg`（`libopenh264` + PulseAudio `aac`、`-use_wallclock_as_timestamps 1`、`-shortest`、`+faststart`；前摄镜像时附加 `-vf hflip`，音频不可用时自动降级为纯视频）。
+  - 更新 [packaging/opd2413-camera/src/opd-camera-gui.py](../packaging/opd2413-camera/src/opd-camera-gui.py)：新增 Photo/Video 模式切换、红色录像/停止按钮、实时 `● REC MM:SS` 计时、录制期间跳过 `RAW10` 拷贝并锁定切镜与镜像开关，成片保存至 `~/Videos/OPD_Camera/VID_<时间>_<FRONT|REAR>.mp4` 并联动缩略图打开。
+  - 新增 [packaging/opd2413-camera/tests/test_video_recorder.py](../packaging/opd2413-camera/tests/test_video_recorder.py)（含合成 `bgr0` 帧实录编解码像素级镜像校验），更新 [packaging/opd2413-camera/opd2413-camera.spec](../packaging/opd2413-camera/opd2413-camera.spec)（`0.1-3`，补充 `/usr/bin/ffmpeg` 依赖）与 [tools/build-camera-rpm.sh](../tools/build-camera-rpm.sh)。
+  - 本机原生构建 `out/rpmbuild/RPMS/aarch64/opd2413-camera-0.1-3.fc45.aarch64.rpm`（`SHA256: 90359485048a5f23...`），`test_hdrplus_isp.py` 与 `test_video_recorder.py` 全部通过。
+- **上机安装与冒烟验证（`真机启动`，待用户目视复核）**：
+  - **预期与判据**：升级安装 `opd2413-camera-0.1-3.fc45.aarch64` 后，`opd-camera` 可在前/后摄正常预览、拍照与录像，前摄开启 `Selfie Mirror` 时录像回放与预览、拍照水平朝向一致且音画同步。
+  - **实测结果**：
+    1. 前摄 `sc820cs`（`1632x1224`，`mirror_front=True`）实机录像冒烟 `1.48 s`：产出 35 帧 H.264（`start=0.000000`, `dur=1.480000`）+ 69 帧 AAC（`start=0.000000`, `dur=1.477166`），缩略图生成正常，零报错（临时文件已清理）。
+    2. 经用户确认后执行 `pkexec dnf -y upgrade` 装入 `opd2413-camera-0.1-3.fc45.aarch64`，`/usr/libexec/opd2413/video_recorder.py` 等 7 个文件校验齐全。待用户在桌面打开 `OPD2413 HDR+ Camera` 实拍录像确认画面与声音。
+
 
 
 

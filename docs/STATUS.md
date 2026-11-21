@@ -77,7 +77,7 @@ M2 剩下的被动观察项：开机提示音毛刺再出现时当场取证；�
   ESP `/dev/sda16` 总计 512M、已用 370M、空闲 143M（73 %）。固定路径 `/dtbs/qcom/sm8750-oneplus-pad2pro.dtb` 是 7.2.15 的（与内核 3 相同）。
 - `boot_b` = `07bf1b53…`（fedora1：菜单 ColorOS / Fedora / Fedora boot menu，倒计时 10 s，默认项仍是 ColorOS）；KSHIM.CHO 记住 Fedora。
   上一版 `492f2cdf…` 的整分区回读在主机 `private/bootflow-20261111/boot_b-readonly.img`。
-- 软件包：内核 `kernel-opd2413-7.2.15-31.opd2413`（当前默认/正在运行）、`kernel-opd2413-7.2.15-30.opd2413`（保留回退）与 `kernel-opd2413-7.2.15-29.opd2413`（保留回退条目），以及 `opd2413-gaming-0.1-4`、`libinput-1.32.0-1.fc45.opd2413.1`、`opd2413-device-0.1-15`（已并入 `lid-input`/`lid-suspend` 并完成重启自启验证）、`opd2413-audio-0.1-12`、`opd2413-sensors-0.1-1`、`opd2413-netshare-0.1-11`、`libcamera{,-ipa,-tools}-0.7.2-5.fc45.opd2413.3`、`python3-libcamera-0.7.2-5.fc45.opd2413.3`、`opd2413-camera-0.1-2`、`opd2413-face-0.1-13`、`polkit-kde-6.8.3-1.fc45.opd2413.2`、`kscreenlocker-6.8.3-1.fc45.opd2413.1`、`wireless-regdb-2026.09.03-1.fc45`、`opd2413-firmware-16.0.10.600-2`、`showtime`（registry 在 `/var/lib/opd2413/sensors`），另装有 Fedora 官方 `fex-emu 2604`、`fex-emu-rootfs-fedora`、`fex-emu-thunks`、`gamescope 3.16.31`、`mangohud 0.8.3`、`gamemode 1.8.2`。`rpm -ivh --nosignature` 不受 `installonly_limit=2` 自动淘汰。
+- 软件包：内核 `kernel-opd2413-7.2.15-32.opd2413`（当前默认/正在运行）、`kernel-opd2413-7.2.15-31.opd2413`（保留回退）与 `kernel-opd2413-7.2.15-30.opd2413`（保留回退条目），以及 `opd2413-gaming-0.1-7`、`libinput-1.32.0-1.fc45.opd2413.1`、`opd2413-device-0.1-15`（已并入 `lid-input`/`lid-suspend` 并完成重启自启验证）、`opd2413-audio-0.1-12`、`opd2413-sensors-0.1-1`、`opd2413-netshare-0.1-11`、`libcamera{,-ipa,-tools}-0.7.2-5.fc45.opd2413.3`、`python3-libcamera-0.7.2-5.fc45.opd2413.3`、`opd2413-camera-0.1-3`、`opd2413-face-0.1-13`、`polkit-kde-6.8.3-1.fc45.opd2413.2`、`kscreenlocker-6.8.3-1.fc45.opd2413.1`、`wireless-regdb-2026.09.03-1.fc45`、`opd2413-firmware-16.0.10.600-2`、`showtime`（registry 在 `/var/lib/opd2413/sensors`），另装有 Fedora 官方 `fex-emu 2604`、`fex-emu-rootfs-fedora`、`fex-emu-thunks`、`gamescope 3.16.31`、`mangohud 0.8.3`、`gamemode 1.8.2`。`rpm -ivh --nosignature` 不受 `installonly_limit=2` 自动淘汰。
   内核 3（`7.2.6-3`）08:45 经用户同意卸载，它的包仍在主机 `out/rpms/`。
 - 7.3 测试内核、"M3 test" 和 "Log capture" 两个条目、ESP 上的 `opd2413-bootlog/` 已于 11-11 23:29 删除。
 - `/etc/modprobe.d/opd2413-pps.conf` 已删除（11-12）。`/etc/kernel/tries` 已删除。
@@ -134,7 +134,7 @@ M2 剩下的被动观察项：开机提示音毛刺再出现时当场取证；�
 | `out/rpmbuild/RPMS/noarch/opd2413-firmware-16.0.10.600-2.noarch.rpm` | 平板上的固件包（加 Iris 固件） |
 | `out/rpmbuild/RPMS/noarch/opd2413-netshare-0.1-8.noarch.rpm`、`out/netshare/opd-netshare.apk` | 跨设备自动网络共享平板端 RPM（`99K`，含 `0.1-4` 80 MHz/`CN`/SCC、 `0.1-5` WirePlumber BT Sink/HF 隔离、`0.1-6`/`0.1-7` BT 断电/重配对自愈、`0.1-8` Wayland `setDesktopFileName`/多尺寸 `hicolor` 应用图标与 4 态 `128×128` 托盘图标）与 Android 伴侣 APK（`90K`，v3 签名，含自适应/单色桌面图标及 24dp 六边形通知/磁贴矢量） |
 | `out/rpmbuild/RPMS/aarch64/libcamera*-0.7.2-5.fc45.opd2413.3.aarch64.rpm` | `libcamera` SoftISP / LSC / AF 与 Stage 1 调校/视角修复 RPM 产物（含 `0101`–`0107` 及调校更新） |
-| `out/rpmbuild/RPMS/aarch64/opd2413-camera-0.1-2.fc45.aarch64.rpm` | ZSL 多帧 RAW10 HDR+ 相机 CLI（`opd-camera-cli`）与 Qt6 Wayland GUI（`opd-camera`）RPM（含自动亮度/肤色保护鲜艳度及后摄 AF 控制） |
+| `out/rpmbuild/RPMS/aarch64/opd2413-camera-0.1-3.fc45.aarch64.rpm` | ZSL 多帧 RAW10 HDR+ 相机 CLI（`opd-camera-cli`）与 Qt6 Wayland GUI（`opd-camera`）RPM（含自动亮度/肤色保护鲜艳度、后摄 AF 控制、原生 MP4 录像与前摄预览/拍照/录像镜像一致） |
 | `out/rpmbuild/RPMS/aarch64/opd2413-face-0.1-10.fc45.aarch64.rpm` | 原生人脸识别守护进程、PAM、锁屏覆盖与 GUI 录入向导 RPM |
 | `out/video/`、`private/m3-video-20261112/` | 视频测试片源、解码记录 |
 | `private/cam-stage1-20261115/` | Stage 1 / Stage 2 HDR+ 相机前后摄真机对比样张与量化指标证据 |

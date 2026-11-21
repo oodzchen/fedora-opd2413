@@ -38,7 +38,7 @@ if [ "$OPD_BUILD_TARGET" = "tablet" ]; then
 
     if ! opd_tablet_ssh "$repo" "env VER=$(printf '%q' "$ver") REL=$(printf '%q' "$rel") RWORK=$(printf '%q' "$rwork") bash -euxs" <<'REMOTE' > "$work/build-$ver-$rel.log" 2>&1
 missing=()
-for pkg in rpm-build python3-devel python3-numpy python3-opencv python3-pillow desktop-file-utils; do
+for pkg in rpm-build python3-devel python3-numpy python3-opencv python3-pillow desktop-file-utils ffmpeg-free; do
     rpm -q "$pkg" >/dev/null 2>&1 || missing+=("$pkg")
 done
 if [ "${#missing[@]}" -gt 0 ]; then
@@ -65,7 +65,7 @@ else
     builder="localhost/opd2413-builder-camera:fc45"
     setup_cmd='dnf -y --setopt=install_weak_deps=False --setopt=keepcache=True install \
         rpm-build python3-devel python3-numpy python3-opencv python3-pillow \
-        desktop-file-utils >/dev/null'
+        desktop-file-utils ffmpeg-free >/dev/null'
     opd_ensure_cached_image "--arch arm64" "$builder" "$image" "$cache" "$setup_cmd"
 
     podman run --rm --arch arm64 --network host \
