@@ -1,0 +1,35 @@
+From: fedora-opd2413 <noreply@local>
+Date: Sun, 22 Nov 2026 21:57:00 +0800
+Subject: [PATCH] arm64: dts: qcom: sm8750-oneplus-pad2pro: add pmic-glink
+ orientation-gpios
+
+Without orientation-gpios on pmic-glink, pmic_glink_ucsi cannot determine
+the Type-C plug orientation for plain USB (non-DP Alt Mode) attachments,
+leaving the QMP USB3/DP combo PHY stuck in NORMAL orientation so USB 3.x
+devices only enumerate at SuperSpeed in one plug orientation and fall back
+to USB 2.0 (480M) when flipped.
+
+Probing all GPIOs on the OnePlus Pad 2 Pro with a USB 3.2 Gen 2 (10 Gbps)
+NVMe enclosure in both plug orientations confirmed TLMM GPIO 61 toggles
+with plug orientation: HIGH corresponds to TYPEC_ORIENTATION_REVERSE and
+LOW corresponds to TYPEC_ORIENTATION_NORMAL (matching sm8750-mtp/qrd).
+Declare orientation-gpios as GPIO_ACTIVE_HIGH so pmic_glink_ucsi reports
+TYPEC_ORIENTATION_REVERSE on HIGH and TYPEC_ORIENTATION_NORMAL on LOW.
+---
+ arch/arm64/boot/dts/qcom/sm8750-oneplus-pad2pro.dts | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/arch/arm64/boot/dts/qcom/sm8750-oneplus-pad2pro.dts b/arch/arm64/boot/dts/qcom/sm8750-oneplus-pad2pro.dts
+index 1a2b3c4d5..6f7e8d9c0 100644
+--- a/arch/arm64/boot/dts/qcom/sm8750-oneplus-pad2pro.dts
++++ b/arch/arm64/boot/dts/qcom/sm8750-oneplus-pad2pro.dts
+@@ -299,6 +299,7 @@
+ 			     "qcom,pmic-glink";
+ 		#address-cells = <1>;
+ 		#size-cells = <0>;
++		orientation-gpios = <&tlmm 61 GPIO_ACTIVE_HIGH>;
+ 
+ 		connector@0 {
+ 			compatible = "usb-c-connector";
+-- 
+2.47.0

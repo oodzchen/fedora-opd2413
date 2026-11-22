@@ -70,4 +70,7 @@
 | `7.2.15-30` | Pogo 键盘触摸板修复：`2436`（注册 `ABS_MT_TOOL_TYPE` 按 `slot[0] & BIT(0)` 上报手指/掌触置信位，并将 `0x2f` 1 s 心跳抬指限定在 `tp_rx_err` 且超 `250 ms` 无新触控帧时） |
 | `7.2.15-31` | 游戏性能基座（阶段 1B）：`m4-gaming.config`（仅新增 `CONFIG_CPU_IDLE_GOV_TEO=y`，零代码改动，配合 `opd2413-gaming` tmpfiles 开机切换 `cpuidle=teo`） |
 | `7.2.15-32` | 启动偶发黑屏硬复位修复（`TECH-DEBT #39`）：`2437`（板级 DTS 新增原厂 `splash@fc800000` `0x2b00000` `no-map` 保留区，消除全局 CMA 与活跃 144 Hz bootloader 显存重叠导致 `qcom_scm_pas_init_image()` 期间触发 XPU 硬件复位） |
+| `7.2.15-33` | Type-C 4-lane DP 下 USB 2.0（KVM 键鼠/Hub）修复：`2438`（`wcd939x_usbss_set()` 在 `TYPEC_DP_STATE_C`/`E` 下同步开启 `enable_usb = true`，不再断开 D+/D- 开关） |
+| `7.2.15-34` | 实验（极性反）：`2439` 初版误用 `GPIO_ACTIVE_LOW`，正反插均降速 480M |
+| `7.2.15-35` | Type-C USB 3.x 正反双向修复：`2439` 修正为 `orientation-gpios = <&tlmm 61 GPIO_ACTIVE_HIGH>`（与 SM8750 MTP/QRD 一致），纯 USB 3.x 正反插均可满速 10 Gbps |
 | `7.2.15-30` | Pogo 键盘触摸板掌触与心跳修复：`2436`（`oneplus-pogo-keyboard.c` 按 `slot[0] & BIT(0)` 上报 `ABS_MT_TOOL_TYPE`=`MT_TOOL_PALM`/`MT_TOOL_FINGER`，且仅在 UART 帧/CRC 错误 `tp_rx_err` 并超时 `250 ms` 无新触控帧时于 `0x2f` 心跳释放残余触点，消除 1 s 周期性断触） |

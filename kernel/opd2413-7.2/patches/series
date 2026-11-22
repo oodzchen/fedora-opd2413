@@ -120,3 +120,9 @@
 # Early boot XPU reset fix (#39): reserve ABL splash framebuffer at 0xfc800000
 2437-arm64-dts-qcom-sm8750-oneplus-pad2pro-reserve-bootlo.patch
 
+# Type-C DP Alt Mode USB 2.0 KVM fix: keep WCD939x D+/D- enabled in 4-lane DP (Pin Assignment C/E)
+2438-usb-typec-mux-wcd939x-usbss-keep-USB2-DP-DM-enabled-.patch
+
+# Type-C USB 3.x dual-orientation fix: expose TLMM GPIO 61 CC orientation to pmic_glink_ucsi
+2439-arm64-dts-qcom-sm8750-oneplus-pad2pro-add-pmic-glink.patch
+

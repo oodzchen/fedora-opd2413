@@ -2557,3 +2557,32 @@ mpv、Firefox 仍是软解（Fedora `ffmpeg-free` 的专利限制），用户选
 
 
 
+
+## 2026-11-22
+
+### 外接 Type-C KVM 显示器 USB 2.0 断连排查与补丁 `2438`（`7.2.15-33.opd2413`）
+
+- **现场取证**：外接 4K KVM 显示器可正常扩展显示（`card1-DP-1: connected 3840x2160`），Type-C 端口处于 `data_role=[host]`、`power_role=[sink]`（9 V PD），`xhci-hcd` 根集线器（Bus 1 480M / Bus 2 10000M）均在位，但 `lsusb` 下无任何外设。内核日志显示插入瞬间 `usb 1-1`（显示器内置 USB 2.0 Hub）曾被探测，紧接着 `wcd939x-usbss` 切入 4-lane DP（`mode=4 svid=ff01`，即 `TYPEC_DP_STATE_C`）时输出 `usb=0 dp=1`，导致 `usb 1-1` 立即报 `can't set config #1, error -71` 掉线。
+- **根因**：`drivers/usb/typec/mux/wcd939x-usbss.c` 中 `wcd939x_usbss_set()` 对 `TYPEC_DP_STATE_C`/`E`（4-lane DP）未设置 `enable_usb = true`，清零开关后漏开 `DNL`/`DPR`（USB 2.0 D+/D-）。
+- **USB 3.0 核查**：`sm8750.dtsi` 的 `usb_dp_qmpphy` 已具备 `mode-switch`/`orientation-switch` 并连到 `pmic_glink_ss_in`，`phy-qcom-qmp-combo.c` 已支持 `QMPPHY_MODE_USB3_ONLY` / `QMPPHY_MODE_USB3DP`（`TYPEC_DP_STATE_D`/`F`） / `QMPPHY_MODE_DP_ONLY`（`TYPEC_DP_STATE_C`/`E`）及正反插方向切换。当前显示器协商为 4-lane DP（`STATE_C`），4 对高速线全部分配给视频；如需同时跑 USB 3.0 高速，需在显示器 OSD 切换为“USB 3.0 优先 / 2-lane DP”（`STATE_D`）或在纯 USB 3.0 外设下实测。
+- **改动与产物**：新增补丁 `2438-usb-typec-mux-wcd939x-usbss-keep-USB2-DP-DM-enabled-.patch`，在本机容器基于 `7.2.15-32`（含 `2437`）构建打包 `out/rpmbuild/RPMS/aarch64/kernel-opd2413-7.2.15-33.opd2413.aarch64.rpm`（`SHA256: f77b71f4...`），DTB 与 `7.2.15-32` 逐字节一致。
+- **上机预期与判据（待用户确认安装）**：
+  1. 卸载最旧回退 `7.2.15-30.opd2413`（保留 `-32` 为默认项、`-31` 为二级回退），安装 `7.2.15-33.opd2413`，设置 `boot-select next fedora-7.2.15-33.opd2413.conf` 重启测试。
+  2. 进入 `7.2.15-33.opd2413` 后插拔外接 KVM 显示器：`wcd939x-usbss` 日志在 `mode=4 svid=ff01` 下打印 `usb=1 dp=1`，扩展显示正常，`lsusb -tv` 稳定识别显示器内置 Hub 及键鼠且可直接打字/移动光标，无 `-71` 掉线。
+  3. 同步验证 USB 3.0（显示器 OSD 切 USB 3.0 模式或直插 USB 3.0 设备，`lsusb -tv` 下 Bus 2 `5000M`/`10000M` 正常枚举）。
+- **实机验收结果（2026-11-22，真机通过）**：
+  - 成功重启进入 `uname -r = 7.2.15-33.opd2413`：`systemctl is-system-running = running`、`0 failed`、SELinux `Enforcing`、`0 avc: denied`。
+  - 外接 4K KVM 显示器后，`wcd939x-usbss` 在 4-lane DP（`mode=4 svid=ff01 orient=2`）下正确输出 `usb=1 dp=1 audio=0 dp_active=1`，显示器内置 TI Hub（`0451:8442` / `0451:82ff`）及下游罗技无线鼠标（`046d:c53f`）与键盘（`342d:e4ce`）均稳定枚举在 `Bus 001`（480M/12M），用户确认 KVM 键鼠与显示器输入源切换提示均恢复正常。
+  - 当前仍保持 `loader.conf` 默认项为 `fedora-7.2.15-32.opd2413.conf`，待用户确认是否固化 `7.2.15-33.opd2413` 为默认项。
+
+### Type-C USB 3.x 正反双向修复与补丁 `2439`（`7.2.15-34.opd2413`）
+
+- **现场取证**：在 `7.2.15-33.opd2413` 上直插 RTL9210 NVMe 硬盘盒（`WD_BLACK SN770 1TB`）：正面握手 `Bus 002` `10000M`（USB 3.2 Gen 2），翻面反插降速至 `Bus 001` `480M`（USB 2.0）；内核日志显示纯 USB 模式下 `orient` 始终为 `0`。对反插与正插状态下的完整 `/sys/kernel/debug/gpio` 做 diff，确认 `f100000.pinctrl`（TLMM）`gpio61`（硬件 `usb_phy` 功能引脚）在正面（10 Gbps）为 `HIGH`、反面为 `LOW`。
+- **根因**：板级 DTS `pmic-glink` 节点缺失 `orientation-gpios`，导致 `pmic_glink_ucsi` 在纯 USB 连接（非 DP AltMode）下无法通过 `typec_set_orientation()` 通知 `usb_dp_qmpphy` 翻转通道。
+- **改动**：新增补丁 `2439-arm64-dts-qcom-sm8750-oneplus-pad2pro-add-pmic-glink.patch`，在 `pmic-glink` 节点添加 `orientation-gpios = <&tlmm 61 GPIO_ACTIVE_LOW>;`，构建 `kernel-opd2413-7.2.15-34.opd2413.aarch64.rpm`（包含 `2437` + `2438` + `2439`）。
+- **上机预期与判据**：
+  1. 卸载最旧回退 `7.2.15-31.opd2413`（保留 `-32` 默认回退与 `-33` 二级回退），安装 `7.2.15-34.opd2413` 并 `boot-select next fedora-7.2.15-34.opd2413.conf` 重启测试。
+  2. 进入 `7.2.15-34.opd2413` 后：`/sys/class/typec/port0/orientation` 正常出现；直插 RTL9210 硬盘盒**正插与反插**均在 `Bus 002` 握手 `10000M`（`SuperSpeed Plus Gen 2x1`）；外接 4K KVM 显示器画面、键鼠、切换提示回归正常。
+- **实机验收结果（2026-11-22，`7.2.15-35.opd2413` 真机通过）**：
+  - `7.2.15-34`（初版 `GPIO_ACTIVE_LOW`）实测 `normal` 与 `reverse` 两面均降速 `480M`，证实此前 `-33` 测试正面 10 Gbps 时 `qmp->orientation` 实际保留了拔掉显示器前遗留的 `REVERSE` 状态，故本机 `tlmm 61` 与 SM8750 MTP/QRD 完全一致，应为 `GPIO_ACTIVE_HIGH`（`HIGH=REVERSE`、`LOW=NORMAL`）。
+  - 修正 `2439` 为 `orientation-gpios = <&tlmm 61 GPIO_ACTIVE_HIGH>;` 并构建安装 `7.2.15-35.opd2413`（`SHA256: d0dd099e...`）后重启验收：`uname -r = 7.2.15-35.opd2413`、`running`、`0 failed`、SELinux `Enforcing`、零 AVC；直插 RTL9210 NVMe 硬盘盒实测 **`orientation=normal`（`orient=1`）→ `Bus 002` `10000M`（`SuperSpeed Plus Gen 2x1`）**，翻面后 **`orientation=reverse`（`orient=2`）→ `Bus 002` `10000M`（`SuperSpeed Plus Gen 2x1`）**，双面 10 Gbps 满速全部通过。

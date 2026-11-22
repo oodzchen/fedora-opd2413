@@ -1,0 +1,50 @@
+From: fedora-opd2413 <noreply@local>
+Date: Sun, 22 Nov 2026 20:52:00 +0800
+Subject: [PATCH] usb: typec: mux: wcd939x-usbss: keep USB2 D+/D- enabled in
+ 4-lane DP alt-mode
+
+The WCD939x USBSS crossbar switches the Type-C SBU1/SBU2 (DP AUX /
+analog audio) and D+/D- (USB 2.0) lines, not the SuperSpeed lanes.
+
+In wcd939x_usbss_set(), TYPEC_DP_STATE_C and TYPEC_DP_STATE_E (4-lane
+DisplayPort without SuperSpeed USB3) only set enable_dp = true and
+left enable_usb = false. Because the function clears all switch enable
+bits before reprogramming, entering 4-lane DP alt-mode physically
+disconnects the USB 2.0 D+/D- switches and drops any downstream USB 2.0
+hub / monitor KVM keyboard and mouse with -EPROTO (-71).
+
+Per the USB Type-C DisplayPort Alt Mode specification, USB 2.0 D+/D-
+is independent of the SuperSpeed pin assignment and remains active in
+all DP pin assignments (C/D/E/F). Keep enable_usb = true for
+TYPEC_DP_STATE_C and TYPEC_DP_STATE_E as well.
+---
+ drivers/usb/typec/mux/wcd939x-usbss.c | 16 ++++++++--------
+ 1 file changed, 8 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/usb/typec/mux/wcd939x-usbss.c b/drivers/usb/typec/mux/wcd939x-usbss.c
+index 65700fc7c..b1a4d2c9e 100644
+--- a/drivers/usb/typec/mux/wcd939x-usbss.c
++++ b/drivers/usb/typec/mux/wcd939x-usbss.c
+@@ -268,14 +268,14 @@ static int wcd939x_usbss_set(struct wcd939x_usbss *usbss)
+ 		enable_usb = true;
+ 	} else if (usbss->svid) {
+ 		switch (usbss->mode) {
+-		/* DP Only */
++		/*
++		 * DP Alt Mode uses SBU for AUX and 2 or 4 SuperSpeed lanes
++		 * for video, leaving USB 2.0 D+/D- independent. Keep D+/D-
++		 * routed to USB in all DP pin assignments (C/D/E/F).
++		 */
+ 		case TYPEC_DP_STATE_C:
+-		case TYPEC_DP_STATE_E:
+-			enable_dp = true;
+-			break;
+-
+-		/* DP + USB */
+ 		case TYPEC_DP_STATE_D:
++		case TYPEC_DP_STATE_E:
+ 		case TYPEC_DP_STATE_F:
+ 			enable_usb = true;
+ 			enable_dp = true;
+-- 
+2.47.0
