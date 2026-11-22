@@ -2586,3 +2586,10 @@ mpv、Firefox 仍是软解（Fedora `ffmpeg-free` 的专利限制），用户选
 - **实机验收结果（2026-11-22，`7.2.15-35.opd2413` 真机通过）**：
   - `7.2.15-34`（初版 `GPIO_ACTIVE_LOW`）实测 `normal` 与 `reverse` 两面均降速 `480M`，证实此前 `-33` 测试正面 10 Gbps 时 `qmp->orientation` 实际保留了拔掉显示器前遗留的 `REVERSE` 状态，故本机 `tlmm 61` 与 SM8750 MTP/QRD 完全一致，应为 `GPIO_ACTIVE_HIGH`（`HIGH=REVERSE`、`LOW=NORMAL`）。
   - 修正 `2439` 为 `orientation-gpios = <&tlmm 61 GPIO_ACTIVE_HIGH>;` 并构建安装 `7.2.15-35.opd2413`（`SHA256: d0dd099e...`）后重启验收：`uname -r = 7.2.15-35.opd2413`、`running`、`0 failed`、SELinux `Enforcing`、零 AVC；直插 RTL9210 NVMe 硬盘盒实测 **`orientation=normal`（`orient=1`）→ `Bus 002` `10000M`（`SuperSpeed Plus Gen 2x1`）**，翻面后 **`orientation=reverse`（`orient=2`）→ `Bus 002` `10000M`（`SuperSpeed Plus Gen 2x1`）**，双面 10 Gbps 满速全部通过。
+
+### 显示空闲熄屏/双屏 `DPMS off -> on` 花屏泛灰排查与证伪（`TECH-DEBT #47`）
+
+- **现场复现**：在 `7.2.15-35.opd2413` 外接显示器双屏模式下跑 5 轮 `DPMS off (2s) -> on (2s)`，无论 60 Hz 还是 120 Hz 均偶发并粘滞复现“整屏竖条彩噪花屏 → 持续有背光泛灰”，后续再次 `DPMS off/on` 无法恢复；而在线切刷新率（`60 <-> 120 Hz`）4/4 次瞬间恢复正常画面。
+- **假设验证与证伪**：原怀疑 MDSS GDSC 未掉电时 `2414` 保留的 `trigger_flush + trigger_start` 残留卡死 `CTL_0`，构建临时内核 `7.2.15-36.opd2413`（实验补丁 `2440`，在 `dpu_crtc_atomic_begin()` 检查并复位 `is_started`/`get_flush_register`）实测：双屏 5 轮压测仍复现泛灰黑屏且 `resetting stale ctl` 从未触发。
+- **硬件寄存器全量取证（`private/display-dpms-grey-20261122/`）**：在 `7.2.15-36.opd2413` 同频 120 Hz 下分别抓取正常态（`dpu_120_good.txt`）与真实黑屏泛灰态（`dpu_120_bad2.txt`）的完整 `/sys/kernel/debug/dri/1/kms`（6013 行）逐模块比对，证实 SoC 侧 `ctl_0`、`lm`、`dspp`、`dce_0_0/0_1`（DSC）、`intf_1/2`、`dsi0/1_ctrl`、`dsi0/1_phy` 全部配置寄存器 **100% 逐位一致**，彻底排除 SoC 侧 `CTL_0`/DPU/DSI 配置卡死，锁定根因位于面板侧（`nt36536` 在 `2433` 真断电 ≥2 s 后重新上电/复位/DCS 初始化时序偶发失锁）。
+- **收口**：已撤回实验补丁 `2440` 并清理 `-36` 构建产物，登记为 [TECH-DEBT.md](TECH-DEBT.md) `#47`；`loader.conf` 默认项仍为已验收提交的 `fedora-7.2.15-35.opd2413.conf`，下次正常重启后即可自动回到 `-35` 并按需卸载 `-36`。
