@@ -1,0 +1,75 @@
+From 8b3f19e4856a0000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: yzddmr6 <46088090+yzddmr6@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 09:24:32 +0000
+Subject: [PATCH] drm/msm/dsi: program the HS TX timer and the video MISR like
+ the vendor driver
+
+The vendor video-mode engine setup writes HS_TIMER_CTRL = 0x3FD08
+(timer resolution 3, timeout 0xFD08, STOP_EN clear) and enables the
+per-frame video MISR (MISR_VIDEO_CTRL = 0x10100). Mainline leaves the
+timer at its reset value, so TIMEOUT_STATUS latches HS_TX_TIMEOUT on
+every frame and carries no information, and never enables the MISR.
+
+Do both on DSI 6G in video mode and describe the MISR registers in
+dsi.xml; MISR_VIDEO_32BIT then gives a per-link CRC of the controller
+output for each frame.
+
+(cherry picked from commit 4d13b6e74241b44eab2fcde9b1cb30ff951760d8)
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ drivers/gpu/drm/msm/dsi/dsi_host.c            | 15 +++++++++++++++
+ drivers/gpu/drm/msm/registers/display/dsi.xml |  5 +++++
+ 2 files changed, 20 insertions(+)
+
+diff --git a/drivers/gpu/drm/msm/dsi/dsi_host.c b/drivers/gpu/drm/msm/dsi/dsi_host.c
+index 1a2b3c4d5..2b3c4d5e6 100644
+--- a/drivers/gpu/drm/msm/dsi/dsi_host.c
++++ b/drivers/gpu/drm/msm/dsi/dsi_host.c
+@@ -860,6 +860,21 @@ static void dsi_ctrl_enable(struct msm_dsi_host *msm_host,
+ 		/* Do not swap RGB colors */
+ 		data = DSI_VID_CFG1_RGB_SWAP(SWAP_RGB);
+ 		dsi_write(msm_host, REG_DSI_VID_CFG1, 0);
++
++		if (cfg_hnd->major == MSM_DSI_VER_MAJOR_6G) {
++			/*
++			 * Vendor video-mode engine setup: a coarse HS TX
++			 * timeout (status only, STOP_EN clear) and the
++			 * per-frame video MISR so the controller output of
++			 * each link can be checked.
++			 */
++			dsi_write(msm_host, REG_DSI_HS_TIMER_CTRL,
++				  DSI_HS_TIMER_CTRL_TIMER_RESOLUTION(3) |
++				  DSI_HS_TIMER_CTRL_HS_TX_TO(0xfd08));
++			dsi_write(msm_host, REG_DSI_MISR_VIDEO_CTRL,
++				  DSI_MISR_VIDEO_CTRL_ENABLE |
++				  DSI_MISR_VIDEO_CTRL_FRAME_COUNT(1));
++		}
+ 	} else {
+ 		/* Do not swap RGB colors */
+ 		data = DSI_CMD_CFG0_RGB_SWAP(SWAP_RGB);
+diff --git a/drivers/gpu/drm/msm/registers/display/dsi.xml b/drivers/gpu/drm/msm/registers/display/dsi.xml
+index 1a2b3c4d5..2b3c4d5e6 100644
+--- a/drivers/gpu/drm/msm/registers/display/dsi.xml
++++ b/drivers/gpu/drm/msm/registers/display/dsi.xml
+@@ -261,6 +261,10 @@
+ 		<bitfield name="TX_EOT_APPEND" pos="0" type="boolean"/>
+ 		<bitfield name="RX_EOT_IGNORE" pos="4" type="boolean"/>
+ 	</reg32>
++	<reg32 offset="0x000a0" name="MISR_VIDEO_CTRL">
++		<bitfield name="FRAME_COUNT" low="8" high="15" type="uint"/>
++		<bitfield name="ENABLE" pos="16" type="boolean"/>
++	</reg32>
+ 	<reg32 offset="0x000a4" name="LANE_STATUS">
+ 		<bitfield name="DLN0_STOPSTATE" pos="0" type="boolean"/>
+ 		<bitfield name="DLN1_STOPSTATE" pos="1" type="boolean"/>
+@@ -282,6 +286,7 @@
+ 		<bitfield name="DLN_SWAP_SEL" low="0" high="2" type="dsi_lane_swap"/>
+ 	</reg32>
+ 	<reg32 offset="0x00108" name="ERR_INT_MASK0"/>
++	<reg32 offset="0x0013c" name="MISR_VIDEO_32BIT"/>
+ 	<reg32 offset="0x0010c" name="INTR_CTRL" type="DSI_IRQ"/>
+ 	<reg32 offset="0x00114" name="RESET"/>
+ 	<reg32 offset="0x00118" name="CLK_CTRL">
+-- 
+2.47.0

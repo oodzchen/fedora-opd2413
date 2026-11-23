@@ -1,0 +1,88 @@
+From d0f6d61204c70000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: yzddmr6 <46088090+yzddmr6@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 15:28:33 +0000
+Subject: [PATCH] drm/msm/dsi: program the bonded slave PHY dividers like the
+ vendor driver
+
+The vendor 3nm PLL driver (dsi_pll_3nm_configure) mirrors the master
+PLL out divider, the PHY post divider (forced to 1), the pixel divider
+and the DSI clock mux into the bonded slave PHY and sets its
+PERF_OPTIMIZE register, so that the slave data path, which runs from
+the master bit clock, is configured identically. Mainline leaves the
+slave with its reset dividers (CLK_CFG0 = 0xf1 on SM8750 versus 0x51 on
+the stock kernel).
+
+Mirror the master configuration into the slave right after the PLL
+bias is enabled and before the PLL starts, for the V7_2 PHY, and log
+the resulting slave registers at debug level.
+
+The vendor driver also pulses the analog and PLL resets of both PHYs
+before every PLL enable; doing the same from the clock framework's
+prepare path (which runs several times per display enable) made the
+NT36532 touch firmware fail to boot after the second display enable on
+the piano unit, so that part is deliberately not taken over.
+
+(cherry picked from commit 55fa3a10e38dc976375306f684da108d7ff8d883)
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ drivers/gpu/drm/msm/dsi/phy/dsi_phy_7nm.c | 35 +++++++++++++++++++++++
+ 1 file changed, 35 insertions(+)
+
+diff --git a/drivers/gpu/drm/msm/dsi/phy/dsi_phy_7nm.c b/drivers/gpu/drm/msm/dsi/phy/dsi_phy_7nm.c
+index 2b3c4d5e6..3c4d5e6f7 100644
+--- a/drivers/gpu/drm/msm/dsi/phy/dsi_phy_7nm.c
++++ b/drivers/gpu/drm/msm/dsi/phy/dsi_phy_7nm.c
+@@ -489,15 +489,50 @@ static void dsi_pll_phy_dig_reset(struct dsi_pll_7nm *pll)
+ 	wmb(); /* Ensure that the reset is deasserted */
+ }
+ 
++/*
++ * A bonded slave PHY runs from the master bit clock, but the vendor driver
++ * still mirrors the master post dividers and DSI clock mux into it (with the
++ * PHY post divider forced to 1) and enables its performance optimization.
++ * Do the same so the slave data path matches the master.
++ */
++static void dsi_pll_v7_2_program_slave(struct dsi_pll_7nm *pll)
++{
++	struct dsi_pll_7nm *slave = pll->slave;
++	u32 outdiv, cfg0, cfg1;
++
++	outdiv = readl(pll->phy->pll_base + REG_DSI_7nm_PHY_PLL_PLL_OUTDIV_RATE);
++	writel(outdiv, slave->phy->pll_base + REG_DSI_7nm_PHY_PLL_PLL_OUTDIV_RATE);
++
++	cfg0 = readl(pll->phy->base + REG_DSI_7nm_PHY_CMN_CLK_CFG0);
++	dsi_pll_cmn_clk_cfg0_write(slave,
++				   (cfg0 & DSI_7nm_PHY_CMN_CLK_CFG0_DIV_CTRL_7_4__MASK) |
++				   DSI_7nm_PHY_CMN_CLK_CFG0_DIV_CTRL_3_0(1));
++
++	cfg1 = readl(pll->phy->base + REG_DSI_7nm_PHY_CMN_CLK_CFG1);
++	dsi_pll_cmn_clk_cfg1_update(slave, DSI_7nm_PHY_CMN_CLK_CFG1_DSICLK_SEL__MASK, cfg1);
++
++	writel(0x22, slave->phy->pll_base + REG_DSI_7nm_PHY_PLL_PERF_OPTIMIZE);
++	wmb(); /* flush the slave configuration before the PLL starts */
++
++	DBG("DSI PLL%d programmed bonded slave PLL%d: CLK_CFG0=0x%02x CLK_CFG1=0x%02x OUTDIV=0x%02x",
++	    pll->phy->id, slave->phy->id,
++	    readl(slave->phy->base + REG_DSI_7nm_PHY_CMN_CLK_CFG0),
++	    readl(slave->phy->base + REG_DSI_7nm_PHY_CMN_CLK_CFG1),
++	    readl(slave->phy->pll_base + REG_DSI_7nm_PHY_PLL_PLL_OUTDIV_RATE));
++}
++
+ static int dsi_pll_7nm_vco_prepare(struct clk_hw *hw)
+ {
+ 	struct dsi_pll_7nm *pll_7nm = to_pll_7nm(hw);
+ 	int rc;
+ 
+ 	dsi_pll_enable_pll_bias(pll_7nm);
+ 	if (pll_7nm->slave)
+ 		dsi_pll_enable_pll_bias(pll_7nm->slave);
+ 
++	if ((pll_7nm->phy->cfg->quirks & DSI_PHY_7NM_QUIRK_V7_2) && pll_7nm->slave)
++		dsi_pll_v7_2_program_slave(pll_7nm);
++
+ 	/* Start PLL */
+ 	writel(BIT(0), pll_7nm->phy->base + REG_DSI_7nm_PHY_CMN_PLL_CNTRL);
+ 
+-- 
+2.47.0

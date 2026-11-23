@@ -126,3 +126,11 @@
 # Type-C USB 3.x dual-orientation fix: expose TLMM GPIO 61 CC orientation to pmic_glink_ucsi
 2439-arm64-dts-qcom-sm8750-oneplus-pad2pro-add-pmic-glink.patch
 
+# Bonded dual-DSI SM8750 PHY/controller synchronization & teardown order (TECH-DEBT #47)
+2440-drm-msm-dsi-stop-the-bonded-clock-consumer-before-it.patch
+2441-drm-msm-dsi-restore-SM8750-bonded-slave-clock-state.patch
+2442-drm-msm-dsi-program-the-bonded-slave-PHY-dividers-li.patch
+2443-drm-msm-dsi-Resynchronize-SM8750-PHYs-after-link-clo.patch
+2444-drm-msm-dsi-Reset-SM8750-bonded-controllers-after-PH.patch
+2445-drm-msm-dsi-program-the-HS-TX-timer-and-the-video-MI.patch
+

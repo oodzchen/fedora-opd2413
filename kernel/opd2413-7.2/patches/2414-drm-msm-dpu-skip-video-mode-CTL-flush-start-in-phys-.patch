@@ -1,18 +1,109 @@
 From 504a0e5cf17549dd356cd90b3aa5b1af783e1242 Mon Sep 17 00:00:00 2001
-From: build <build@localhost>
-Date: Sat, 14 Nov 2026 12:22:03 +0800
-Subject: [PATCH] drm/msm/dpu: skip video-mode CTL flush/start in phys cleanup
+From: Kholin <oodzchen@gmail.com>
+Date: Mon, 23 Nov 2026 11:03:00 +0800
+Subject: [PATCH] drm/msm/dpu: skip video-mode CTL flush/start when MDSS GDSC
+ stays powered
 
-During an inline modeset on SM8750, MDSS GDSC does not collapse between disable and enable. Calling trigger_flush + trigger_start in dpu_encoder_helper_phys_cleanup() after the video-mode timing engines are stopped leaves CTL_FLUSH/CTL_START armed with CTL_INTF_ACTIVE cleared, wedging CTL_0 on re-enable.
+During an inline modeset or a dual-screen DPMS off while an external DP
+monitor is plugged in (keeping MDSS GDSC powered via DisplayPort runtime
+PM), video-mode timing engines have already stopped before cleanup runs.
+Calling trigger_flush + trigger_start in _dpu_encoder_helper_phys_cleanup()
+with CTL_INTF_ACTIVE cleared and no subsequent MDSS GDSC power collapse
+leaves CTL_0/SSPP_8 fetch wedged on re-enable.
+
+Skip video-mode trigger_flush/trigger_start whenever the CRTC stays active
+(inline modeset), another CRTC remains active, or any DisplayPort
+controller is runtime-active. Single-screen DPMS off (where MDSS GDSC
+collapses) retains the flush/start sequence.
+
+Co-Authored-By: Antigravity <noreply@deepmind.google>
 ---
- drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c | 38 ++++++++++++++++++---
- 1 file changed, 33 insertions(+), 5 deletions(-)
-
-diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
-index f508d0654..2311e9a83 100644
 --- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
 +++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
-@@ -1436,20 +1436,33 @@ static void dpu_encoder_virt_atomic_enable(struct drm_encoder *drm_enc,
+@@ -10,9 +10,12 @@
+ #define pr_fmt(fmt)	"[drm:%s:%d] " fmt, __func__, __LINE__
+ #include <linux/debugfs.h>
+ #include <linux/kthread.h>
++#include <linux/of.h>
++#include <linux/pm_runtime.h>
+ #include <linux/seq_file.h>
+ 
+ #include <drm/drm_atomic.h>
++#include <drm/drm_bridge.h>
+ #include <drm/drm_crtc.h>
+ #include <drm/drm_file.h>
+ #include <drm/drm_probe_helper.h>
+@@ -20,6 +23,7 @@
+ #include <drm/display/drm_dsc_helper.h>
+ 
+ #include "msm_drv.h"
++#include "dp/dp_display.h"
+ #include "dpu_kms.h"
+ #include "dpu_hwio.h"
+ #include "dpu_hw_catalog.h"
+@@ -387,7 +391,28 @@
+ 	return entries_added;
+ }
+ 
+-static void _dpu_encoder_setup_dither(struct dpu_hw_pingpong *hw_pp, unsigned bpc)
++/*
++ * The DPU disables output dithering at 8bpc, but a panel fed from the 10-bit
++ * pipeline can visibly band without it. Boards opt in per panel with the
++ * armada,dpu-8bpc-dither devicetree property on the panel node.
++ */
++static bool dpu_encoder_panel_dithers_8bpc(struct drm_encoder *drm_enc)
++{
++	struct drm_bridge *last = drm_bridge_chain_get_last_bridge(drm_enc);
++	bool dithers;
++
++	if (!last)
++		return false;
++
++	dithers = last->of_node &&
++		of_property_read_bool(last->of_node, "armada,dpu-8bpc-dither");
++	drm_bridge_put(last);
++
++	return dithers;
++}
++
++static void _dpu_encoder_setup_dither(struct dpu_hw_pingpong *hw_pp, unsigned bpc,
++				      bool panel_dithers_8bpc)
+ {
+ 	struct dpu_hw_dither_cfg dither_cfg = { 0 };
+ 
+@@ -402,6 +427,17 @@
+ 		dither_cfg.c3_bitdepth = 6;
+ 		dither_cfg.temporal_en = 0;
+ 		break;
++	case 8:
++		if (!panel_dithers_8bpc) {
++			hw_pp->ops.setup_dither(hw_pp, NULL);
++			return;
++		}
++		dither_cfg.c0_bitdepth = 8;
++		dither_cfg.c1_bitdepth = 8;
++		dither_cfg.c2_bitdepth = 8;
++		dither_cfg.c3_bitdepth = 8;
++		dither_cfg.temporal_en = 0;
++		break;
+ 	default:
+ 		hw_pp->ops.setup_dither(hw_pp, NULL);
+ 		return;
+@@ -1321,10 +1357,12 @@
+ 	if (dpu_enc->disp_info.intf_type == INTF_DSI &&
+ 			!WARN_ON(dpu_enc->num_phys_encs == 0)) {
+ 		unsigned bpc = dpu_enc->connector->display_info.bpc;
++		bool panel_dithers_8bpc = dpu_encoder_panel_dithers_8bpc(drm_enc);
+ 		for (i = 0; i < ARRAY_SIZE(dpu_enc->hw_pp); i++) {
+ 			if (!dpu_enc->hw_pp[i])
+ 				continue;
+-			_dpu_encoder_setup_dither(dpu_enc->hw_pp[i], bpc);
++			_dpu_encoder_setup_dither(dpu_enc->hw_pp[i], bpc,
++						  panel_dithers_8bpc);
+ 		}
+ 	}
+ }
+@@ -1400,20 +1438,61 @@
  	mutex_unlock(&dpu_enc->enc_lock);
  }
  
@@ -44,10 +135,38 @@ index f508d0654..2311e9a83 100644
 +	if (new_state && new_state->active &&
 +	    (!new_conn_state || new_conn_state->best_encoder == drm_enc))
 +		skip_vid_trigger = true;
++
++	/*
++	 * Also skip video-mode CTL flush/start when MDSS GDSC will stay powered
++	 * across DPMS off (another CRTC remains active, or a plugged external
++	 * DisplayPort controller holds an MDSS runtime PM reference). Without
++	 * GDSC power collapse, triggering flush/start on a stopped video CTL
++	 * wedges CTL_0/SSPP fetch on the next enable.
++	 */
++	if (!skip_vid_trigger && drm_enc->dev) {
++		struct msm_drm_private *priv = drm_enc->dev->dev_private;
++		struct drm_crtc *other_crtc;
++		struct drm_crtc_state *other_new_state;
++		int idx;
++
++		for_each_new_crtc_in_state(state, other_crtc, other_new_state, idx) {
++			if (other_crtc != crtc && other_new_state->active) {
++				skip_vid_trigger = true;
++				break;
++			}
++		}
++
++		for (idx = 0; !skip_vid_trigger && priv && priv->kms &&
++		     idx < ARRAY_SIZE(priv->kms->dp); idx++) {
++			if (priv->kms->dp[idx] && priv->kms->dp[idx]->pdev &&
++			    pm_runtime_active(&priv->kms->dp[idx]->pdev->dev))
++				skip_vid_trigger = true;
++		}
++	}
  
  	/*
  	 * The encoder is already disabled if self refresh mode was set earlier,
-@@ -1492,7 +1505,7 @@ static void dpu_encoder_virt_atomic_disable(struct drm_encoder *drm_enc,
+@@ -1456,7 +1535,7 @@
  				break;
  		}
  		if (j == i)
@@ -56,7 +175,7 @@ index f508d0654..2311e9a83 100644
  	}
  
  
-@@ -2388,7 +2401,8 @@ static void dpu_encoder_unprep_dsc(struct dpu_encoder_virt *dpu_enc)
+@@ -2352,7 +2431,8 @@
   * dpu_encoder_helper_phys_cleanup - helper to cleanup dpu pipeline
   * @phys_enc: Pointer to physical encoder structure
   */
@@ -66,7 +185,7 @@ index f508d0654..2311e9a83 100644
  {
  	struct dpu_hw_ctl *ctl = phys_enc->hw_ctl;
  	struct dpu_hw_intf_cfg intf_cfg = { 0 };
-@@ -2486,11 +2500,25 @@ void dpu_encoder_helper_phys_cleanup(struct dpu_encoder_phys *phys_enc)
+@@ -2450,11 +2530,25 @@
  		}
  	}
  
@@ -94,6 +213,3 @@ index f508d0654..2311e9a83 100644
  void dpu_encoder_helper_phys_setup_cwb(struct dpu_encoder_phys *phys_enc,
  				       bool enable)
  {
--- 
-2.56.0
-

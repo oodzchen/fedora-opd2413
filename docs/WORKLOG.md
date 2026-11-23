@@ -2593,3 +2593,95 @@ mpv、Firefox 仍是软解（Fedora `ffmpeg-free` 的专利限制），用户选
 - **假设验证与证伪**：原怀疑 MDSS GDSC 未掉电时 `2414` 保留的 `trigger_flush + trigger_start` 残留卡死 `CTL_0`，构建临时内核 `7.2.15-36.opd2413`（实验补丁 `2440`，在 `dpu_crtc_atomic_begin()` 检查并复位 `is_started`/`get_flush_register`）实测：双屏 5 轮压测仍复现泛灰黑屏且 `resetting stale ctl` 从未触发。
 - **硬件寄存器全量取证（`private/display-dpms-grey-20261122/`）**：在 `7.2.15-36.opd2413` 同频 120 Hz 下分别抓取正常态（`dpu_120_good.txt`）与真实黑屏泛灰态（`dpu_120_bad2.txt`）的完整 `/sys/kernel/debug/dri/1/kms`（6013 行）逐模块比对，证实 SoC 侧 `ctl_0`、`lm`、`dspp`、`dce_0_0/0_1`（DSC）、`intf_1/2`、`dsi0/1_ctrl`、`dsi0/1_phy` 全部配置寄存器 **100% 逐位一致**，彻底排除 SoC 侧 `CTL_0`/DPU/DSI 配置卡死，锁定根因位于面板侧（`nt36536` 在 `2433` 真断电 ≥2 s 后重新上电/复位/DCS 初始化时序偶发失锁）。
 - **收口**：已撤回实验补丁 `2440` 并清理 `-36` 构建产物，登记为 [TECH-DEBT.md](TECH-DEBT.md) `#47`；`loader.conf` 默认项仍为已验收提交的 `fedora-7.2.15-35.opd2413.conf`，下次正常重启后即可自动回到 `-35` 并按需卸载 `-36`。
+
+### 显示熄屏/DPMS 黑灰屏根因定案与 SM8750 双路 DSI 同步修复（`2440`–`2445`，`7.2.15-36.opd2413`，`离线通过`）
+
+- **深层根因核查（寄存器 + 上游 `erhai` 逐文件比对）**：
+  - 全量比对 [panel-novatek-nt36536.c](../out/m3k/linux-7.2.15/drivers/gpu/drm/panel/panel-novatek-nt36536.c)、`ktz8866.c`、板级 DTS 与 `dpu1` / `dsi` 源码，结合 `private/display-dpms-grey-20261122/dpu_120_good.txt` 与 `dpu_120_bad2.txt` 实机寄存器 dump，发现 `7.2.15-35` 缺少上游 `erhai`（`sm8750/v7.4-dev`）整套 **SM8750 绑定双路 DSI 硬件同步与关断序列（6 个提交）**，实机寄存器直接印证：
+    1. `dsi_mgr_bridge_post_disable()` 先关时钟源 `DSI_0` 再关从路消费者 `DSI_1`（缺失 `ff1a1513c`）。
+    2. 未启用 `restore_slave_pll`，DPMS 关闭/恢复期未保存与恢复从路 PHY（`DSI_1`）分频器与时钟多路器状态（缺失 `7385bb05c`）。
+    3. 未实现从路 PHY 分频镜像与 `PERF_OPTIMIZE=0x22` 编程（缺失 `d0f6d6120`）：实测 `dsi0_phy[0x10]`（`CMN_CLK_CFG0`）=`0x61`，而 **`dsi1_phy[0x10]` 滞留出厂默认值 `0xf1`**。
+    4. 双路 HS 链路时钟启动后未执行原厂两步 PHY 重同步（缺失 `282ca2a9a`）：未翻转 `RBUF_CTRL`（`0->1`）且未清除 `CLK_EN_SEL`（`BIT(4)`），实测 **`dsi0_phy[0x14]=0x30`、`dsi1_phy[0x14]=0x34`**（原厂黄金值为 `0x20`/`0x24`）。
+    5. PHY 重同步完成后未对绑定 `qcom,sm8750-dsi-ctrl` 视频模式控制器执行 `1 us` 软复位（缺失 `3b4689ae9`）。
+    6. 未编程 `HS_TIMER_CTRL`（`0x3FD08`）与 `MISR_VIDEO_CTRL`（`0x10100`）（缺失 `8b3f19e48`）：实测 **`dsi0/1_ctrl[0xbc]`（`TIMEOUT_STATUS`）每帧误锁存 `0x00000001`** 且逐帧视频 CRC `MISR_VIDEO_32BIT`（`0x13c`）未开启。
+  - **2026-11-22 `23:24:51 -> 23:24:53` 复现现场**：外接 4K DP 期间平板闲置熄屏再唤醒再次触发有背灯黑屏；实测 `DSI-1`（`connected`/`enabled`/`dpms:On`）、背光 `1331/2047`（`bl_power=0`）、5 路供电（`vreg_l12b_1p8` `1896000 uV`、`lcd_vsp`、`lcd_vsn`、`vreg_l3i_0p88` `880000 uV`、`vreg_l3g_1p2` `1200000 uV`）及 `nt36536` 触控固件加载（`<183344 us>`, `PID=5F95`）均正常且内核零 DSI/DPU 报错，与双路 DSI PHY retime FIFO 相位失锁（静态 MMIO diff 不可见）特征完全一致。
+- **代码改动与离线构建校验（`离线通过`）**：
+  - 修复此前实验回退遗留在 `out/m3k/linux-7.2.15/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c` 第 1333 行的 1 行误删，确认与 `linux-7.2.15.tar.xz + armada-7.2.6 + opd2413-7.2` 重建结果严格仅差该行。
+  - 新增并按 `-F0` 严格打入补丁 `2440`–`2445`（见 [series](../kernel/opd2413-7.2/patches/series) 与 [PATCHES.md](../kernel/PATCHES.md)），不改 DPU（保留 `2411`/`2414`）、不引入依赖 7.4 CCF orphan 改造的 `bbf19e86d`，也不回退 `2433`（保留熄屏真断电）：
+    - [2440-drm-msm-dsi-stop-the-bonded-clock-consumer-before-it.patch](../kernel/opd2413-7.2/patches/2440-drm-msm-dsi-stop-the-bonded-clock-consumer-before-it.patch)
+    - [2441-drm-msm-dsi-restore-SM8750-bonded-slave-clock-state.patch](../kernel/opd2413-7.2/patches/2441-drm-msm-dsi-restore-SM8750-bonded-slave-clock-state.patch)
+    - [2442-drm-msm-dsi-program-the-bonded-slave-PHY-dividers-li.patch](../kernel/opd2413-7.2/patches/2442-drm-msm-dsi-program-the-bonded-slave-PHY-dividers-li.patch)
+    - [2443-drm-msm-dsi-Resynchronize-SM8750-PHYs-after-link-clo.patch](../kernel/opd2413-7.2/patches/2443-drm-msm-dsi-Resynchronize-SM8750-PHYs-after-link-clo.patch)
+    - [2444-drm-msm-dsi-Reset-SM8750-bonded-controllers-after-PH.patch](../kernel/opd2413-7.2/patches/2444-drm-msm-dsi-Reset-SM8750-bonded-controllers-after-PH.patch)
+    - [2445-drm-msm-dsi-program-the-HS-TX-timer-and-the-video-MI.patch](../kernel/opd2413-7.2/patches/2445-drm-msm-dsi-program-the-HS-TX-timer-and-the-video-MI.patch)
+  - 于 `localhost/opd2413-builder-kernel:fc45`（`HOSTCC=/tmp/hostgcc`）使用 `-j7` 完成干净全量编译，4 个改动 DSI `.o` 文件在 `KCFLAGS="-Werror"` 下零警告编译通过；产出 `out/rpmbuild/RPMS/aarch64/kernel-opd2413-7.2.15-36.opd2413.aarch64.rpm`（SHA-256 `75e8eecb4d55d7d97ca1689c03ebc850c1f51b5f108c2c328f2f07029c27b57d`）：
+    - `dsi.xml.h` 已生成 `REG_DSI_MISR_VIDEO_CTRL`（`0x000a0`）与 `REG_DSI_MISR_VIDEO_32BIT`（`0x0013c`）；
+    - `System.map` 与 `vmlinuz`（未压缩 ARM64 `Image`）确认含 `msm_dsi_host_reset_after_phy_sync`、`msm_dsi_phy_toggle_resync_fifo`、`msm_dsi_phy_reset_clk_en_sel` 及 `dsi_pll_v7_2_program_slave`/`reset_clk_en_sel` 调试字符串，`vmlinux` 与模块 `oneplus-pogo-keyboard.ko`（`vermagic: 7.2.15-36.opd2413`）均含完整 `.BTF` 段；
+    - `sm8750-oneplus-pad2pro.dtb` 与 `7.2.15-35` 逐字节一致（零多余 DTS 改动）。
+- **上机预期与判据（待用户确认装机测试）**：
+  1. 保留 `7.2.15-35` 为 `default`、`7.2.15-32` 为二级回退，安装 `7.2.15-36.opd2413`（不动 `boot_b` 与 `KSHIM.CHO`），经 `/usr/libexec/opd2413/boot-select next fedora-7.2.15-36.opd2413.conf` 单次重启进入 `uname -r = 7.2.15-36.opd2413`。
+  2. **硬件寄存器判据**（`/sys/kernel/debug/dri/1/kms`）：
+     - `dsi0_phy[0x10] == 0x61` 且 **`dsi1_phy[0x10] == 0x61`**（由 `0xf1` 修正）；
+     - **`dsi0_phy[0x14] == 0x20` 且 `dsi1_phy[0x14] == 0x24`**（`CLK_EN_SEL=0`，由 `0x30/0x34` 修正）；
+     - **`dsi0_ctrl[0xbc] == 0` 且 `dsi1_ctrl[0xbc] == 0`**（`TIMEOUT_STATUS` 清零，由 `0x1` 修正）；
+     - `dsi0_ctrl[0xa0] == 0x00010100`、`dsi1_ctrl[0xa0] == 0x00010100`，且 `0x13c`（`MISR_VIDEO_32BIT`）呈非零活跃 CRC。
+  3. **DPMS 与刷新率/休眠功能判据**：
+     - `DPMS off (≥3 s)` 期间 `vreg_l12b_1p8`、`lcd_vsp`、`lcd_vsn` 真实断电；
+     - 在 **120 Hz**（双屏外接 `DP-1` 与单屏独立模式）及 **60 Hz** 下连续执行 **≥10 轮 `DPMS off (≥3 s) -> on`**，以及桌面闲置熄屏/锁屏唤醒与 **`s2idle` 休眠唤醒**：**0 次**竖条彩噪或持续黑灰屏，内核日志零 DSI/DPU 报错，触控、背光、音频与 `60 <-> 120 Hz` 切换均正常。
+     - 经用户确认设为默认项并完成冷启动验收后关闭 [TECH-DEBT.md](TECH-DEBT.md) `#47`。
+
+### `7.2.15-36` 实机寄存器核验与 `2443` 补丁错位修正（`7.2.15-37.opd2413`，`离线通过`）
+
+- **`7.2.15-36.opd2413` 实机首启核验结果（`2026-11-23 00:15`）**：
+  - 经 `boot-select next` 成功重启进入 `uname -r = 7.2.15-36.opd2413`，`systemctl is-system-running = running`、`0 failed`、SELinux `Enforcing`、`0 avc: denied`、`KSHIM.CHO` 保持 `"Fedora"` 且 `loader_default` 为 `-35`、`DP-1` + `DSI-1`（`3392x2400@120`）与 `nt36536` 触控均正常工作。
+  - 只读读取 `/sys/kernel/debug/dri/1/kms` 确认 `2442` 与 `2445` 已立即生效：
+    - `dsi0_phy[0x10] = 0x61` 且 **`dsi1_phy[0x10] = 0x61`**（从路分频已由 `0xf1` 修正）；
+    - `dsi0/1_ctrl[0xb8]`（`HS_TIMER_CTRL`）=`0x0003fd08`，**`dsi0/1_ctrl[0xbc]`（`TIMEOUT_STATUS`）=`0x00000000`**（由每帧 `0x1` 清除），`dsi0/1_ctrl[0xa0]`（`MISR_VIDEO_CTRL`）=`0x00010100`。
+  - 同时发现 **`dsi0_phy[0x14]=0x30`、`dsi1_phy[0x14]=0x34`**（`CLK_EN_SEL` 仍未清零）：审计源码确认因 `2443` 第 2 个 hunk 原仅有 `.save_pll_state`/`.restore_pll_state`/`.set_continuous_clock` 3 行上下文，在 `-F0` 下误落到了紧邻上方具有相同 3 行的 `dsi_phy_4nm_8650_cfgs`，未挂入 `dsi_phy_3nm_8750_cfgs.ops`。
+- **修复与 `7.2.15-37.opd2413` 离线构建校验（`离线通过`）**：
+  - 修正 [2443-drm-msm-dsi-Resynchronize-SM8750-PHYs-after-link-clo.patch](../kernel/opd2413-7.2/patches/2443-drm-msm-dsi-Resynchronize-SM8750-PHYs-after-link-clo.patch)（扩展上下文包含 `.restore_slave_pll = true,` 至 `.quirks = DSI_PHY_7NM_QUIRK_V7_2,`，确保仅匹配 `dsi_phy_3nm_8750_cfgs`）及 `dsi_phy_7nm.c`，并在临时目录通过 `2445 -> 2440` 逆序卸载与 `2440 -> 2445` 正序 `-F0` 重打严格闭环校验。
+  - 编包产出 `out/rpmbuild/RPMS/aarch64/kernel-opd2413-7.2.15-37.opd2413.aarch64.rpm`（SHA-256 `b66c91517262628e8b6e0f5cd192c5e80cfec0067aafb16b82a16e8c224526d9`）：`dsi_phy_7nm.o` 经 `KCFLAGS="-Werror"` 零警告编译，`readelf -rW`/`-sW` 证实 `dsi_7nm_phy_toggle_resync_fifo`（`0x1d0`）与 `dsi_7nm_phy_reset_clk_en_sel`（`0x1d8`）重定位严格落入 `dsi_phy_3nm_8750_cfgs`（`[0x188, 0x210)`），`vmlinuz`/`oneplus-pogo-keyboard.ko` 均含 `.BTF` 与 `vermagic: 7.2.15-37.opd2413`，`sm8750-oneplus-pad2pro.dtb` 与 `-35` 逐字节一致。
+- **下一步写入范围与上机判据（待用户确认）**：
+  - 因当前 ESP `/dev/sda16` 剩余 `143M`（`< 200 MiB` 装机最低需求），申请经单次 `pkexec` 卸载最旧回退 `7.2.15-32.opd2413`（保留 `-35` 为 `default`、`7.2.15-36` 为二级回退），安装 `7.2.15-37.opd2413`，核验 `KSHIM.CHO` 不变且保持 `1 extent` 后设 `boot-select next fedora-7.2.15-37.opd2413.conf`；由用户手动重启进入 `-37` 复验 `dsi0/1_phy[0x14] == 0x20/0x24` 与 120/60 Hz `DPMS off -> on` / 休眠唤醒压测。
+
+### `7.2.15-37` 单双屏对照与 `erhai` 共享视频 `CTL` 四补丁替换（`2446`–`2449`，`7.2.15-38.opd2413`，`离线通过`）
+
+- **`7.2.15-37.opd2413` 实机完整复验结果（`2026-11-23 00:35–07:54`）**：
+  1. **开机健康与双路 DSI 寄存器全绿（`真机通过`）**：`boot-select next` 进入 `7.2.15-37.opd2413`（`running`、`0 failed`、SELinux `Enforcing`、0 AVC），`dsi0/1_phy[0x10]=0x61/0x61`、`dsi0/1_phy[0x14]=0x20/0x24`、`dsi0/1_ctrl[0xb8]=0x0003fd08`、`[0xbc]=0`、`[0xa0]=0x00010100`、`dsi0_pll[0x260]=0x22`，全部达到 SM8750 原厂黄金值。
+  2. **单屏 `120 Hz` `DPMS off (3s) -> on (3s)` 10 轮 + `120 -> 60 -> 120 Hz` 切换（`真机通过`）**：`10/10` 轮亮屏视觉正常、`12/12` 次 `nt36536` 固件重载正常、4 路供电轨（`vreg_l12b_1p8`/`lcd_vsp`/`lcd_vsn`/`vreg_l3i_0p88`）关断/上电对称，0 内核错误。
+  3. **双屏（`DP-1` + `DSI-1`）`DPMS off (4s) -> on (8s)`（`120 Hz` 6 轮 + `60 Hz` 3 轮，共 9 轮）—— `真机失败`（暴露真实根因）**：
+     - 用户目视确认全部 **9/9 轮**外接 `DP-1` 正常亮屏出图，而内置 `DSI-1` 每轮均卡死在“有背光灰黑无画面”；循环结束切换刷新率（`120 <-> 60 Hz`）`2/2` 次瞬间恢复。
+     - `pm_runtime` 计费直接证明原因：外接 `DP-1` 在连接态持有 `af54000.displayport-controller` 的 `pm_runtime` 引用（`DPMS off` 期间挂起增量 **`0 ms`**），连带拉住父域 `ae00000.display-subsystem`（`MDSS GDSC`）累计挂起保持 **`0 ms` 增量**（从不掉电复位），而 `ae01000.display-controller` 正常挂起 `+3561 ms`。
+     - 抓包 `private/display-dpms-grey-20261122/dpu37_dual_bad.txt` 精准锁定 DPU 卡死指纹与 [DISPLAY-60HZ-MODESET.md](DISPLAY-60HZ-MODESET.md) 完全一致：**`sspp_8[0xd0]=00000c80`、`0xd4=00000c80`、`0xe0=00000008`、`0xf8=00000000`**，**`vbif[0x204]=ffff0000`**（XIN1 停止取帧）、**`vbif[0x20c]=00000030`**，而此时双路 `DSI`/`PHY` 寄存器仍为 100% 黄金值。
+     - **根本因果收敛**：本地规避补丁 `2414` 仅在 `new_state->active == true`（内联切刷新率）时跳过 `_dpu_encoder_helper_phys_cleanup()` 里的 `trigger_flush + trigger_start`，错误假设 `DPMS off` 后 `MDSS GDSC` 必然掉电；单屏熄屏靠 `MDSS GDSC` 掉电掩盖了 `CTL_0` 卡死，双屏时 `DP-1` 保住 `MDSS GDSC` 使卡死态直接带入下一次亮屏，而切刷新率（`active == true`）正好绕过 `trigger_flush/start` 并靠 `ctl->ops.reset(ctl)` 解锁。
+- **`7.2.15-38.opd2413` 修复方案与离线构建校验（`离线通过`）**：
+  - 撤除临时规避 `2411` 与 `2414`，合入 `yzddmr6/linux-sm8750-erhai`（`sm8750/v7.4-dev`）共享视频 `CTL` 寄存器级修复四补丁系列（均通过严格 `-F0` 正向→反向→正向回环校验，已同步更新 `kernel/opd2413-7.2/patches/series`、`kernel/PATCHES.md`、`kernel/opd2413-7.2/README.md`）：
+    - [2446-drm-msm-dpu-flush-shared-video-CTLs-once-per-kickoff.patch](../kernel/opd2413-7.2/patches/2446-drm-msm-dpu-flush-shared-video-CTLs-once-per-kickoff.patch)（erhai `cece3773ddb5`）
+    - [2447-drm-msm-dpu-tear-a-video-mode-slave-down-after-both-.patch](../kernel/opd2413-7.2/patches/2447-drm-msm-dpu-tear-a-video-mode-slave-down-after-both-.patch)（erhai `8b53b972e9bd`）
+    - [2448-drm-msm-dpu-complete-shared-video-CTL-teardown-befor.patch](../kernel/opd2413-7.2/patches/2448-drm-msm-dpu-complete-shared-video-CTL-teardown-befor.patch)（erhai `f6dafb3dbc42`）
+    - [2449-drm-msm-dpu-hand-off-the-shared-video-slave-before-t.patch](../kernel/opd2413-7.2/patches/2449-drm-msm-dpu-hand-off-the-shared-video-slave-before-t.patch)（erhai `1fead1793340`）
+  - 重建 `localhost/opd2413-builder-kernel:fc45` 后（清理编译中间树释放 `/dev/sda18` 至 `186G` 可用），完成 `7.2.15-38.opd2413` 全量编译：5 个修改 DPU `.o` 在 `KCFLAGS="-Werror"` 下零警告通过；`vmlinux` 与 `oneplus-pogo-keyboard.ko` 均含 `.BTF`、`vermagic: 7.2.15-38.opd2413 SMP preempt mod_unload aarch64`；`dpu_hw_ctl_remove_intf` 与 `dpu_encoder_phys_cleanup` 存在于 `vmlinux` 符号表；`sm8750-oneplus-pad2pro.dtb` 与 `-37` 逐字节一致；产物 `out/rpmbuild/RPMS/aarch64/kernel-opd2413-7.2.15-38.opd2413.aarch64.rpm`（SHA-256 `e3dcf6804b8b4e47b1afc8c81db1ec159e904427020263092a1f0d5c82b258d9`）。
+- **上机预期与判据（`7.2.15-38.opd2413` 待重启验收）**：
+  1. 卸载过渡内核 `-36`（保留 `-35` 默认与 `-37` 回退），装入 `-38` 并以 `boot-select next fedora-7.2.15-38.opd2413.conf` 单次重启进入 `uname -r = 7.2.15-38.opd2413`（`running`、`0 failed`、SELinux `Enforcing`、0 AVC）；
+  2. `/sys/kernel/debug/dri/1/kms` 保持 `dsi0/1_phy[0x10]=0x61/0x61`、`[0x14]=0x20/0x24`、`[0xb8]=0x0003fd08`、`[0xbc]=0`；
+  3. **双屏（`DP-1` + `DSI-1`）`DPMS off (4s) -> on (8s)` 压测**（`120 Hz` 6 轮 + `60 Hz` 3 轮）：**9/9 轮双屏均正常亮屏显示完整桌面**（零灰黑屏/花屏），内核零 DSI/DPU/vblank/VBIF 错误；
+  4. **在线切换 `120 <-> 60 <-> 30 Hz`**、**单屏 10 轮 DPMS**、**真实闲置锁屏/熄屏唤醒**与 **`s2idle` 休眠唤醒**全通过；随后经用户确认设 `-38` 为默认并完成冷启动验证后同步关闭 `#36` 与 `#47`。
+
+### `7.2.15-38` 实机回退与 `7.2.15-39.opd2413` 精准扩展 `2414`（`离线通过`）
+
+- **`7.2.15-38.opd2413` 实机测试结果（`真机失败`，`2026-11-23 10:28–10:45`）**：
+  - 开机正常进入 `7.2.15-38.opd2413`（`running`、`0 failed`、SELinux `Enforcing`、0 AVC），但单屏第 1 轮 `DPMS off -> on` 即在 `novatek_nt36536_on()` 首条内存 DMA DCS 命令（`ff 20`）处触发 **`dsi1 cmd dma timeout`**（`status0=00020003 clk=008077c3 dln0=00088888`）、连续 `vblank timeout: ctl=1 intf=2 flush=4208c0 pending=4208c0`，且后续 `DPMS off` 报 **`VBIF AXI ports did not halt before power collapse`**，面板 `lcd_vsp`/`lcd_vsn` 保持 `disabled` 黑屏（用户短按电源键走 `s2idle` 唤醒后恢复）。
+  - 结论：`erhai` 的 `2446`–`2449`（`1fead1793340` 两阶段从端交接）在 7.2.15 树上反而触发 `dsi1 cmd dma timeout` 与 VBIF 停摆；立即撤回 `2446`–`2449`。
+- **`7.2.15-39.opd2413` 精准修复与离线构建校验（`离线通过`）**：
+  - 恢复已验证单屏 10/10 正常的 `2411` + `2440`–`2445`，并扩展 [2414-drm-msm-dpu-skip-video-mode-CTL-flush-start-in-phys-.patch](../kernel/opd2413-7.2/patches/2414-drm-msm-dpu-skip-video-mode-CTL-flush-start-in-phys-.patch)：在 `dpu_encoder_virt_atomic_disable()` 中除 `new_state->active`（内联 modeset）外，当存在其他活跃 CRTC 或任一外接 `priv->kms->dp[]` 处于 `pm_runtime_active`（即 `MDSS GDSC` 保电不掉电）时同样置 `skip_vid_trigger = true`，单屏 `DPMS off`（`MDSS GDSC` 掉电）路径保持与 `-37` 100% 一致。
+  - 离线校验：严格 `-F0` 正反向回环通过；5 个 DPU `.o` 在 `KCFLAGS="-Werror"` 下零警告编译；`vmlinux` 与 `oneplus-pogo-keyboard.ko` 含 `.BTF`、`vermagic: 7.2.15-39.opd2413 SMP preempt mod_unload aarch64`；`sm8750-oneplus-pad2pro.dtb` 与 `-37` 逐字节一致；产物 `out/rpmbuild/RPMS/aarch64/kernel-opd2413-7.2.15-39.opd2413.aarch64.rpm`（SHA-256 `a02b867e76c3372cbcbf68fb39a4d58fe9b905389948d25c9633745b5720d074`）。
+- **上机预期与判据（`7.2.15-39.opd2413`）**：
+  1. 卸载 `-37`、安装 `-39`（保留 `-35` 默认回退及当前运行的 `-38`），经 `boot-select next fedora-7.2.15-39.opd2413.conf` 单次重启进入 `7.2.15-39.opd2413`（`running`、`0 failed`、SELinux `Enforcing`、0 AVC）；
+  2. **单屏 10 轮 `DPMS off (3s) -> on (3s)` + `120 -> 60 -> 30 -> 60 -> 120 Hz` 在线切换**：10/10 轮及全刷新率切换视觉正常、4 路电源轨真断电、0 内核异常；
+  3. **真实闲置锁屏/熄屏唤醒**与 **`s2idle` 休眠唤醒**均正常；
+  4. **待外接显示器可用时补验双屏 9 轮长窗口 `DPMS off (4s) -> on (8s)`**，确认 `MDSS GDSC` 保电态下双屏 9/9 轮均正常出图（零灰黑屏）。
+- **实机单屏验收与默认收尾结果（`2026-11-23 11:10–11:35`，单屏 `真机通过`，双屏待外接显示器补验）**：
+  1. **开机健康**：卸载 `-37` 并安装 `-39` 后经 `boot-select next` 一次性重启进入 `uname -r = 7.2.15-39.opd2413`：`systemctl is-system-running = running`、`0 failed`、SELinux `Enforcing`、`0 avc: denied`、`af54000.displayport-controller` 处于 `suspended`。
+  2. **单屏自动化压测**：连续 **10/10 轮** `120 Hz` `DPMS off (3s) -> on (3s)` + **4/4 次**在线刷新率切换（`60 -> 30 -> 60 -> 120 Hz`）全部通过；每次灭屏 4 路电源轨（`vreg_l12b_1p8`/`lcd_vsp`/`lcd_vsn`/`vreg_l3i_0p88`）真断电为 `disabled`，亮屏 `14/14` 次 `nt36536` 固件重载正常，`MDSS GDSC`（`ae00000.display-subsystem`）与 `DPU` 同步挂起 `+25.2 s`，`anomalous_kernel_lines=0`。
+  3. **用户手动长短熄屏实测（`11:18–11:27`）**：连续完成 **5 轮**真实熄屏/复亮（含最长近 **4 分钟** `11:20:00 -> 11:23:59` 与 **71 秒** `11:25:46 -> 11:26:57`），`#16`–`#20` 全部 `Update firmware success`（`217–223 ms`），`MDSS GDSC` 累计挂起约 `379 s`，内核零 DSI/DPU/VBIF/vblank 异常；用户目视确认无问题（当前 `suspend_stats=0`，`s2idle` 待按需补测）。
+  4. **清理与默认启动项切换（`11:35`）**：经用户确认单次 `pkexec` 卸载失败内核 `kernel-opd2413-7.2.15-38.opd2413`、执行 `/usr/libexec/opd2413/boot-select default fedora-7.2.15-39.opd2413.conf`（保留 `-35` 作回退）并清理本地临时目录 `out/m3k/build38`：`KSHIM.CHO` 前后 SHA-256 一致且保持 `1 extent found`，`loader_default = booted_entry = fedora-7.2.15-39.opd2413.conf`，`pending_next: null`，ESP `/boot/efi` 恢复至 `247M / 512M`（剩余 `266M`，49%），`/` 剩余 `181G`。**待办**：完成 1 次 `-39` 冷启动复查；待外接显示器可用时跑完双屏 9 轮长窗口 DPMS 压测再关闭 [TECH-DEBT.md](TECH-DEBT.md) `#47`。
