@@ -1,0 +1,46 @@
+From: fedora-opd2413 <noreply@local>
+Date: Wed, 25 Nov 2026 21:40:00 +0800
+Subject: [PATCH] usb: typec: ucsi: do not reset mux to USB mode while partner is in alt-mode
+
+When a Type-C dock or monitor with both USB data and DisplayPort Alt
+Mode finishes PD Alt Mode negotiation, the PPM delivers a
+UCSI_CONSTAT_PARTNER_CHANGE event with both UCSI_CONSTAT_PARTNER_FLAG_USB
+and UCSI_CONSTAT_PARTNER_FLAG_ALT_MODE set.
+
+On Qualcomm PMIC GLINK platforms, pmic_glink_altmode manages the
+DisplayPort Alt Mode pin assignment on the shared Type-C mux
+(wcd939x-usbss SBU/AUX crossbar and QMP USB3/DP combo PHY). In
+ucsi_partner_change(), checking only PARTNER_FLAG_USB causes UCSI to
+unconditionally call typec_set_mode(con->port, TYPEC_STATE_USB)
+(svid=0, mode=1) right after pmic_glink_altmode configures DP Alt Mode
+(mode=4/5, svid=0xff01):
+- wcd939x-usbss physically disconnects SBU1/SBU2 (DP AUX) and briefly
+  blanks D+/D- switches (-EPROTO -71 on USB2 enumeration).
+- phy-qcom-qmp-combo resets and tears down the combo PHY back to
+  QMPPHY_MODE_USB3_ONLY, breaking HDMI/DP Alt Mode and dropping the
+  USB 3.2 SuperSpeed hub link.
+
+Skip typec_set_mode(con->port, TYPEC_STATE_USB) when
+UCSI_CONSTAT_PARTNER_FLAG_ALT_MODE is set. Plain USB attachments,
+audio/debug accessories, USB role switching, alt-mode exit back to
+USB-only, and disconnect (TYPEC_STATE_SAFE) remain unchanged.
+---
+ drivers/usb/typec/ucsi/ucsi.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/usb/typec/ucsi/ucsi.c b/drivers/usb/typec/ucsi/ucsi.c
+index 6f11d1e48..7c8d9e0f1 100644
+--- a/drivers/usb/typec/ucsi/ucsi.c
++++ b/drivers/usb/typec/ucsi/ucsi.c
+@@ -1356,7 +1356,8 @@ static void ucsi_partner_change(struct ucsi_connector *con)
+ 			typec_set_mode(con->port, TYPEC_MODE_AUDIO);
+ 			break;
+ 		default:
+-			if (UCSI_CONSTAT(con, PARTNER_FLAG_USB))
++			if (UCSI_CONSTAT(con, PARTNER_FLAG_USB) &&
++			    !UCSI_CONSTAT(con, PARTNER_FLAG_ALT_MODE))
+ 				typec_set_mode(con->port, TYPEC_STATE_USB);
+ 		}
+ 
+-- 
+2.49.0

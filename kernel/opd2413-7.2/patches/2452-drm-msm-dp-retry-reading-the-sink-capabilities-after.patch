@@ -1,0 +1,93 @@
+From cc6e10632c9276eb29562f2fddca7fbe899496d4 Mon Sep 17 00:00:00 2001
+From: yzddmr6 <46088090+yzddmr6@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 21:25:15 +0800
+Subject: [PATCH] drm/msm/dp: retry reading the sink capabilities after an AUX
+ failure
+
+When a monitor is connected through a USB-C hub in the reverse plug
+orientation, entering DisplayPort alternate mode can make the hub
+re-attach its upstream link. The AUX channel is then unusable for a few
+hundred milliseconds, which is when the sink capabilities are read after
+HPD goes high. HPD stays asserted, so no new plug event follows and the
+plug fails until the cable is plugged in again.
+
+Retry reading the DPCD and the sink capabilities up to 15 times, 150 ms
+apart, before failing the plug. On this tree reading the sink
+capabilities includes the EDID read, so a sink that is gone by then is
+retried as well, which only delays the failure.
+
+Based on TheMojoMan's drivers/gpu/drm/msm/dp/dp_display.c change in
+commit 2905ba664274 ("drm/msm: SM8750 dual-DSI 4-DSC pipeline, seamless
+dfps and DP sink-caps retry for erhai") in
+https://github.com/TheMojoMan/oneplus-erhai-linux
+
+Assisted-by: LLM
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ drivers/gpu/drm/msm/dp/dp_display.c | 35 ++++++++++++++++++++++++-----
+ 1 file changed, 29 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/dp/dp_display.c b/drivers/gpu/drm/msm/dp/dp_display.c
+index dc6f33809..908d60cd4 100644
+--- a/drivers/gpu/drm/msm/dp/dp_display.c
++++ b/drivers/gpu/drm/msm/dp/dp_display.c
+@@ -32,6 +32,15 @@ static bool psr_enabled = false;
+ module_param(psr_enabled, bool, 0);
+ MODULE_PARM_DESC(psr_enabled, "enable PSR for eDP and DP displays");
+ 
++/*
++ * In the reverse USB-C orientation, entering DP alternate mode can make a USB
++ * hub re-attach its upstream link, which leaves the AUX channel unusable for a
++ * few hundred milliseconds just when the sink capabilities are read. HPD stays
++ * asserted, so no new plug event follows: retry the read until AUX recovers.
++ */
++#define DP_SINK_CAPS_RETRIES		15
++#define DP_SINK_CAPS_RETRY_DELAY_MS	150
++
+ #define HPD_STRING_SIZE 30
+ 
+ enum {
+@@ -263,20 +272,34 @@ static int msm_dp_display_lttpr_init(struct msm_dp_display_private *dp, u8 *dpcd
+ 	return lttpr_count;
+ }
+ 
+-static int msm_dp_display_process_hpd_high(struct msm_dp_display_private *dp)
++static int msm_dp_display_read_sink_caps(struct msm_dp_display_private *dp)
+ {
+-	struct drm_connector *connector = dp->msm_dp_display.connector;
+-	const struct drm_display_info *info = &connector->display_info;
+-	int rc = 0;
+ 	u8 dpcd[DP_RECEIVER_CAP_SIZE];
++	int rc;
+ 
+ 	rc = drm_dp_read_dpcd_caps(dp->aux, dpcd);
+ 	if (rc)
+-		goto end;
++		return rc;
+ 
+ 	dp->link->lttpr_count = msm_dp_display_lttpr_init(dp, dpcd);
+ 
+-	rc = msm_dp_panel_read_sink_caps(dp->panel, connector);
++	return msm_dp_panel_read_sink_caps(dp->panel, dp->msm_dp_display.connector);
++}
++
++static int msm_dp_display_process_hpd_high(struct msm_dp_display_private *dp)
++{
++	struct drm_connector *connector = dp->msm_dp_display.connector;
++	const struct drm_display_info *info = &connector->display_info;
++	unsigned int tries = 0;
++	int rc;
++
++	rc = msm_dp_display_read_sink_caps(dp);
++	while (rc && tries++ < DP_SINK_CAPS_RETRIES) {
++		drm_dbg_dp(dp->drm_dev, "sink caps read failed (%d), retry %u/%u\n",
++			   rc, tries, DP_SINK_CAPS_RETRIES);
++		msleep(DP_SINK_CAPS_RETRY_DELAY_MS);
++		rc = msm_dp_display_read_sink_caps(dp);
++	}
+ 	if (rc)
+ 		goto end;
+ 
+-- 
+2.56.1
+

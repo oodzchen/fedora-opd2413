@@ -2212,12 +2212,12 @@ mpv、Firefox 仍是软解（Fedora `ffmpeg-free` 的专利限制），用户选
      - 手机端 RFCOMM 建连即先发送 `{"event":"hello","sta_freq":...}`；平板端 `opd-netshare-daemon` 订阅 `NetworkManager` `StateChanged` 加快断网唤醒（`s2idle` 唤醒复评 `300 ms`），且在仅广播待命时不预先起 `p2p0` AP（消解空闲 `5745 MHz` 占频触发 `#41`），待收到 `hello`（上限 `0.45 s`）后直接按对端 `sta_freq` 一次选对信道起播 AP。
   3. **判据**：离线检查 `py_compile`、`sh -n helper.sh`、XML 解析、`tests/netshare-daemon-test.py` 4 项单测与 `tools/build-netshare-rpm.sh 0.1 9` 全通过；待在有 Android SDK 的宿主机编译 `opd-netshare.apk` 并 `adb install -r` 到手机、在平板安装 `opd2413-netshare-0.1-9.noarch.rpm` 并完成伴侣关联后，实测熄屏/退后台自动建连速度、`tailscale netcheck` `IPv6: yes` 及公网 IPv6 连通性。
 - **实机验证结果（2026-11-16，IPv6 已真机通过，后台发现/息屏压测待用户继续实测）：**
-  1. **本机环境配置与装机**：通过 `pkexec dnf` 在平板安装 `opd2413-netshare-0.1-9.noarch` 与 `java-25-openjdk-devel`（`javac 25.0.4.1`）；于 `~/Android/Sdk` 部署 Android `cmdline-tools`、`platforms;android-35` 与 `build-tools;35.0.1`，并在 `~/Android/x86_64-sysroot` 配置精简 `x86_64` `glibc`/`libgcc` 供 `qemu-x86_64-static` 运行 `aapt2`/`zipalign`，直接编出 `out/netshare/opd-netshare.apk`（`114K`，v3 签名校验通过）。手机端经 `su -c 'pm uninstall ...'` 清除旧版残留后由 `/data/local/tmp/` 走 `pm install -r` 安装成功。
+  1. **本机环境配置与装机**：通过 `dnf` 在平板安装 `opd2413-netshare-0.1-9.noarch` 与 `java-25-openjdk-devel`（`javac 25.0.4.1`）；于 `~/Android/Sdk` 部署 Android `cmdline-tools`、`platforms;android-35` 与 `build-tools;35.0.1`，并在 `~/Android/x86_64-sysroot` 配置精简 `x86_64` `glibc`/`libgcc` 供 `qemu-x86_64-static` 运行 `aapt2`/`zipalign`，直接编出 `out/netshare/opd-netshare.apk`（`114K`，v3 签名校验通过）。手机端经 `su -c 'pm uninstall ...'` 清除旧版残留后由 `/data/local/tmp/` 走 `pm install -r` 安装成功。
   2. **IPv6 端到端真机通过**：平板切换至 `opd-netshare mode force`（验证广播期未拉起 `p2p0` AP、不干扰 `wlp1s0`）并完成伴侣端建连后，手机经 `rmnet_data3` 上报链路本地网关与 `/64` 派生的全局 IPv6 地址；平板 `p2p0` 自动获配 `<prefix>:0:2413:49:1/128 scope global nodad` 及 `default via fe80::... dev p2p0 proto static metric 550`（并配置 `resolvectl` IPv6 DNS `2400:3200::1`、`2402:4e00::`），AP 运行于 `5180 MHz / 80 MHz`（`1200.9 MBit/s HE-MCS 11 NSS 2`）。
   3. **Tailscale 与公网 IPv6 实测**：`tailscale netcheck` 返回 `IPv6: yes, [2408:xxxx:...]:32923`（`Nearest DERP: Hong Kong`）、`ping -6 -c 2 2400:3200::1` 往返 `71.1–99.7 ms`（`0% packet loss`）、`curl -6 -I https://www.qq.com` 通过 IPv6 收到正常 HTTP 响应；随后切回 `opd-netshare mode auto` 保持稳定连接。
   4. **连续切换稳定性修复（`opd2413-netshare-0.1-10` + APK 重编）**：
      - 定位到桌面端多次切换后复现连续组网失败的原因：1）`helper.sh` `cmd_down` 反复调用 `cmd wifip2p deinit` 且 `cmd_up` 仅 `sleep 0.1`，叠加 160 轮轮询超过 `28 s` 触发 `helper timeout` 强杀后未做 `cancel-connect`；2）平板端 `5180 MHz` 遇邻居 BSS 重叠切换主信道至 `5200 MHz` 时仍向手机下发 `5180`；3）候选信道耗尽重置会话时未清空 `failed_freqs`（`180 s` 冷却残留导致下次只试 1 次即中断）。
-     - 已修复：平板端读取实际 `iw dev p2p0 info` 信道并在候选耗尽时清空 `failed_freqs`（冷却缩至 `60 s`）；`helper.sh` 去掉 `cmd_down` 的 `deinit`、新增 `ensure_p2p_ready` 与 `cmd_cancel`、以墙钟 `16 s` 上限避免 `helper timeout`；`NetShareService` 增加扫描防抖与超时 `cancel`。重跑 `tests/netshare-daemon-test.py`（4/4 `OK`），编译并经 `pkexec dnf` 安装 `opd2413-netshare-0.1-10.noarch`，同时重编 `out/netshare/opd-netshare.apk`（`114K`，同密钥可覆盖安装）。
+     - 已修复：平板端读取实际 `iw dev p2p0 info` 信道并在候选耗尽时清空 `failed_freqs`（冷却缩至 `60 s`）；`helper.sh` 去掉 `cmd_down` 的 `deinit`、新增 `ensure_p2p_ready` 与 `cmd_cancel`、以墙钟 `16 s` 上限避免 `helper timeout`；`NetShareService` 增加扫描防抖与超时 `cancel`。重跑 `tests/netshare-daemon-test.py`（4/4 `OK`），编译并经 `dnf` 安装 `opd2413-netshare-0.1-10.noarch`，同时重编 `out/netshare/opd-netshare.apk`（`114K`，同密钥可覆盖安装）。
   5. **双端连续切换、耗时拆解与锁屏后台验收（2026-11-16 真机通过）**：
      - 手机覆盖安装新版 APK 后，用户多次切换桌面模式均可稳定恢复连接（`5745 MHz` 一次成功、`IPv6` 同步生效）；初始耗时拆解确认 BLE+RFCOMM 发现仅 `~1–2 s`、平板按需起 AP `~1 s`，而 `RFCOMM hello` 至组网完成仍需约 `15–17 s`（随后经手机端 `adb` + `dumpsys wifip2p` 进一步追查精确定位，见下条）。
      - **锁屏后台对比实测**：未在 ColorOS 最近任务锁卡时，锁屏静置一段时间后仍会被 ColorOS 强制冻结直至打开手机；**将 `OPD NetShare` 在最近任务栏锁定后再次锁屏静置，平板断开再切回 `auto` 模式可在手机不解锁/不打开 App 的情况下后台自动拉起建连**（同步更新 [TECH-DEBT.md](TECH-DEBT.md) `#40` 与 `#41`）。
@@ -2225,7 +2225,7 @@ mpv、Firefox 仍是软解（Fedora `ffmpeg-free` 的专利限制），用户选
 ### `opd2413-netshare-0.1-11` 连接速度根因定位与 P2P ADB 调试联动（2026-11-16，真机通过）
 
 - **上机测试前预期与判据：**
-  1. **设备写入边界**：在平板安装 `android-tools` 后经仅限 P2P 网关的白名单防火墙端口建立手机 `adb` 只读诊断，确认根因并与用户确认修改范围后：重编并覆盖安装 `out/netshare/opd-netshare.apk` 至手机，通过 `pkexec dnf` 升级平板 `opd2413-netshare-0.1-11.noarch`。
+  1. **设备写入边界**：在平板安装 `android-tools` 后经仅限 P2P 网关的白名单防火墙端口建立手机 `adb` 只读诊断，确认根因并与用户确认修改范围后：重编并覆盖安装 `out/netshare/opd-netshare.apk` 至手机，通过 `dnf` 升级平板 `opd2413-netshare-0.1-11.noarch`。
   2. **根因与优化预期**：
      - 手机端：`get_sta_freq()` 在 `wlan0` 未连接时会回退调用 `/vendor/bin/wpa_cli`，受 ColorOS SELinux 拒绝 `hal_wifi_supplicant_default` 向 `su` (`u:r:ksu:s0`) 回包（`avc: denied { sendto }`）影响每次超时卡死 **10.055 s**（失败重试更卡 20.1 s）；移除 `wpa_cli` 回退并仅在失败分支按需读取 `iw`、`hello` 阶段优先读取 Android `WifiInfo.getFrequency()`、已处 `InactiveState` 时跳过冗余 `cancel-connect`/`remove-group`、通过 `/proc/sys/net/ipv6/conf/p2p0/dad_transmits=0` 消除链路本地地址 `tentative` 等待、借助状态脏标记与 `/dev/.opdlink_v6nat_ok` 缓存省去重复 `iptables`/`ip6tables` 清理与无效 `ip6tables -t nat` 试探，并在 APK 与 `helper.sh` 中集成仅放行 P2P 网关（`192.168.49.1`）的 `adb-on`/`adb-off`/`adb-status` 开关。
      - 平板端：`dnsmasq` 启动参数增加 `--no-ping` 消除首次 `DHCPDISCOVER` 默认 ICMP ping 探活造成的 **3.005 s** 硬延迟；`_start_ap()` 用 `_drain_proc_log` 触发的 `AP-ENABLED` 事件替换 `0.15 s` 慢轮询与固定 `sleep(0.2)`，并将 `firewall-cmd --zone=trusted` 与 `wpa_supplicant` 启动并行执行。
@@ -2257,12 +2257,12 @@ mpv、Firefox 仍是软解（Fedora `ffmpeg-free` 的专利限制），用户选
 
 - **用户需求与策略设计：** 用户确认在平板安装 `kscreenlocker-6.8.3-1.fc45.opd2413.1.aarch64`，并将合盖行为调整为「合盖立即锁屏并熄屏、10 分钟后再进入休眠（短时间合盖再打开无需经历 `s2idle` 唤醒延迟）」。源码确认 KDE PowerDevil 6.8.3 `HandleButtonEvents`（`daemon/actions/bundled/handlebuttonevents.cpp` 与 `dpms.cpp`）仅支持合盖立即执行单一动作：设 `LidAction=64`（`TurnOffScreen`）+ `[Display] LockBeforeTurnOffDisplay=true` 可在合盖时立即调用 `KScreen::Dpms::Off` 熄屏并在 `250 ms`（`dimAnimationTime`）后触发 `org.freedesktop.ScreenSaver Lock` 锁屏，而 PowerDevil 无原生「合盖延迟 N 分钟休眠」配置（若改全局 `AutoSuspendAction=1` 会在开盖挂机或 SSH 跑编译时误睡眠）。
 - **预期与判据：**
-  1. 经 Polkit 授权执行 `pkexec dnf --disablerepo='*' upgrade -y ./out/rpmbuild/RPMS/aarch64/kscreenlocker-6.8.3-1.fc45.opd2413.1.aarch64.rpm` 完成装包，`rpm -q kscreenlocker` 为 `kscreenlocker-6.8.3-1.fc45.opd2413.1.aarch64`。
+  1. 执行 `dnf --disablerepo='*' upgrade -y ./out/rpmbuild/RPMS/aarch64/kscreenlocker-6.8.3-1.fc45.opd2413.1.aarch64.rpm` 完成装包，`rpm -q kscreenlocker` 为 `kscreenlocker-6.8.3-1.fc45.opd2413.1.aarch64`。
   2. 通过 `kwriteconfig6` 对 `powerdevilrc` 的 `AC`/`Battery`/`LowBattery` 均写入 `[Display] LockBeforeTurnOffDisplay=true` 与 `[SuspendAndShutdown] LidAction=64`（保留 `PowerButtonAction=1` 与 `AutoSuspendAction=0`），重启 `plasma-powerdevil.service` 后 `HandleButtonEvents.lidAction()` 返回 `64`。
   3. 新增 `device/libexec/lid-suspend` 与 `device/systemd/opd2413-lid-suspend.service`（暂用户态部署至 `~/.local/libexec/opd2413-lid-suspend` 与 `~/.config/systemd/user/opd2413-lid-suspend.service`，登记 [TECH-DEBT.md](TECH-DEBT.md) `#44`）：监听 `org.freedesktop.UPower` `LidIsClosed` 与 `login1` `PrepareForSleep`，合盖后启动 `600 s` 单调定时器，开盖或提前进入睡眠则立即取消；`600 s` 到时复查仍合盖且 `HandleButtonEvents.triggersLidAction()` 为真（无外接显示器抑制）后调用 `PowerDevil` `SuspendSession.suspendToRam()` 进 `s2idle`；若系统处于合盖态发生误唤醒并收到 `PrepareForSleep(false)`，则重新计时以便再次入睡。
   4. **判据**：注销重登或重启整机让 `kwin_wayland` 加载新版 `libKScreenLocker.so.6` 后，实测合盖立即黑屏锁屏、10 分钟内开盖瞬时亮屏解锁（无卡死与崩溃弹窗、`fcitx5` 正常），持续合盖满 10 分钟自动进入 `s2idle`。
 - **实机操作与检验结果（2026-11-16）：**
-  1. 用户经桌面 Polkit 弹窗授权后 `pkexec dnf --disablerepo='*' upgrade -y` 成功完成事务，`rpm -q kscreenlocker` 返回 `kscreenlocker-6.8.3-1.fc45.opd2413.1.aarch64`。
+  1. 执行 `dnf --disablerepo='*' upgrade -y` 成功完成事务，`rpm -q kscreenlocker` 返回 `kscreenlocker-6.8.3-1.fc45.opd2413.1.aarch64`。
   2. `~/.config/powerdevilrc` 更新并执行 `systemctl --user restart plasma-powerdevil.service` 后，`qdbus-qt6 org.kde.Solid.PowerManagement /org/kde/Solid/PowerManagement/Actions/HandleButtonEvents lidAction` 返回 `64`。
   3. `systemctl --user enable --now opd2413-lid-suspend.service` 后服务为 `active (running)`（日志 `watching lid events (delay=600s, lid currently open)`、零警告）；离线单元测试 `LidSuspendWatcher(delay_sec=1, dry_run=True)` 验证 `get_lid_closed()==False`、`triggers_lid_action()==True`、合盖起表/开盖撤表、`PrepareForSleep(true)` 撤表及超时触发 `trigger_suspend` 均通过（`LID_SUSPEND_TEST_PASS`）。
 
@@ -2298,7 +2298,7 @@ mpv、Firefox 仍是软解（Fedora `ffmpeg-free` 的专利限制），用户选
   1. `packaging/opd2413-face/src/qml/facebridge.{h,cpp}`：新增 `FaceBridge.lidClosed` 属性（订阅系统总线 `org.freedesktop.UPower` `PropertiesChanged` 并在构造时异步拉取 `LidIsClosed`）。
   2. `packaging/opd2413-face/src/opd2413-faced.py`：订阅 `UPower` `LidIsClosed`，合盖瞬间若正在识别立即 `active_cancel.set()` 释放摄像头并按 `lid-closed` 结束，避免在黑盖后空转 3.5 s。
   3. `packaging/opd2413-face/data/lockscreen/LockScreenUi.qml`：新增 `onLidClosedChanged`：合盖（`lidClosed===true`）立即停表、归零 `faceTriedThisOpen=false`、`uiVisible=false` 并 `FaceBridge.resetState()`；开盖（`lidClosed===false`）时在未解锁态复位 `faceTriedThisOpen=false` 与状态，主动展示锁屏提示并在 `260 ms` 后自动拉起新一轮人脸识别（`armScan()` 也增加 `!FaceBridge.lidClosed` 守卫）。
-  4. `./tools/build-face-rpm.sh --local 0.1 11` 编出 `out/rpmbuild/RPMS/aarch64/opd2413-face-0.1-11.fc45.aarch64.rpm` 并经 `pkexec dnf upgrade -y` 装机及重启 `opd2413-face.service`（`active`）；`cmp -s` 确认 `/usr/local/share/plasma/.../LockScreenUi.qml` 已随 `%posttrans` 更新一致，`PySide6` 离线 QML 加载验证 `FaceBridge.lidClosed===false` 通过（`FACEBRIDGE_QML_OK`）；并同步将 `TECH-DEBT #44` 中的 `opd2413-face` 直装项清除。待用户实测「开盖未解锁→合盖→再开盖」闭环确认。
+  4. `./tools/build-face-rpm.sh --local 0.1 11` 编出 `out/rpmbuild/RPMS/aarch64/opd2413-face-0.1-11.fc45.aarch64.rpm` 并经 `dnf upgrade -y` 装机及重启 `opd2413-face.service`（`active`）；`cmp -s` 确认 `/usr/local/share/plasma/.../LockScreenUi.qml` 已随 `%posttrans` 更新一致，`PySide6` 离线 QML 加载验证 `FaceBridge.lidClosed===false` 通过（`FACEBRIDGE_QML_OK`）；并同步将 `TECH-DEBT #44` 中的 `opd2413-face` 直装项清除。待用户实测「开盖未解锁→合盖→再开盖」闭环确认。
 
 ### P0 收口：合盖服务并入 `opd2413-device` RPM、修复固件数测试校验与 NTP 时钟同步（2026-11-16，离线构建通过，待用户确认后装机验证）
 2304: 
@@ -2309,14 +2309,14 @@ mpv、Firefox 仍是软解（Fedora `ffmpeg-free` 的专利限制），用户选
 - **上机写入范围与判据：**
   1. **设备写入范围（仅 `ARMADA_ROOT`，不碰 ESP / `boot_b` / Android 分区）**：
      - 停用并清理此前直装的 `/etc/systemd/system/opd2413-lid-input.service`（及 `multi-user.target.wants` 软链）、`/usr/libexec/opd2413/lid-input`、`~/.local/libexec/opd2413-lid-suspend`、`~/.config/systemd/user/opd2413-lid-suspend.service`（及 `graphical-session.target.wants` 软链）；
-     - 安装 `out/rpmbuild/RPMS/noarch/opd2413-device-0.1-15.noarch.rpm`（`pkexec dnf --disablerepo='*' upgrade -y`），`systemctl daemon-reload` 与 `systemctl --user daemon-reload` 并重启两个服务；
+     - 安装 `out/rpmbuild/RPMS/noarch/opd2413-device-0.1-15.noarch.rpm`（`dnf --disablerepo='*' upgrade -y`），`systemctl daemon-reload` 与 `systemctl --user daemon-reload` 并重启两个服务；
      - 更新 `/etc/chrony.conf`，保留原有配置结构并替换 `pool 2.fedora.pool.ntp.org iburst` 为 `ntp.aliyun.com` / `ntp1.aliyun.com` / `ntp.tencent.com` / `time2.cloud.tencent.com`（`iburst`），重启 `chronyd.service`。
   2. **验收判据**：
      - `rpm -q opd2413-device` 为 `0.1-15` 且 `rpm -V opd2413-device` 无缺失/篡改；原直装路径已清除；`opd2413-lid-input.service`（系统级）与 `opd2413-lid-suspend.service`（用户级）均处于 `active (running)` 且指向 `/usr/lib/systemd/{system,user}/` 与 `/usr/libexec/opd2413/`；
      - `chronyc tracking` `Leap status` 变为 `Normal`，`chronyc sources` 至少 3 个国内源达到非零 `Reach` 并选出主同步源（`*`）；
      - 经一次冷启动验证（因涉及系统级 systemd unit 变动），确认上述服务与 `chronyd` 在开机后自动就绪、`systemctl --failed` 为空、SELinux `Enforcing` 无新增 AVC。
 - **实机验证结果（2026-11-16，运行态已通过，待下一次冷启动复核 systemd 静态自启）：**
-  1. **清理与装包（`opd2413-device-0.1-15.noarch`）**：停止并清除旧直装 `/etc/systemd/system/opd2413-lid-input.service`、`/usr/libexec/opd2413/lid-input`、`~/.local/libexec/opd2413-lid-suspend` 与 `~/.config/systemd/user/opd2413-lid-suspend.service`（含各自 `.wants` 软链）；经 `pkexec dnf --disablerepo="*" upgrade -y` 成功升级至 `opd2413-device-0.1-15.noarch`，`rpm -V opd2413-device` 零输出通过；新文件路径及 SELinux 上下文确认分别为 `/usr/libexec/opd2413/{lid-input,lid-suspend}`（`bin_t`）与 `/usr/lib/systemd/{system/opd2413-lid-input,user/opd2413-lid-suspend}.service`（`systemd_unit_file_t`）及对应静态 `.wants` 软链。
+  1. **清理与装包（`opd2413-device-0.1-15.noarch`）**：停止并清除旧直装 `/etc/systemd/system/opd2413-lid-input.service`、`/usr/libexec/opd2413/lid-input`、`~/.local/libexec/opd2413-lid-suspend` 与 `~/.config/systemd/user/opd2413-lid-suspend.service`（含各自 `.wants` 软链）；经 `dnf --disablerepo="*" upgrade -y` 成功升级至 `opd2413-device-0.1-15.noarch`，`rpm -V opd2413-device` 零输出通过；新文件路径及 SELinux 上下文确认分别为 `/usr/libexec/opd2413/{lid-input,lid-suspend}`（`bin_t`）与 `/usr/lib/systemd/{system/opd2413-lid-input,user/opd2413-lid-suspend}.service`（`systemd_unit_file_t`）及对应静态 `.wants` 软链。
   2. **服务状态**：`opd2413-lid-input.service`（系统级，`PID 26584`）与 `opd2413-lid-suspend.service`（用户级，`PID 26613`）均处于 `active (running)`，`watching /dev/input/event...` 与 `watching lid events (delay=600s, lid currently open)` 正常。
   3. **NTP 同步**：更新 `/etc/chrony.conf`（注释原境外 `pool 2.fedora.pool.ntp.org iburst`，加入 `ntp.aliyun.com`、`ntp1.aliyun.com`、`ntp.tencent.com`、`time2.cloud.tencent.com` `iburst`）并重启 `chronyd.service`；6 s 后 `chronyc tracking` 为 `Leap status: Normal`、`Stratum: 3`、`Reference ID: 6FE6BDAE (111.230.189.174)`、`System time: 0.000170632 s slow`，`chronyc sources -v` 4 源全部 `Reach=17`（`^* 111.230.189.174` 为主源）。
   4. **整机健康度**：`systemctl is-system-running = running`，`systemctl --failed` 为 `0 loaded units listed`，SELinux `Enforcing` 无 `lid-input`/`lid-suspend`/`chronyd` 相关 AVC 拒绝（`chronyc` 仅读父 shell `/proc/<pid>` 触发无害拒绝）。待下一次插电冷启动后确认静态启用的两项合盖服务与 `chronyd` 自动就绪。
@@ -2347,7 +2347,7 @@ mpv、Firefox 仍是软解（Fedora `ffmpeg-free` 的专利限制），用户选
      - 通过 `quirks/50-system-oneplus.quirks`（`MatchVendor=0x22D9` / `MatchProduct=0x3869` / `ModelOnePlusOPD2413Touchpad=1`）定向启用 ColorOS 16 曲线及 `DSI-1` `kwinoutputconfig.json` 缩放读取、`tp_dwt_default_enabled() == false`、`220 ms` / `2.0 mm` 轻击阈值、关闭 `jump.detection_disabled = true` 并设置 `20 ms / 8 ms` 串口帧间隔平滑。
      - `./tools/build-libinput-rpm.sh --local 1` 编出 `out/rpmbuild/RPMS/aarch64/libinput-1.32.0-1.fc45.opd2413.1.aarch64.rpm`（SHA-256 `e18db3f3be598748b629aaf86f10f8bb2de3003b5c7a147bd9f5cb2752b95d32`），`%check` 执行 `meson test`（`validate-quirks`、`test-library-version`、`symbols-leak-test` 3/3 `OK`）与链接 `libfilter.a` + `liblibinput-util.a` 的自测程序均通过（`OPD2413_FILTER_SELF_TEST_PASS`：1–500 mm/s 单调、3 个拐点连续性 <0.2%、`20/85/200 mm/s` 精确增益、`-1/0/+1` 档位倍率、`kwinoutputconfig.json` 中 `DSI-1 scale=2.0` 解析），且包内已含 `/usr/share/libinput/50-system-oneplus.quirks`。
 - **实机装机与单次引导准备（2026-11-17，已写入设备，待重启验收）：**
-  1. **装机与 ESP 状态**：经 `pkexec dnf --disablerepo='*'` 执行单事务：先核对 `boot-select status`（`kshim_remembered: "Fedora"`、`booted_entry: fedora-7.2.15-29.opd2413.conf`、`pending_next: null`）并将 `fedora-7.2.15-29.opd2413.conf` 确认为回退默认项；带 `--setopt=protected_packages=""` 卸载最旧备用内核 `kernel-opd2413-7.2.15-26.opd2413`（ESP `/dev/sda16` 从 `370M / 512M` 回落至 `247M / 512M`，空出 `266M`）；随后升级安装 `libinput-1.32.0-1.fc45.opd2413.1.aarch64`（`rpm -V libinput` 零输出通过；`/usr/lib64/libinput.so.10.13.0` 与 `/usr/share/libinput/50-system-oneplus.quirks` SELinux 上下文分别为 `lib_t` 与 `usr_t`），并带 `--setopt=installonly_limit=3` 装入 `kernel-opd2413-7.2.15-30.opd2413.aarch64`（保留 `-29` 与 `-28` 两级回退）。
+  1. **装机与 ESP 状态**：经 `dnf --disablerepo='*'` 执行单事务：先核对 `boot-select status`（`kshim_remembered: "Fedora"`、`booted_entry: fedora-7.2.15-29.opd2413.conf`、`pending_next: null`）并将 `fedora-7.2.15-29.opd2413.conf` 确认为回退默认项；带 `--setopt=protected_packages=""` 卸载最旧备用内核 `kernel-opd2413-7.2.15-26.opd2413`（ESP `/dev/sda16` 从 `370M / 512M` 回落至 `247M / 512M`，空出 `266M`）；随后升级安装 `libinput-1.32.0-1.fc45.opd2413.1.aarch64`（`rpm -V libinput` 零输出通过；`/usr/lib64/libinput.so.10.13.0` 与 `/usr/share/libinput/50-system-oneplus.quirks` SELinux 上下文分别为 `lib_t` 与 `usr_t`），并带 `--setopt=installonly_limit=3` 装入 `kernel-opd2413-7.2.15-30.opd2413.aarch64`（保留 `-29` 与 `-28` 两级回退）。
   2. **ESP 与 `KSHIM.CHO` 核验**：`kernel-install` + `dracut` + `60-opd2413-initrd-check` 于 `30 s` 内完成；`/boot/efi/fedora/7.2.15-30.opd2413/` 含 `linux`（`62M`）、`initrd`（`62M`）、`sm8750-oneplus-pad2pro.dtb`（`145K`），`fedora-7.2.15-30.opd2413.conf` 启动参数与 `-29` 一致（含 `cpufreq.default_governor=schedutil swiotlb=8192 mem_sleep_default=s2idle`），ESP 最终占用 `370M / 512M`（剩余 `143M`）。已调用 `/usr/libexec/opd2413/boot-select next fedora-7.2.15-30.opd2413.conf` 并 `sync`，校验 `KSHIM.CHO` 前后 SHA-256 完全一致，`pending_next` 指向 `fedora-7.2.15-30.opd2413.conf`（回退项为 `fedora-7.2.15-29.opd2413.conf`）。待用户重启进入 `-30` 后完成下列真机验收：
 - **真机验收判据：**
   - `uname -r = 7.2.15-30.opd2413`、SELinux `Enforcing`、`0 AVC`、`/proc/bus/input/devices` 触控板 `ABS` 位图包含 `ABS_MT_TOOL_TYPE`（位 `55`）；
@@ -2356,7 +2356,7 @@ mpv、Firefox 仍是软解（Fedora `ffmpeg-free` 的专利限制），用户选
   1. **系统与输入栈状态复核**：用户重启经 `boot-select next` 引导至 `7.2.15-30.opd2413`（`/proc/cmdline` 含 `initrd=\fedora\7.2.15-30.opd2413\initrd` 与 `mem_sleep_default=s2idle`），`opd2413-boot-restore.service` 于开机阶段按预期自动将 `loader.conf` 默认条目从 `fedora-7.2.15-30.opd2413.conf` 恢复至 `fedora-7.2.15-29.opd2413.conf`（待用户确认后调用 `boot-select default` 固化）。`rpm -q kernel-opd2413` 列出 `-28`/`-29`/`-30`、`libinput` 为 `1.32.0-1.fc45.opd2413.1`、`systemctl is-system-running = running`、`0 failed`、SELinux `Enforcing`、当次开机 journal `0 avc: denied`；`/proc/bus/input/devices` 中 `OnePlus Pad 2 Pro Keyboard Touchpad`（`event6`）`ABS=2e0800000000003`（`ABS_MT_TOOL_TYPE` 位 55 已激活）；KWin D-Bus `/org/kde/KWin/InputDevice/event6` 实测 `disableWhileTyping=false`、`disableWhileTypingEnabledByDefault=false`、`pointerAccelerationProfileAdaptive=true`、`tapToClick=true`。
   2. **真机交互验收与 `Ctrl+轻击` 分层排除**：用户实测确认重启后单指轻击与连续拖拽（“拓展”）明显改善；针对浏览器 `Ctrl+轻击` 进行独立隔离测试——**“双手离开触控板 → 按住 `Ctrl` 等约 1 秒（避开 `< 160 ms` 固件静默且掌根不贴边）→ 单指轻击网页链接”可正常打开新标签页**，证明内核 `2436`（`MT_TOOL_PALM` + 心跳条件抬指）与 `opd2413-libinput` 未误杀正常 `Ctrl+轻击`；同步滑动按 `Ctrl` 停顿与 `< 160 ms` 快速组合吞点确认属硬件固件限制（日常可用三指轻击中键替代）。
   3. **固件协议完全审计（证据位于 `private/touchpad-20261117/`）**：反汇编 `oplus_bsp_pogo_keyboard.ko`、`libpogo_keyboard.so`、`dtbo_b` 与 `AccessoryFramework.apk`（`IPogoKeyboard`）确认，键盘为 `KA030_B_1.2.0`（MCU）+ `TP_A_13`（触控 IC）双芯片方案，UART 指令仅覆盖 LED（`0x20 06 0d 04`）、版本查询（`0x34 01 07` / `0x38 03 08`）、亮灭屏同步（`0x3a 03 02`）、电池电流（`0x3a 03 09`）、20 B 序列号（`0x3a 04 0b`）、触控板总开关（`0x3a 03 11`）、手势开关（`0x3a 03 17`）、15×25 电容矩阵调试流（`0x3a 03 19`）与 NFC 标签同步，不存在 DWT/掌触参数调节命令；且 `dtbo_b` `Erhai` 节点未开 `pogopin-kb-fw-support`、`super` 分区无 `POGOPIN_KB.bin`，串口 DFU（`0x38 04 0a` / `0x24 03` 与 `0x3a 09 12`）仅有只写路径而无 Flash 回读，MCU 还依赖 Nordic Secure DFU `bat_data` 签名校验（见 [TECH-DEBT.md](TECH-DEBT.md) `#46`）。
-  4. **设为默认启动项（2026-11-17，经用户确认执行）**：经用户确认仅写入 ESP `loader.conf` 后，通过 `pkexec /usr/libexec/opd2413/boot-select default fedora-7.2.15-30.opd2413.conf && sync` 固化默认引导项；核验 `/boot/efi/loader/loader.conf` 为 `default fedora-7.2.15-30.opd2413.conf`，`boot-select status` 显示 `booted_entry: "fedora-7.2.15-30.opd2413.conf"`、`loader_default: "fedora-7.2.15-30.opd2413.conf"`、`pending_next: null`、`kshim_remembered: "Fedora"`，`/boot/efi/KSHIM.CHO` 写前后 SHA-256 完全一致且保持 `1 extent`（`16384 B`），`loader/entries/` 保留 `fedora-7.2.15-{28,29,30}.opd2413.conf`（ESP `370M / 512M`，剩余 `143M`）；常规冷启动走默认项可于下次断电重启时一并复核。
+  4. **设为默认启动项（2026-11-17，经用户确认执行）**：经用户确认仅写入 ESP `loader.conf` 后，通过 `/usr/libexec/opd2413/boot-select default fedora-7.2.15-30.opd2413.conf && sync` 固化默认引导项；核验 `/boot/efi/loader/loader.conf` 为 `default fedora-7.2.15-30.opd2413.conf`，`boot-select status` 显示 `booted_entry: "fedora-7.2.15-30.opd2413.conf"`、`loader_default: "fedora-7.2.15-30.opd2413.conf"`、`pending_next: null`、`kshim_remembered: "Fedora"`，`/boot/efi/KSHIM.CHO` 写前后 SHA-256 完全一致且保持 `1 extent`（`16384 B`），`loader/entries/` 保留 `fedora-7.2.15-{28,29,30}.opd2413.conf`（ESP `370M / 512M`，剩余 `143M`）；常规冷启动走默认项可于下次断电重启时一并复核。
 
 
 
@@ -2374,7 +2374,7 @@ mpv、Firefox 仍是软解（Fedora `ffmpeg-free` 的专利限制），用户选
     3. 点击 `Start Face Recognition` 后按钮切换为 `Scanning Face…`，正对前摄即完成识别并授权放行；遮挡摄像头超时或失败后保留密码输入与 `Retry Face Recognition` 按钮，且 `Cancel` 能立即中止扫描；
     4. 终端 `sudo` 与锁屏人脸解锁仍按原有方式正常工作；SELinux `Enforcing` 无新增 AVC 拒绝。
 - **实机验证结果（2026-11-17，真机通过）：**
-  1. **装包与服务重启**：经 `pkexec dnf --disablerepo="*" upgrade -y` 装入 `opd2413-face-0.1-12.fc45.aarch64` 与 `polkit-kde-6.8.3-1.fc45.opd2413.1.aarch64`（`rpm -V opd2413-face polkit-kde` 零输出通过）；`opd2413-face.service`（`PID 191533`）与用户级 `plasma-polkit-agent.service`（`PID 191846`）均 `active (running)`。`gdbus` 查询确认 `HasEnrolled("colin") = true`、`IsPolkitArmed("colin") = false`。
+  1. **装包与服务重启**：经 `dnf --disablerepo="*" upgrade -y` 装入 `opd2413-face-0.1-12.fc45.aarch64` 与 `polkit-kde-6.8.3-1.fc45.opd2413.1.aarch64`（`rpm -V opd2413-face polkit-kde` 零输出通过）；`opd2413-face.service`（`PID 191533`）与用户级 `plasma-polkit-agent.service`（`PID 191846`）均 `active (running)`。`gdbus` 查询确认 `HasEnrolled("colin") = true`、`IsPolkitArmed("colin") = false`。
   2. **显式点击确认验收（`pkexec id`）**：
      - `22:22:30` 触发 `pkexec id` 弹出新版 `QuickAuthDialog.qml`，在随后 9 秒停留期间未触发人脸扫描与自动授权（用户有充足时间查看动作内容）；
      - `22:22:39` 用户点击 **Start Face Recognition** 后，`polkit-agent-helper-1[192249]` 记录 `pam_opd2413_face(polkit-1:auth): Face authenticated user colin (polkit-1)`，审核日志 `grantors=pam_opd2413_face res=success`，`pkexec id` 返回 `uid=0(root)`；
@@ -2405,14 +2405,14 @@ mpv、Firefox 仍是软解（Fedora `ffmpeg-free` 的专利限制），用户选
   1. **阶段 1A（安装 `opd2413-gaming-0.1-1`）**：安装后 sysctl/udev/tmpfiles 立即生效，`opd-power status` 显示 `polling_interval=16 ms`、`rt_uclamp_min=64`、`swappiness=150`、`dirty=536870912/67108864`、`rmem_max=33554432`；重启 PipeWire 后扬声器播放正常无爆音；`opd-power bypass on` / `off` 可正常切换 `charge_control_{start,end}_threshold`；SELinux `Enforcing` 零新增 AVC。
   2. **阶段 1B（清理旧回退 `-28`、安装 `7.2.15-31.opd2413` 并经 `boot-select next` 安全单次引导 + 冷启动复核）**：开机后 `uname -r = 7.2.15-31.opd2413`、`/sys/devices/system/cpu/cpuidle/current_governor = teo`、`running`、`0 failed`、`Enforcing` 零 AVC、`KSHIM.CHO` 哈希与 `1 extent` 不变、`s2idle` 短休眠唤醒与显示/触控/触摸板/Wi-Fi/蓝牙/GPU/相机均无回归。
 - **阶段 1A 实机验证结果（2026-11-19，经用户确认装机，真机通过）：**
-  - 通过 `pkexec dnf --disablerepo="*" install -y out/rpmbuild/RPMS/noarch/opd2413-gaming-0.1-1.noarch.rpm` 完成安装（`rpm -V opd2413-gaming` 零输出）。
+  - 通过 `dnf --disablerepo="*" install -y out/rpmbuild/RPMS/noarch/opd2413-gaming-0.1-1.noarch.rpm` 完成安装（`rpm -V opd2413-gaming` 零输出）。
   - sysctl/udev 即时生效：`3d00000.gpu/polling_interval = 16` ms、`kernel.sched_util_clamp_min_rt_default = 64`、`vm.swappiness = 150`、`vm.dirty_bytes = 536870912`、`vm.dirty_background_bytes = 67108864`、`net.core.rmem_max = 33554432`、`/dev/ntsync` 可访问（`0666`）；`60-opd2413-gaming.conf` tmpfiles 写入 `cpuidle=teo` 在当前 `7.2.15-30` 上按预期返回 `Invalid argument`（待 1B 内核 `7.2.15-31` 启用后自动切入）。
   - `opd-power bypass on` 将阈值置为 `93%..94%`，`opd-power bypass off` 恢复至 `50%..100%`（`qcom_battmgr` 固件将 `start=0` 钳位至 `50`）；`opd-power profile performance` 保持 `policy6` 为 `schedutil` 并将 GPU 最低频提至 `443 MHz`，切回 `balanced` 恢复全范围。
   - 重启用户级 `pipewire`/`pipewire-pulse`/`wireplumber` 均 `active`，`pw-metadata -n settings 0` 确认 `clock.min-quantum = 1024`、`clock.quantum = 1024`、`clock.rate = 48000`；`opd-game fast` 实测 `PROTON_USE_NTSYNC=1`、`WINE_D3D_CONFIG=renderer=vulkan`、`FEX_X87REDUCEDPRECISION=1` 与 `uclampset util_clamp: min: 448 max: 1024`。
   - 整机状态：`systemctl is-system-running = running`、`0 failed`、`SELinux Enforcing` 零新增 AVC。
 - **阶段 1B 离线构建与装机就绪（2026-11-19，待重启验收）：**
   - 本地容器离线完成 `kernel-opd2413-7.2.15-31.opd2413.aarch64.rpm` 构建（SHA-256 `5355fe70…`），`diff -u` 确认 `.config` 相对 `7.2.15-30.opd2413` 仅 `CONFIG_CPU_IDLE_GOV_TEO=y` 一行变化。
-  - 已通过单次 `pkexec` 固化 `boot-select default fedora-7.2.15-30.opd2413.conf`、卸载最旧回退 `7.2.15-28`、装入 `7.2.15-31.opd2413` 并设置一次性引导 `boot-select next fedora-7.2.15-31.opd2413.conf`；ESP `/dev/sda16` 保留 `-29`/`-30`/`-31`（`370M / 512M`，剩余 `143M`），`/boot/efi/KSHIM.CHO` 写前后 SHA-256 完全一致且保持 `1 extent`（`16384 B`）。待用户重启平板后核验 `uname -r = 7.2.15-31.opd2413`、`cpuidle=teo`、`opd2413-gaming` 冷启动持久化与整机健康度。
+  - 已固化 `boot-select default fedora-7.2.15-30.opd2413.conf`、卸载最旧回退 `7.2.15-28`、装入 `7.2.15-31.opd2413` 并设置一次性引导 `boot-select next fedora-7.2.15-31.opd2413.conf`；ESP `/dev/sda16` 保留 `-29`/`-30`/`-31`（`370M / 512M`，剩余 `143M`），`/boot/efi/KSHIM.CHO` 写前后 SHA-256 完全一致且保持 `1 extent`（`16384 B`）。待用户重启平板后核验 `uname -r = 7.2.15-31.opd2413`、`cpuidle=teo`、`opd2413-gaming` 冷启动持久化与整机健康度。
 - **阶段 1B 重启验收结果（2026-11-19 09:20:59 开机，真机通过）：**
   - 重启直接进入 `uname -r = 7.2.15-31.opd2413`；`opd-power status` 核验 `CPUIDLE: teo (available: menu teo)`、`3d00000.gpu/polling_interval = 16 ms`、`ntsync=yes`、`rt_uclamp_min=64`、`swappiness=150`、`dirty=536870912/67108864`、`rmem_max=33554432`；
   - `systemctl --user show-environment` 含 `WINE_D3D_CONFIG=renderer=vulkan`，PipeWire `clock.min-quantum = 1024`（`48000 Hz`）；
@@ -2461,7 +2461,7 @@ mpv、Firefox 仍是软解（Fedora `ffmpeg-free` 的专利限制），用户选
   - 原生构建产出 `out/rpmbuild/RPMS/aarch64/opd2413-face-0.1-13.fc45.aarch64.rpm`（SHA-256 `baf4c473...`）与 `out/rpmbuild/RPMS/aarch64/polkit-kde-6.8.3-1.fc45.opd2413.2.aarch64.rpm`（SHA-256 `f89123c0...`）；离线解包并解压 `.qrc` zstd 资源验证两包均仅含新图标、无旧 `edit-image-face-*` 残留（`离线通过`）。
 - **上机预期与判据**：装入两包并重启 `plasma-polkit-agent.service` 后，（1）`rpm -q` 为 `opd2413-face-0.1-13` 与 `polkit-kde-6.8.3-1.fc45.opd2413.2`；（2）`/usr/local/share/plasma/shells/org.kde.plasma.desktop/contents/lockscreen/MainBlock.qml` 已刷新为 `preferences-desktop-emoticons-symbolic`；（3）触发 `pkexec` 授权弹窗与锁屏界面目视确认均为黑白单色微笑脸且人脸解锁正常；（4）`SELinux Enforcing` 零新增 AVC。
 - **装机与实机验收结果（2026-11-19，经用户确认与目视验收，达 `真机通过`）**：
-  - 通过单次 `pkexec` 完成 `dnf -y upgrade --nogpgcheck`，`rpm -q` 确认为 `opd2413-face-0.1-13.fc45.aarch64` 与 `polkit-kde-6.8.3-1.fc45.opd2413.2.aarch64`；
+  - 完成 `dnf -y upgrade --nogpgcheck`，`rpm -q` 确认为 `opd2413-face-0.1-13.fc45.aarch64` 与 `polkit-kde-6.8.3-1.fc45.opd2413.2.aarch64`；
   - `/usr/share/opd2413-face/lockscreen/MainBlock.qml` 与 `/usr/local/share/plasma/shells/org.kde.plasma.desktop/contents/lockscreen/MainBlock.qml` 均已更新为 `preferences-desktop-emoticons-symbolic`；
   - `systemctl --user restart plasma-polkit-agent.service` 后 `active`（新进程 `/usr/libexec/kf6/polkit-kde-authentication-agent-1` 已接管），`opd2413-face.service` 为 `active`，`SELinux Enforcing` 零新增 AVC；用户目视验收锁屏与授权弹窗黑白微笑脸图标均符合预期。
 
@@ -2545,7 +2545,7 @@ mpv、Firefox 仍是软解（Fedora `ffmpeg-free` 的专利限制），用户选
   - **预期与判据**：升级安装 `opd2413-camera-0.1-3.fc45.aarch64` 后，`opd-camera` 可在前/后摄正常预览、拍照与录像，前摄开启 `Selfie Mirror` 时录像回放与预览、拍照水平朝向一致且音画同步。
   - **实测结果**：
     1. 前摄 `sc820cs`（`1632x1224`，`mirror_front=True`）实机录像冒烟 `1.48 s`：产出 35 帧 H.264（`start=0.000000`, `dur=1.480000`）+ 69 帧 AAC（`start=0.000000`, `dur=1.477166`），缩略图生成正常，零报错（临时文件已清理）。
-    2. 经用户确认后执行 `pkexec dnf -y upgrade` 装入 `opd2413-camera-0.1-3.fc45.aarch64`，`/usr/libexec/opd2413/video_recorder.py` 等 7 个文件校验齐全。待用户在桌面打开 `OPD2413 HDR+ Camera` 实拍录像确认画面与声音。
+    2. 经用户确认后执行 `dnf -y upgrade` 装入 `opd2413-camera-0.1-3.fc45.aarch64`，`/usr/libexec/opd2413/video_recorder.py` 等 7 个文件校验齐全。待用户在桌面打开 `OPD2413 HDR+ Camera` 实拍录像确认画面与声音。
 
 
 
@@ -2642,7 +2642,7 @@ mpv、Firefox 仍是软解（Fedora `ffmpeg-free` 的专利限制），用户选
   - 修正 [2443-drm-msm-dsi-Resynchronize-SM8750-PHYs-after-link-clo.patch](../kernel/opd2413-7.2/patches/2443-drm-msm-dsi-Resynchronize-SM8750-PHYs-after-link-clo.patch)（扩展上下文包含 `.restore_slave_pll = true,` 至 `.quirks = DSI_PHY_7NM_QUIRK_V7_2,`，确保仅匹配 `dsi_phy_3nm_8750_cfgs`）及 `dsi_phy_7nm.c`，并在临时目录通过 `2445 -> 2440` 逆序卸载与 `2440 -> 2445` 正序 `-F0` 重打严格闭环校验。
   - 编包产出 `out/rpmbuild/RPMS/aarch64/kernel-opd2413-7.2.15-37.opd2413.aarch64.rpm`（SHA-256 `b66c91517262628e8b6e0f5cd192c5e80cfec0067aafb16b82a16e8c224526d9`）：`dsi_phy_7nm.o` 经 `KCFLAGS="-Werror"` 零警告编译，`readelf -rW`/`-sW` 证实 `dsi_7nm_phy_toggle_resync_fifo`（`0x1d0`）与 `dsi_7nm_phy_reset_clk_en_sel`（`0x1d8`）重定位严格落入 `dsi_phy_3nm_8750_cfgs`（`[0x188, 0x210)`），`vmlinuz`/`oneplus-pogo-keyboard.ko` 均含 `.BTF` 与 `vermagic: 7.2.15-37.opd2413`，`sm8750-oneplus-pad2pro.dtb` 与 `-35` 逐字节一致。
 - **下一步写入范围与上机判据（待用户确认）**：
-  - 因当前 ESP `/dev/sda16` 剩余 `143M`（`< 200 MiB` 装机最低需求），申请经单次 `pkexec` 卸载最旧回退 `7.2.15-32.opd2413`（保留 `-35` 为 `default`、`7.2.15-36` 为二级回退），安装 `7.2.15-37.opd2413`，核验 `KSHIM.CHO` 不变且保持 `1 extent` 后设 `boot-select next fedora-7.2.15-37.opd2413.conf`；由用户手动重启进入 `-37` 复验 `dsi0/1_phy[0x14] == 0x20/0x24` 与 120/60 Hz `DPMS off -> on` / 休眠唤醒压测。
+  - 因当前 ESP `/dev/sda16` 剩余 `143M`（`< 200 MiB` 装机最低需求），申请 卸载最旧回退 `7.2.15-32.opd2413`（保留 `-35` 为 `default`、`7.2.15-36` 为二级回退），安装 `7.2.15-37.opd2413`，核验 `KSHIM.CHO` 不变且保持 `1 extent` 后设 `boot-select next fedora-7.2.15-37.opd2413.conf`；由用户手动重启进入 `-37` 复验 `dsi0/1_phy[0x14] == 0x20/0x24` 与 120/60 Hz `DPMS off -> on` / 休眠唤醒压测。
 
 ### `7.2.15-37` 单双屏对照与 `erhai` 共享视频 `CTL` 四补丁替换（`2446`–`2449`，`7.2.15-38.opd2413`，`离线通过`）
 
@@ -2684,7 +2684,7 @@ mpv、Firefox 仍是软解（Fedora `ffmpeg-free` 的专利限制），用户选
   1. **开机健康**：卸载 `-37` 并安装 `-39` 后经 `boot-select next` 一次性重启进入 `uname -r = 7.2.15-39.opd2413`：`systemctl is-system-running = running`、`0 failed`、SELinux `Enforcing`、`0 avc: denied`、`af54000.displayport-controller` 处于 `suspended`。
   2. **单屏自动化压测**：连续 **10/10 轮** `120 Hz` `DPMS off (3s) -> on (3s)` + **4/4 次**在线刷新率切换（`60 -> 30 -> 60 -> 120 Hz`）全部通过；每次灭屏 4 路电源轨（`vreg_l12b_1p8`/`lcd_vsp`/`lcd_vsn`/`vreg_l3i_0p88`）真断电为 `disabled`，亮屏 `14/14` 次 `nt36536` 固件重载正常，`MDSS GDSC`（`ae00000.display-subsystem`）与 `DPU` 同步挂起 `+25.2 s`，`anomalous_kernel_lines=0`。
   3. **用户手动长短熄屏实测（`11:18–11:27`）**：连续完成 **5 轮**真实熄屏/复亮（含最长近 **4 分钟** `11:20:00 -> 11:23:59` 与 **71 秒** `11:25:46 -> 11:26:57`），`#16`–`#20` 全部 `Update firmware success`（`217–223 ms`），`MDSS GDSC` 累计挂起约 `379 s`，内核零 DSI/DPU/VBIF/vblank 异常；用户目视确认无问题（当前 `suspend_stats=0`，`s2idle` 待按需补测）。
-  4. **清理与默认启动项切换（`11:35`）**：经用户确认单次 `pkexec` 卸载失败内核 `kernel-opd2413-7.2.15-38.opd2413`、执行 `/usr/libexec/opd2413/boot-select default fedora-7.2.15-39.opd2413.conf`（保留 `-35` 作回退）并清理本地临时目录 `out/m3k/build38`：`KSHIM.CHO` 前后 SHA-256 一致且保持 `1 extent found`，`loader_default = booted_entry = fedora-7.2.15-39.opd2413.conf`，`pending_next: null`，ESP `/boot/efi` 恢复至 `247M / 512M`（剩余 `266M`，49%），`/` 剩余 `181G`。**待办**：完成 1 次 `-39` 冷启动复查；待外接显示器可用时跑完双屏 9 轮长窗口 DPMS 压测再关闭 [TECH-DEBT.md](TECH-DEBT.md) `#47`。
+  4. **清理与默认启动项切换（`11:35`）**：经用户确认 卸载失败内核 `kernel-opd2413-7.2.15-38.opd2413`、执行 `/usr/libexec/opd2413/boot-select default fedora-7.2.15-39.opd2413.conf`（保留 `-35` 作回退）并清理本地临时目录 `out/m3k/build38`：`KSHIM.CHO` 前后 SHA-256 一致且保持 `1 extent found`，`loader_default = booted_entry = fedora-7.2.15-39.opd2413.conf`，`pending_next: null`，ESP `/boot/efi` 恢复至 `247M / 512M`（剩余 `266M`，49%），`/` 剩余 `181G`。**待办**：完成 1 次 `-39` 冷启动复查；待外接显示器可用时跑完双屏 9 轮长窗口 DPMS 压测再关闭 [TECH-DEBT.md](TECH-DEBT.md) `#47`。
 
 ### `7.2.15-39.opd2413` 外接显示器双屏 DPMS 专项验收（`TECH-DEBT #47`）
 
@@ -2695,7 +2695,7 @@ mpv、Firefox 仍是软解（Fedora `ffmpeg-free` 的专利限制），用户选
      - 每次 `DPMS off` 期间确认 `af54000.displayport-controller` 保持 `active` 且父域 `ae00000.display-subsystem`（`MDSS GDSC`）`susp_ms` 增量为 `0 ms`（真实命中扩展版 `2414` 保电分支），同时内置面板 4 路电源轨（`vreg_l12b_1p8`/`lcd_vsp`/`lcd_vsn`/`vreg_l3i_0p88`）正常断电；
      - 每次 `DPMS on` 后 `nt36536` 触控固件重载成功、内核零 DSI/DPU/VBIF/vblank/KTZ 报错；
      - 10/10 轮复亮后经用户目视确认双屏（尤其内置 `DSI-1`）均正常出图、零“有背光灰黑屏”；
-     - 第 10 轮结束后单次 `pkexec` 读取 `/sys/kernel/debug/dri/1/kms` 寄存器快照（归档于 `private/display-dpms-grey-20261122/dpu39_dual_after.txt`），确认 `dsi0/1_phy[0x10/0x14]`、`dsi0/1_ctrl[0xa0/0xb8/0xbc]` 保持黄金值，且 `sspp_8[0xd0/0xd4/0xe0/0xf8]` 与 `vbif` 处于正常取帧活跃态（非 `00000c80` / `00000008` / `00000000` 卡死态）。
+     - 第 10 轮结束后 读取 `/sys/kernel/debug/dri/1/kms` 寄存器快照（归档于 `private/display-dpms-grey-20261122/dpu39_dual_after.txt`），确认 `dsi0/1_phy[0x10/0x14]`、`dsi0/1_ctrl[0xa0/0xb8/0xbc]` 保持黄金值，且 `sspp_8[0xd0/0xd4/0xe0/0xf8]` 与 `vbif` 处于正常取帧活跃态（非 `00000c80` / `00000008` / `00000000` 卡死态）。
 - **实机双屏测试结果（`2026-11-23 19:38–19:45`，`真机失败`，证据：`private/display-dpms-grey-20261122/dual39_dpms_test.log`、`dual39_kmsg.log`）**：
   1. **阶段 1 双屏在线刷新率切换（`120 -> 60 -> 30 -> 60 Hz`，`通过`）**：在 `DP-1` `3840x2160@60 Hz` 持续输出下，内置 `DSI-1` 连续 3 次在线切刷新率全部正常生效（`nt36536` 固件重载 `#12`–`#14` 成功、耗时 `213–230 ms`，内核零报错，用户目视确认最开始内置屏正常切换恢复）。
   2. **阶段 2 起双屏 `DPMS off (4s) -> on (8s)`（`真机失败`，第 1 轮即彻底失效，脚本因 `kscreen-doctor` 持续阻塞超时以 `124` 退出）**：
@@ -2716,13 +2716,13 @@ mpv、Firefox 仍是软解（Fedora `ffmpeg-free` 的专利限制），用户选
   - 新增补丁 [2446-drm-msm-dpu-reset-CTL-before-staging-newly-enabled-C.patch](../kernel/opd2413-7.2/patches/2446-drm-msm-dpu-reset-CTL-before-staging-newly-enabled-C.patch)（已登记至 [series](../kernel/opd2413-7.2/patches/series)、[PATCHES.md](../kernel/PATCHES.md) 与 [kernel/opd2413-7.2/README.md](../kernel/opd2413-7.2/README.md)）：在 `dpu_crtc_atomic_begin()` 中，当检测到 `old_crtc_state && !old_crtc_state->active && crtc->state->active`（CRTC 由灭到亮 `0 -> 1`）时，在 `_dpu_crtc_blend_setup` / `_dpu_crtc_setup_cp_blocks` / `commit_planes` 之前对所分配的每个 `hw_ctl` 无条件执行一次 `ctl->ops.reset(ctl)` 与 `clear_pending_flush(ctl)`（按 `ctl->idx` 去重）。
   - 离线校验：`2414`（保留 `dpu_encoder_panel_dithers_8bpc` 共 2 处引用）与 `2446` 均通过严格 `--fuzz=0` 正反向回环校验；`dpu_encoder.o` 与 `dpu_crtc.o` 在 `KCFLAGS="-Werror"` 下零警告编译通过；`sm8750-oneplus-pad2pro.dtb` 与 `-39` 逐字节一致；`vmlinux` 与 `oneplus-pogo-keyboard.ko` 含 `.BTF`、`vermagic: 7.2.15-40.opd2413 SMP preempt mod_unload aarch64`；产物 `out/rpmbuild/RPMS/aarch64/kernel-opd2413-7.2.15-40.opd2413.aarch64.rpm`（SHA-256 `b307201c429dde7e72ca5201993f5b992fe04760789823f447ca99ce5dd673e0`）；已清理 `build39`/`stage39`，ESP 剩余 `266M`（49%）、`/` 剩余 `180G`。
 - **上机预期与判据（`7.2.15-40.opd2413`，待用户确认安装与重启测试）**：
-  1. 保留 `7.2.15-39` 为当前 `default`（`7.2.15-35` 为二级回退），单次 `pkexec` 安装 `kernel-opd2413-7.2.15-40.opd2413.aarch64.rpm`、设 `boot-select next fedora-7.2.15-40.opd2413.conf` 并核验 `KSHIM.CHO` 一致且保持 `1 extent`，重启进入 `uname -r = 7.2.15-40.opd2413`（`running`、`0 failed`、SELinux `Enforcing`、0 AVC）；
+  1. 保留 `7.2.15-39` 为当前 `default`（`7.2.15-35` 为二级回退），安装 `kernel-opd2413-7.2.15-40.opd2413.aarch64.rpm`、设 `boot-select next fedora-7.2.15-40.opd2413.conf` 并核验 `KSHIM.CHO` 一致且保持 `1 extent`，重启进入 `uname -r = 7.2.15-40.opd2413`（`running`、`0 failed`、SELinux `Enforcing`、0 AVC）；
   2. **双屏（`DP-1` 4K@60 Hz + `DSI-1` 120/60 Hz）完整压测**：
      - 双屏在线刷新率切换 `120 -> 60 -> 30 -> 60 -> 120 Hz` 全正常；
      - 连续 **9 轮**长窗口 `DPMS off (4s) -> on (8s)`（`60 Hz` 3 轮 + `120 Hz` 6 轮）+ **1 轮** `120 Hz` `15 s` 长熄屏复亮：**10/10 轮**期间 `af54000.displayport-controller` 保持 `active`（`MDSS GDSC` `susp_ms` 增量 `0 ms`）、面板 4 路电源轨真实断电，每次唤醒均无 `dsi1 cmd dma timeout`、无 `vblank timeout`、无 `LUTDMA` 错误、无内置屏灰黑屏、无 `DP-1` 蓝屏，用户目视确认双屏 10/10 轮均正常出图；
      - 第 10 轮结束后抓取 `/sys/kernel/debug/dri/1/kms`，验证 `dsi0/1_phy[0x10/0x14]` 与 `sspp_8`/`vbif` 均处于健康取帧活跃态；
   3. **单屏回归验收**：拔掉外接显示器后跑 **10 轮**单屏 `DPMS off (3s) -> on (3s)` + `120/60/30 Hz` 切换 + `s2idle` 休眠唤醒，确认 `MDSS GDSC` 正常掉电与全项无回归；随后经用户确认设 `-40` 为默认（卸载失败项 `-39`）并做 1 次冷启动复核后正式关闭 `#47`。
-- **装机与一次性启动设置（`2026-11-23 20:34`）**：经用户确认单次 `pkexec` 安装 `kernel-opd2413-7.2.15-40.opd2413.aarch64.rpm`（保留 `-39` 与 `-35`）、设置 `boot-select next fedora-7.2.15-40.opd2413.conf`（`pending_next` 指向 `-40`，`previous_default` 保持 `-39`），`KSHIM.CHO` 前后 SHA-256 一致且保持 `1 extent found`，ESP `/boot/efi` 已用 `370M / 512M`（剩余 `143M`）；待用户重启进入 `7.2.15-40.opd2413` 后执行双屏与单屏验收。
+- **装机与一次性启动设置（`2026-11-23 20:34`）**：经用户确认安装 `kernel-opd2413-7.2.15-40.opd2413.aarch64.rpm`（保留 `-39` 与 `-35`）、设置 `boot-select next fedora-7.2.15-40.opd2413.conf`（`pending_next` 指向 `-40`，`previous_default` 保持 `-39`），`KSHIM.CHO` 前后 SHA-256 一致且保持 `1 extent found`，ESP `/boot/efi` 已用 `370M / 512M`（剩余 `143M`）；待用户重启进入 `7.2.15-40.opd2413` 后执行双屏与单屏验收。
 
 ### `7.2.15-40.opd2413` 双屏实机结果（`真机失败`）与黑屏/彩条根因闭环，及 `7.2.15-41.opd2413` 构建校验（`离线通过`）
 
@@ -2736,10 +2736,10 @@ mpv、Firefox 仍是软解（Fedora `ffmpeg-free` 的专利限制），用户选
     - 在 `dpu_encoder.c` 的 `dpu_encoder_virt_atomic_enable()` 中（`trace_dpu_enc_enable` 之后、`cur_slave`/`cur_master->ops.enable` 配置 `INTF/DSC` 之前），仅针对 `intf_type == INTF_DSI && !is_cmd_mode` 且 `!old_crtc_state || !old_crtc_state->active` 场景（此时 `dsi_mgr_bridge_pre_enable()` 已启动 `pclk0`/`pclk1`），按 `ctl->idx` 去重调用 `ctl->ops.reset(ctl)` 并在复位发生后调用 `dpu_crtc_reprogram_blend(dpu_enc->base.crtc)`；`INTF_DP` 完全不受影响。
   - **离线校验（`离线通过`）**：`2446` 正反向 `patch --fuzz=0` 均通过，`dpu_encoder_panel_dithers_8bpc` 在 `dpu_encoder.c` 维持 `2` 处；`dpu_encoder.o` 与 `dpu_crtc.o` 在 `KCFLAGS="-Werror"` 下零警告编译通过；`sm8750-oneplus-pad2pro.dtb` 与 `-39` 逐字节一致（SHA-256 `238ba743288722af635177209e6568636185ceff33694e582b8956cd45e62280`）；`nm -n vmlinux` 确认含 `dpu_crtc_reprogram_blend`；`vmlinux` 与 `oneplus-pogo-keyboard.ko` 均含 `.BTF`，`vermagic: 7.2.15-41.opd2413 SMP preempt mod_unload aarch64`；产物 RPM `kernel-opd2413-7.2.15-41.opd2413.aarch64.rpm`（SHA-256 `5738e79a4a5ca81e705b51219d3d6617442771a90721b86895a1e6c0ea839b2a`）；已清理 `stage40` 与 `stage41`。
 - **上机预期与判据（`7.2.15-41.opd2413`，待用户确认装机与重启验收）**：
-  1. 因 ESP `/dev/sda16` 仅剩 `143M`（直接保留 4 个内核空间不足），待用户确认后单次 `pkexec` 先设 `boot-select default fedora-7.2.15-35.opd2413.conf` 并卸载已证实双屏失败的 `-39`（保留稳定回退 `-35` 与当前运行的 `-40`），再安装 `kernel-opd2413-7.2.15-41.opd2413.aarch64.rpm`、设 `boot-select next fedora-7.2.15-41.opd2413.conf` 并核验 `KSHIM.CHO` 一致且保持 `1 extent`；
+  1. 因 ESP `/dev/sda16` 仅剩 `143M`（直接保留 4 个内核空间不足），待用户确认后 先设 `boot-select default fedora-7.2.15-35.opd2413.conf` 并卸载已证实双屏失败的 `-39`（保留稳定回退 `-35` 与当前运行的 `-40`），再安装 `kernel-opd2413-7.2.15-41.opd2413.aarch64.rpm`、设 `boot-select next fedora-7.2.15-41.opd2413.conf` 并核验 `KSHIM.CHO` 一致且保持 `1 extent`；
   2. 重启进入 `7.2.15-41.opd2413`（连接外接 DP 显示器）后运行双屏压测：在线刷新率切换 `120 -> 60 -> 30 -> 60 Hz` 与 **10/10 轮** `DPMS off -> on`（终轮 `120 Hz` 15 s 熄屏 -> 8 s 亮屏）零内核报错（无 `dsi1 cmd dma timeout`、`vblank timeout`、`LUTDMA`、`VBIF`、AVC）、4 路面板电源轨熄灭断电且每次唤醒 `nt36536` 成功重加载、用户目视确认 **`DSI-1` 与 `DP-1` 均正常呈现桌面（无黑屏/无彩条）**，且轮后 `/sys/kernel/debug/dri/1/kms` 满足 `sspp_8[0xd0] != 0x00000c80`、`vbif[0x204]` `BIT(17)==0`、`vbif[0x20c]==0`、`ctl_0[0x804]` 低半字节 `0x7`、`dsi0/1_phy` 原厂黄金值及 `TIMEOUT_STATUS == 0`；
   3. 拔掉外接显示器完成单屏 10 轮 `DPMS off -> on` + 刷新率切换 + `s2idle` 回归验收无误后，再询问用户确认是否设为默认并执行 1 次冷启动复核。
-- **装机与一次性启动设置（`2026-11-23 21:54`）**：经用户确认单次 `pkexec` 先将 `boot-select default` 设为 `fedora-7.2.15-35.opd2413.conf` 并卸载 `kernel-opd2413-7.2.15-39.opd2413`，核验 RPM SHA-256（`5738e79a4a5ca81e705b51219d3d6617442771a90721b86895a1e6c0ea839b2a`）后安装 `kernel-opd2413-7.2.15-41.opd2413.aarch64.rpm`（当前已装 `-35`/`-40`/`-41`），核对 `-41` BLS 条目 `options` 与 `-40` 一致（含 `mem_sleep_default=s2idle`，无 `fw_devlink.sync_state=timeout`/`pcie_ports=compat`），并设置 `boot-select next fedora-7.2.15-41.opd2413.conf`（`previous_default: "fedora-7.2.15-35.opd2413.conf"`）；`KSHIM.CHO` 写前后 SHA-256 一致且保持 `1 extent found`，ESP `/boot/efi` 已用 `370M / 512M`（空闲 `143M`，`73%`），电池电量 `54%`；待用户保持外接显示器重启进入 `7.2.15-41.opd2413` 后执行双屏与单屏验收。
+- **装机与一次性启动设置（`2026-11-23 21:54`）**：经用户确认 先将 `boot-select default` 设为 `fedora-7.2.15-35.opd2413.conf` 并卸载 `kernel-opd2413-7.2.15-39.opd2413`，核验 RPM SHA-256（`5738e79a4a5ca81e705b51219d3d6617442771a90721b86895a1e6c0ea839b2a`）后安装 `kernel-opd2413-7.2.15-41.opd2413.aarch64.rpm`（当前已装 `-35`/`-40`/`-41`），核对 `-41` BLS 条目 `options` 与 `-40` 一致（含 `mem_sleep_default=s2idle`，无 `fw_devlink.sync_state=timeout`/`pcie_ports=compat`），并设置 `boot-select next fedora-7.2.15-41.opd2413.conf`（`previous_default: "fedora-7.2.15-35.opd2413.conf"`）；`KSHIM.CHO` 写前后 SHA-256 一致且保持 `1 extent found`，ESP `/boot/efi` 已用 `370M / 512M`（空闲 `143M`，`73%`），电池电量 `54%`；待用户保持外接显示器重启进入 `7.2.15-41.opd2413` 后执行双屏与单屏验收。
 - **`7.2.15-41.opd2413` 上线与双屏 DPMS + `kms` 硬件复核（`2026-11-23 21:57–22:05`，`真机启动`，待用户目视确认与单屏回归）**：
   1. **启动与回退状态**：平板成功重启至 `uname -r = 7.2.15-41.opd2413`（`running`、`0 failed`、SELinux `Enforcing`，电量 `53%`），`boot-select status` 确认 `booted_entry = fedora-7.2.15-41.opd2413.conf`、`loader_default = fedora-7.2.15-35.opd2413.conf`、`pending_next = null`。
   2. **双屏压测结果**（`dual41_dpms_test.log`、`dual41_kmsg.log`）：`DP-1` `2560x1440@144 Hz` + `DSI-1` `3392x2400` 完成阶段 1 `120 -> 60 -> 30 -> 60 Hz` 在线切换、阶段 2 `60 Hz` ×3 轮 `DPMS off (4s) -> on (8s)`、阶段 3 切回 `120 Hz`、阶段 4 `120 Hz` ×6 轮 `DPMS off -> on` 及阶段 5 `120 Hz` 扩展长熄屏 `15s off -> 8s on`（`Rounds completed: 10/10 (aborted=False)`）；全程 `all_dp_active_during_off = True`、`all_mdss_gdsc_stayed_on = True`（`mdss=+0ms dpu=+46082ms dp=+0ms`）、4 路面板供电轨熄屏均 `disabled(u=0)` 且唤醒 `enabled`、`nt36536` 成功重载 14 次、`Anomalous kernel lines: 0`。
@@ -2763,7 +2763,7 @@ mpv、Firefox 仍是软解（Fedora `ffmpeg-free` 的专利限制），用户选
   1. [2447-drm-msm-dpu-calculate-plane-perf-in-atomic_check-on-.patch](../kernel/opd2413-7.2/patches/2447-drm-msm-dpu-calculate-plane-perf-in-atomic_check-on-.patch)：在 `dpu_plane_atomic_check_sspp()` 与纯 modeset 下预先计算 `pstate->plane_fetch_bw` / `pstate->plane_clk`，并将 `dpu_core_perf.c` 的 `_dpu_core_perf_calc_{bw,clk}()` 与 `dpu_core_perf_aggregate()` 切换至待提交的新 CRTC/plane 状态，保证 `0 -> 1` 首帧即下发真实 DDR 带宽投票；
   2. [2448](../kernel/opd2413-7.2/patches/2448-drm-msm-dp-retry-reading-the-sink-capabilities-after-an-AUX-failure.patch)–[2459](../kernel/opd2413-7.2/patches/2459-phy-qcom-qmp-combo-Drop-the-stale-err_disable_pipe_clk-teardown.patch)：合入 `erhai/v0.7` 经审定的 12 项 Type-C DP / QMP Combo PHY / `pmic_glink_altmode` 修复（含 `dp` 按插入态单次持有 runtime PM 引用、HPD 锁序列化、AUX 重试、PHY/link 错误回滚、`qmp-combo` `qmpphy_mode_committed` 跟踪与 `pmic_glink_altmode` `BIT(mode)` 位图编码）。
 - **上机预期与判据（`7.2.15-42.opd2413`，待离线构建与用户确认装机后上机实测）**：
-  1. 保留 `7.2.15-35` 为 `default`、`7.2.15-41` 为备用回退，卸载已失败 `-40` 后单次 `pkexec` 安装 `-42` 并 `boot-select next fedora-7.2.15-42.opd2413.conf`（`KSHIM.CHO` SHA-256 与 `1 extent` 不变），重启进入 `uname -r = 7.2.15-42.opd2413`（`running`、`0 failed`、SELinux `Enforcing`、0 AVC）；
+  1. 保留 `7.2.15-35` 为 `default`、`7.2.15-41` 为备用回退，卸载已失败 `-40` 后 安装 `-42` 并 `boot-select next fedora-7.2.15-42.opd2413.conf`（`KSHIM.CHO` SHA-256 与 `1 extent` 不变），重启进入 `uname -r = 7.2.15-42.opd2413`（`running`、`0 failed`、SELinux `Enforcing`、0 AVC）；
   2. **双屏完整压测（`DSI-1` + `DP-1`，含在线切换与多轮 `15s–20s` 超待机长熄屏）**：
      - 双屏在线刷新率切换 `120 -> 60 -> 30 -> 60 -> 120 Hz` 正常；
      - 短窗口（`4s off -> 8s on`）与长窗口（外接显示器进入无信号待机 `>=15s–20s off -> 8s on` 多轮）均由用户**目视确认双屏（`DSI-1` 与 `DP-1`）同时正常出图，无需改主屏设置**；
@@ -2772,7 +2772,7 @@ mpv、Firefox 仍是软解（Fedora `ffmpeg-free` 的专利限制），用户选
 - **离线校验（`2026-11-24`，`离线通过`）**：
   - `2447`–`2459` 严格 `patch -p1 -F0` 正向与反向回环全通过，`dp_display.c`、`dp_ctrl.c`、`dp_panel.c`、`phy-qcom-qmp-combo.c` 与 `erhai/v0.7` 逐字节一致，`pmic_glink_altmode.c` 保留 SM8750 `-EPROBE_DEFER`。
   - 全部 9 个改动 `.o` 文件在 `KCFLAGS="-Werror"` 下零警告通过；`sm8750-oneplus-pad2pro.dtb` SHA-256 与 `-41` 一致（`238ba743288722af635177209e6568636185ceff33694e582b8956cd45e62280`）；`vmlinux` 与 `.ko` 含 `.BTF`、`vermagic: 7.2.15-42.opd2413 SMP preempt mod_unload aarch64`、`nm -n vmlinux` 含新增/改动符号；产物 `out/rpmbuild/RPMS/aarch64/kernel-opd2413-7.2.15-42.opd2413.aarch64.rpm`（SHA-256 `bb6d102c4547f73b77a96958a05b857019a07676cfb7d08fbd2d97d9f071e88b`），已清理 `out/m3k/build40` 与 `out/m3k/stage42`。
-- **装机与一次性启动设置（`2026-11-24 07:00`）**：经用户确认先后通过 `pkexec` 卸载废弃内核 `kernel-opd2413-7.2.15-40.opd2413`、保持 `boot-select default fedora-7.2.15-35.opd2413.conf`（保留 `-35` 与 `-41` 作双回退）、以 `rpm -ivh --nosignature` 安装 `kernel-opd2413-7.2.15-42.opd2413.aarch64.rpm`（`linux` `62M`、`initrd` `62M`、`sm8750-oneplus-pad2pro.dtb` `145K` 就绪，BLS `options` 与 `-41` 零差异并含 `mem_sleep_default=s2idle`），并设置 `boot-select next fedora-7.2.15-42.opd2413.conf`（`pending_next.next: fedora-7.2.15-42.opd2413.conf`、`previous_default: fedora-7.2.15-35.opd2413.conf`）；`KSHIM.CHO` 写前后 SHA-256 一致且保持 `1 extent found`，ESP `/boot/efi` 已用 `370M / 512M`（剩余 `143M`，`73%`），电池电量 `93%`（Charging）。待用户保持外接显示器重启进入 `7.2.15-42.opd2413` 后执行双屏与单屏验收。
+- **装机与一次性启动设置（`2026-11-24 07:00`）**：经用户确认先后 卸载废弃内核 `kernel-opd2413-7.2.15-40.opd2413`、保持 `boot-select default fedora-7.2.15-35.opd2413.conf`（保留 `-35` 与 `-41` 作双回退）、以 `rpm -ivh --nosignature` 安装 `kernel-opd2413-7.2.15-42.opd2413.aarch64.rpm`（`linux` `62M`、`initrd` `62M`、`sm8750-oneplus-pad2pro.dtb` `145K` 就绪，BLS `options` 与 `-41` 零差异并含 `mem_sleep_default=s2idle`），并设置 `boot-select next fedora-7.2.15-42.opd2413.conf`（`pending_next.next: fedora-7.2.15-42.opd2413.conf`、`previous_default: fedora-7.2.15-35.opd2413.conf`）；`KSHIM.CHO` 写前后 SHA-256 一致且保持 `1 extent found`，ESP `/boot/efi` 已用 `370M / 512M`（剩余 `143M`，`73%`），电池电量 `93%`（Charging）。待用户保持外接显示器重启进入 `7.2.15-42.opd2413` 后执行双屏与单屏验收。
 - **`7.2.15-42.opd2413` 上机启动与双屏压测结果（`2026-11-24 07:11–07:18`，`真机启动`，待用户目视确认与单屏回归）**：
   1. **启动与回退态**：`uname -r = 7.2.15-42.opd2413`、`systemctl is-system-running = running`、`0 failed`、SELinux `Enforcing`、`0 avc: denied`，电量 `92% (Charging)`；`af54000.displayport-controller` 开机阶段即有 `susp_ms=3755`（验证 `2456` 消除 `pm_runtime` 泄漏）。
   2. **双屏压测（`dual42_dpms_test.log`、`dual42_kmsg.log`）**：`DP-1` `2560x1440@144` + `DSI-1` `3392x2400` 完成阶段 1 `120 -> 60 -> 30 -> 60 Hz` 与阶段 3 `60 -> 120 Hz` 在线切换，以及 **9/9 轮** `DPMS off -> on`（60 Hz：4s ×2 + **16s ×1**；120 Hz：4s ×3 + **16s ×1** + **18s ×2**）：
@@ -2794,7 +2794,7 @@ mpv、Firefox 仍是软解（Fedora `ffmpeg-free` 的专利限制），用户选
 
 - **改动与设计依据**：在已证实 `4s` 短熄屏 **9/9 通过** 的 `-41`（`2440`–`2446`）之上，**仅保留 `2447`**（解决长熄屏后重新挂载平面时首帧 `new_bw=0` 导致的欠载），完整回退引起 `4s` 短熄屏 `DSI-1` 黑屏及 `88e8000.phy` `s2idle` 超时的 `2448`–`2459` 共 12 个 `erhai/v0.7` DP/QMP/`pmic_glink` 补丁。
 - **上机预期与判据（`7.2.15-43.opd2413`，待构建校验与用户确认装机后实测）**：
-  1. 保留 `7.2.15-35` 为 `default`、`7.2.15-41` 为备用回退，卸载 `-42` 并单次 `pkexec` 安装 `-43`，设 `boot-select next fedora-7.2.15-43.opd2413.conf`（`KSHIM.CHO` SHA-256 与 `1 extent` 不变），重启进入 `uname -r = 7.2.15-43.opd2413`（`running`、`0 failed`、SELinux `Enforcing`、0 AVC）；
+  1. 保留 `7.2.15-35` 为 `default`、`7.2.15-41` 为备用回退，卸载 `-42` 并 安装 `-43`，设 `boot-select next fedora-7.2.15-43.opd2413.conf`（`KSHIM.CHO` SHA-256 与 `1 extent` 不变），重启进入 `uname -r = 7.2.15-43.opd2413`（`running`、`0 failed`、SELinux `Enforcing`、0 AVC）；
   2. **双屏混合压测（`DSI-1` + `DP-1`）**：
      - 双屏在线刷新率切换 `120 -> 60 -> 30 -> 60 -> 120 Hz` 全部正常；
      - 短熄屏（`4s off -> 8s on`）**与**超待机长熄屏（`16s–18s off -> 8s on`）各多轮，用户**目视确认双屏（`DSI-1` 与 `DP-1`）在短熄屏、长熄屏与混合顺序下均自动恢复正常画面，无需改主屏设置**；
@@ -2803,7 +2803,7 @@ mpv、Firefox 仍是软解（Fedora `ffmpeg-free` 的专利限制），用户选
 - **离线校验（`2026-11-24 10:19`，`离线通过`）**：
   - `2459`–`2448` 在源码树逆序 `patch -p1 -R -F0` 干净回退，反向 `--dry-run -F0` 验证 `2447`、`2446`、`2430` 完整保留且零 `.rej`/`.orig`；`series`、`PATCHES.md` 同步清理。
   - `dpu_encoder.o`/`dpu_crtc.o`/`dpu_plane.o`/`dpu_core_perf.o` 通过 `KCFLAGS="-Werror"`；`vmlinux` 含 `.BTF`/`.BTF_ids` 及 `dpu_crtc_reprogram_blend`/`dpu_plane_calc_perf`/`dpu_core_perf_crtc_check`；`oneplus-pogo-keyboard.ko` 为 `vermagic: 7.2.15-43.opd2413 SMP preempt mod_unload aarch64`；`sm8750-oneplus-pad2pro.dtb` SHA-256 为 `238ba743288722af635177209e6568636185ceff33694e582b8956cd45e62280`；产物 `out/rpmbuild/RPMS/aarch64/kernel-opd2413-7.2.15-43.opd2413.aarch64.rpm`（SHA-256 `827bb16a2e65ca1ef329cf54e92141b7cddc9a942416d963b805f8874d8557d3`），已清理 `out/m3k/stage43` 与 `out/m3k/build42`。
-- **装机与一次性启动设置（`2026-11-24 20:13`）**：经用户确认单次 `pkexec` 保持 `boot-select default fedora-7.2.15-35.opd2413.conf`（保留 `-35` 与 `-41` 作双回退）、卸载已失败的 `kernel-opd2413-7.2.15-42.opd2413` 并安装 `kernel-opd2413-7.2.15-43.opd2413.aarch64.rpm`（`linux` `62M`、`initrd` `62M`、`sm8750-oneplus-pad2pro.dtb` `145K` 就绪，BLS `options` 与 `-41` 零差异并含 `mem_sleep_default=s2idle`），设置 `boot-select next fedora-7.2.15-43.opd2413.conf`（`previous_default: fedora-7.2.15-35.opd2413.conf`、`next: fedora-7.2.15-43.opd2413.conf`）；`KSHIM.CHO` 写前后 SHA-256 一致且保持 `1 extent found`，ESP `/boot/efi` 已用 `370M / 512M`（剩余 `143M`，`73%`），电池电量 `40%`（Charging），`card1-DP-1` 与 `card1-DSI-1` 均处于 `connected`。待用户重启进入 `7.2.15-43.opd2413` 后执行双屏短/长混合与单屏 `s2idle` 验收。
+- **装机与一次性启动设置（`2026-11-24 20:13`）**：经用户确认 保持 `boot-select default fedora-7.2.15-35.opd2413.conf`（保留 `-35` 与 `-41` 作双回退）、卸载已失败的 `kernel-opd2413-7.2.15-42.opd2413` 并安装 `kernel-opd2413-7.2.15-43.opd2413.aarch64.rpm`（`linux` `62M`、`initrd` `62M`、`sm8750-oneplus-pad2pro.dtb` `145K` 就绪，BLS `options` 与 `-41` 零差异并含 `mem_sleep_default=s2idle`），设置 `boot-select next fedora-7.2.15-43.opd2413.conf`（`previous_default: fedora-7.2.15-35.opd2413.conf`、`next: fedora-7.2.15-43.opd2413.conf`）；`KSHIM.CHO` 写前后 SHA-256 一致且保持 `1 extent found`，ESP `/boot/efi` 已用 `370M / 512M`（剩余 `143M`，`73%`），电池电量 `40%`（Charging），`card1-DP-1` 与 `card1-DSI-1` 均处于 `connected`。待用户重启进入 `7.2.15-43.opd2413` 后执行双屏短/长混合与单屏 `s2idle` 验收。
 - **`7.2.15-43.opd2413` 实机双屏测试与寄存器定位（`2026-11-24 20:24–22:25`，`真机失败`，证据：`private/display-dpms-grey-20261122/dual43_dpms_test.log`、`dual43_kmsg.log`、`dpu43_dual_after.txt`、`dpu43_dual_state.txt`）**：
   1. **实测现象与结果**：`Rounds completed: 10/10`、`Anomalous kernel lines: 0`、`0 devcoredump`、`nt36536 Update firmware success count: 14`，`2447` 已彻底消除 `-41`/`-42` 的 FIFO 欠载（`intf_1/2[0x1c4] == 0`、`top[0x00c/0x014] == 0`、`dce_0_0/0_1_enc[0x004] == 0x3`）。Rounds 1–2（`60 Hz`，`4s`）双屏均恢复；Round 3（`60 Hz`，`16s` 长熄屏，外接屏 `+5.2s` 待机 HPD 脉冲）后内置 `DSI-1` 停留在有背光黑屏，仅在阶段 3（`60 -> 120 Hz` 在线切换）恢复约 `2s`，随后的 `120 Hz` Rounds 4–10 最终以 `DSI-1` 有背光黑屏结束（测试后切回 `60 -> 120 Hz` 立即恢复）。
   2. **全块对比锁定根因**：`dpu43_dual_after.txt` 显示 `CTL_0` 除 `0x094` / `0x180..0x18c`（均标出 `SSPP_DMA0`）外配置与 `dpu_120_good.txt` 一致，`INTF_1/2` 正常以 `120 Hz` 扫描黑边，而 `sspp_8`（`SSPP_DMA0`）卡死在单次预取后停摆（`0x0d0=0x0c80, 0x0e0=0x8, 0x0f4=0x10030, 0x0f8=0x0`、`vbif[0x204]=0xffdf0000` `BIT(17)=1`、`vbif[0x20c]=0x30`）。
@@ -2817,7 +2817,7 @@ mpv、Firefox 仍是软解（Fedora `ffmpeg-free` 的专利限制），用户选
      - 在 `dpu_encoder_virt_atomic_enable()` 保持针对非命令型 `INTF_DSI` 且 `!old_crtc_state || !old_crtc_state->active` 的去重 `ctl->ops.reset(ctl)` 并调用 `ctl->ops.clear_pending_flush(ctl)`（此时 `pclk0/1` 已开且在 `commit_planes()` 之前），移除 `dpu_crtc.c`/`dpu_crtc.h` 中不再需要的半吊子 `dpu_crtc_reprogram_blend()`；
      - **离线判据**：`2446` 与 `2447` 正反向 `patch -p1 -F0` 回环通过、`KCFLAGS="-Werror"` 编译 `msm_atomic.o`/`dpu_encoder.o`/`dpu_crtc.o` 零警告、`vmlinux` 与 `.ko` 含 `.BTF` 与 `vermagic: 7.2.15-44.opd2413 SMP preempt mod_unload aarch64`、`sm8750-oneplus-pad2pro.dtb` SHA-256 与 `-35` 逐字节一致。
   2. **装机与双屏上机验收判据**：
-     - 保留 `7.2.15-35` 为 `default`、`7.2.15-43` 为备用回退，卸载旧 `-41` 腾出 ESP 空间（`>200 MiB` 可用），单次 `pkexec` 安装 `-44` 并核验 `KSHIM.CHO` SHA-256 与 `1 extent` 不变，设 `boot-select next fedora-7.2.15-44.opd2413.conf` 重启；
+     - 保留 `7.2.15-35` 为 `default`、`7.2.15-43` 为备用回退，卸载旧 `-41` 腾出 ESP 空间（`>200 MiB` 可用），安装 `-44` 并核验 `KSHIM.CHO` SHA-256 与 `1 extent` 不变，设 `boot-select next fedora-7.2.15-44.opd2413.conf` 重启；
      - 双屏（`DSI-1` + `DP-1`）运行 `dual_dpms_test.py`：10/10 轮混合 `4s` 短熄屏、`16s–18s` 长熄屏、长熄屏后 `4s` 短熄屏及在线 `120/60/30 Hz` 切换均由用户**目视确认双屏同时正常恢复桌面**；`0` 内核异常、`0` AVC；`dpu44_dual_after.txt` 满足 `sspp_8[0x0d0] != 0x0c80`、`[0x0f8] != 0`、`intf_1/2[0x1c4] == 0`、`vbif[0x204]` `BIT(17) == 0`、`dsi0/1_phy[0x10]=0x61`、`[0x14]=0x20/0x24`、`dsi0/1_ctrl[0xbc]=0`；
      - 拔掉外接屏跑通单屏 10 轮 DPMS + 刷新率切换 + `s2idle` 后再切默认并冷启动复查关闭 `#47`。
 - **离线校验（`2026-11-24 22:38`，`离线通过`）**：
@@ -2829,7 +2829,7 @@ mpv、Firefox 仍是软解（Fedora `ffmpeg-free` 的专利限制），用户选
 - **`7.2.15-44.opd2413` 启动实测与全面回退至 `7.2.15-35.opd2413`（`2026-11-24 22:50–22:58`，`真机失败`，证据：`private/display-dpms-grey-20261122/boot44_fail_kmsg.log`）**：
   - **现象与结论**：用户重启进入 `7.2.15-44.opd2413`（`boot -1`）后当场出现**内置屏花屏、外接 `DP-1` 蓝屏**（`msm_atomic_commit_tail()` 提前执行 `drm_atomic_helper_commit_modeset_enables()` 致使 DSI/DP 时序引擎早于 `commit_planes()`/`_dpu_crtc_blend_setup()`/`CTL_FLUSH` 启动扫描）。用户随后通过 `Fedora boot menu` 启动 `-43` 并要求卸载实验内核、回退并搁置 `TECH-DEBT #47`。
   - **归档与代码树回退**：将 `boot -1` 内核日志保存至 `private/display-dpms-grey-20261122/boot44_fail_kmsg.log`，将 `2440`–`2447` 备份至 `private/display-dpms-grey-20261122/patches-shelved/`；对 `out/m3k/linux-7.2.15` 按逆序执行 `patch -p1 -R -F0`、清理 `build43*`/`build44*` 及 `7.2.15-{36..44}` 构建产物，移除仓库 `2440`–`2447` 补丁及 `series`/`PATCHES.md` 对应条目使补丁树恢复至 `7.2.15-35`（`2439`）零差异基线。
-  - **设备卸载与默认恢复**：单次 `pkexec` 校验 `/boot/efi/loader/entries/fedora-7.2.15-35.opd2413.conf`（`linux`/`initrd`/`devicetree` 与 `modules.dep` 非空，含 `mem_sleep_default=s2idle`），清理 `/var/lib/opd2413-boot/next.json` 并执行 `boot-select default fedora-7.2.15-35.opd2413.conf`，随后 `rpm -e kernel-opd2413-7.2.15-44.opd2413 kernel-opd2413-7.2.15-43.opd2413`；卸载后复核 `loader_default` 为 `fedora-7.2.15-35.opd2413.conf`、`pending_next` 为 `null`、`rpm -qa` 仅留 `kernel-opd2413-7.2.15-35.opd2413.aarch64`、`/boot/efi/KSHIM.CHO` SHA-256（`846ae1e13319197780b7c13b734f371f05fc321098fa7de55055d3d469f71d9f`）与 `1 extent found` 不变、ESP `/dev/sda16` 释放至 `124M / 512M`（`389M` 可用，`25%`）、电量 `29% Charging`。
+  - **设备卸载与默认恢复**：校验 `/boot/efi/loader/entries/fedora-7.2.15-35.opd2413.conf`（`linux`/`initrd`/`devicetree` 与 `modules.dep` 非空，含 `mem_sleep_default=s2idle`），清理 `/var/lib/opd2413-boot/next.json` 并执行 `boot-select default fedora-7.2.15-35.opd2413.conf`，随后 `rpm -e kernel-opd2413-7.2.15-44.opd2413 kernel-opd2413-7.2.15-43.opd2413`；卸载后复核 `loader_default` 为 `fedora-7.2.15-35.opd2413.conf`、`pending_next` 为 `null`、`rpm -qa` 仅留 `kernel-opd2413-7.2.15-35.opd2413.aarch64`、`/boot/efi/KSHIM.CHO` SHA-256（`846ae1e13319197780b7c13b734f371f05fc321098fa7de55055d3d469f71d9f`）与 `1 extent found` 不变、ESP `/dev/sda16` 释放至 `124M / 512M`（`389M` 可用，`25%`）、电量 `29% Charging`。
 
 ## 2026-11-25
 
@@ -2847,11 +2847,11 @@ mpv、Firefox 仍是软解（Fedora `ffmpeg-free` 的专利限制），用户选
   - 在 `localhost/opd2413-builder-kernel:fc45` 完成全量编译（`dp_display.o` 与 `dp_aux.o` 通过 `KCFLAGS="-Werror"` 零警告校验；首次 `-j7` 在 `vmlinux`/`Image` 编完进入并行 `BTF [M]` 时伴随 7A PPS 充电卡死，重启后以 `-j4 --log-driver=none` 顺利完成增量续编与打包）。
   - 产物 `out/rpmbuild/RPMS/aarch64/kernel-opd2413-7.2.15-45.opd2413.aarch64.rpm`（SHA-256 `34d3a27f717eb79783789de64a21371066189b1c37c03bfbf55a141dd563e9f7`）：`vmlinuz` 为未压缩 `ARM64 Image`、`vmlinux`（`[12] .BTF`/`[13] .BTF_ids`）与 `oneplus-pogo-keyboard.ko`（`[36] .BTF`，`vermagic: 7.2.15-45.opd2413 SMP preempt mod_unload aarch64`）校验通过，`System.map` 含 `msm_dp_dont_use_autosuspend`/`msm_dp_hpd_plug_handle`/`msm_dp_bridge_detect`，`sm8750-oneplus-pad2pro.dtb` SHA-256 为 `238ba743288722af635177209e6568636185ceff33694e582b8956cd45e62280`（与 `-35` 逐字节一致）；已清理 `out/m3k/stage45`（暂留 `out/m3k/build45` 供后续第二步根治增量复用）。
 - **上机预期与验收判据（`7.2.15-45.opd2413`，待用户确认装机与重启）**：
-  1. 保持 `7.2.15-35.opd2413` 为 `default` 回退项，单次 `pkexec` 安装 `kernel-opd2413-7.2.15-45.opd2413.aarch64.rpm`、核验 BLS `options` 与 `-35` 一致且 `KSHIM.CHO` SHA-256 与 `1 extent found` 不变，设 `boot-select next fedora-7.2.15-45.opd2413.conf` 重启进入 `uname -r = 7.2.15-45.opd2413`（`running`、`0 failed`、SELinux `Enforcing`、`0 AVC`）；
+  1. 保持 `7.2.15-35.opd2413` 为 `default` 回退项，安装 `kernel-opd2413-7.2.15-45.opd2413.aarch64.rpm`、核验 BLS `options` 与 `-35` 一致且 `KSHIM.CHO` SHA-256 与 `1 extent found` 不变，设 `boot-select next fedora-7.2.15-45.opd2413.conf` 重启进入 `uname -r = 7.2.15-45.opd2413`（`running`、`0 failed`、SELinux `Enforcing`、`0 AVC`）；
   2. **核心回归判据（拔出外接屏后不重启）**：插上外接 Type-C DP 显示器点亮后再拔出，等待 `>= 4 s` 后检查 `/sys/devices/platform/soc@0/ae00000.display-subsystem/af54000.displayport-controller/power/runtime_status == suspended` 且 `runtime_suspended_time` 持续增长；随后在不重启的情况下执行单屏 `DPMS off (>= 3 s) -> on`（≥5 轮）与真实空闲自动熄屏唤醒，确认 `ae00000.display-subsystem`（`MDSS GDSC`）每次熄屏 `runtime_suspended_time` 均正常增加、内置 `DSI-1` 每次均正常亮屏出图且内核零 DSI/DPU/DP 报错；
   3. **`s2idle` 与热插拔复核**：拔线前后及单屏状态下各做一次 `s2idle` 休眠唤醒无超时/WARNING；验收通过后经用户确认设 `-45` 为默认（保留 `-35` 作回退）并推进第二步 `TECH-DEBT #47` 底层根治。
 - **装机与引导核验（`2026-11-25 12:46`）**：
-  - 经用户确认，单次 `pkexec` 校验 RPM SHA-256（`34d3a27f717eb79783789de64a21371066189b1c37c03bfbf55a141dd563e9f7`）并完成 `rpm -ivh --nosignature` 安装（保留 `7.2.15-35.opd2413` 为默认回退）；
+  - 经用户确认，校验 RPM SHA-256（`34d3a27f717eb79783789de64a21371066189b1c37c03bfbf55a141dd563e9f7`）并完成 `rpm -ivh --nosignature` 安装（保留 `7.2.15-35.opd2413` 为默认回退）；
   - 核验 `/boot/efi/loader/entries/fedora-7.2.15-45.opd2413.conf` 的 `options` 与 `-35` 完全一致，`linux`（`62M`）、`sm8750-oneplus-pad2pro.dtb`（`145K`）、`initrd`（`62M`）均非空；
   - 核验 `/boot/efi/KSHIM.CHO` 安装前后 SHA-256 同为 `c8e09f6dace5531b2341c88d4db53046408dd4032d92512977501ca93c914ac6` 且保持 `1 extent found`；`kshim_remembered: "Fedora"`；已设 `boot-select next fedora-7.2.15-45.opd2413.conf`（`previous_default: fedora-7.2.15-35.opd2413.conf`）；ESP `/dev/sda16` 为 `247M / 512M`（`266M` 可用，`49%`）；电量 `79% (Discharging)`。待用户重启进入 `7.2.15-45.opd2413` 验收。
 - **`7.2.15-45.opd2413` 实机开机、外接屏热插拔与单屏 5 轮 DPMS 复核（`2026-11-25 12:48–19:05`，`真机启动`，待用户目视确认升级 `真机通过`）**：
@@ -2859,7 +2859,7 @@ mpv、Firefox 仍是软解（Fedora `ffmpeg-free` 的专利限制），用户选
   2. **外接 DP 热插拔无泄漏实测（`19:03:46 -> 19:03:53`）**：插上外接 Type-C DP 显示器（`wcd939x-usbss: mode=4 dp_active=1`）点亮后再拔出（`mode=0 dp_active=0`，`DP-1: disconnected`），等待 `>3 s` 后 `af54000.displayport-controller` 自动恢复 `runtime_status = suspended`（`active = 18.4 s`，`suspended = 14764 s`），彻底消除 `7.2.15-35` 拔线后永久泄漏卡死 `active` 的缺陷，零内核报错。
   3. **拔线后不重启 5 轮单屏 `DPMS off (3.2 s) -> on (2.2 s)` 压测（`19:04:44–19:05:11`）**：5/5 轮熄屏态实测 `mdss = suspended`（每轮 `MDSS GDSC` 挂起增量 `+2709..+2732 ms`）且 `dp = suspended`（每轮 `+5464..+5473 ms`），`nt36536` 触控重载 `5/5`、`Anomalous kernel lines: 0`（注：第 5 轮末尾 `bl=412` 为 KDE 60 s 空闲变暗，属正常行为）。待用户目视确认 5 轮亮屏画面均正常，并确认是否执行 `boot-select default fedora-7.2.15-45.opd2413.conf`（保留 `-35` 作回退）后，推进第二步 `TECH-DEBT #47` 底层根治。
 - **用户目视确认与设为默认（`2026-11-25 19:07`，`真机通过`）**：
-  - 用户目视确认 5/5 轮熄屏/唤醒画面均正常；经确认单次 `pkexec` 执行 `/usr/libexec/opd2413/boot-select default fedora-7.2.15-45.opd2413.conf`（保留 `7.2.15-35.opd2413` 作回退）；核验 `loader_default = booted_entry = fedora-7.2.15-45.opd2413.conf`、`pending_next = null`、`kshim_remembered = "Fedora"`，`/boot/efi/KSHIM.CHO` SHA-256（`c8e09f6dace5531b2341c88d4db53046408dd4032d92512977501ca93c914ac6`）与 `1 extent found` 均未变化。
+  - 用户目视确认 5/5 轮熄屏/唤醒画面均正常；经确认 执行 `/usr/libexec/opd2413/boot-select default fedora-7.2.15-45.opd2413.conf`（保留 `7.2.15-35.opd2413` 作回退）；核验 `loader_default = booted_entry = fedora-7.2.15-45.opd2413.conf`、`pending_next = null`、`kshim_remembered = "Fedora"`，`/boot/efi/KSHIM.CHO` SHA-256（`c8e09f6dace5531b2341c88d4db53046408dd4032d92512977501ca93c914ac6`）与 `1 extent found` 均未变化。
 
 ### 第二步根治 `TECH-DEBT #47`：`7.2.15-46.opd2413`（DPMS-off 末尾 `CTL` 复位 + SM8750 双路 DSI 同步 + 首帧带宽，`离线通过`）
 
@@ -2880,7 +2880,7 @@ mpv、Firefox 仍是软解（Fedora `ffmpeg-free` 的专利限制），用户选
     - `vmlinux`（`[12] .BTF`/`[13] .BTF_ids`）与 `oneplus-pogo-keyboard.ko`（`[36] .BTF`，`vermagic: 7.2.15-46.opd2413 SMP preempt mod_unload aarch64`）校验通过；
     - `System.map` 与 `vmlinux` 检出全部关键符号/字符串：`msm_dp_dont_use_autosuspend`、`dpu_plane_calc_perf`、`msm_dsi_host_reset_after_phy_sync`、`dsi_7nm_phy_toggle_resync_fifo` 及 `post-cleanup ctl %d reset failed`；已清理 `out/m3k/stage46`。
 - **上机预期与验收判据（`7.2.15-46.opd2413`，待用户确认装机与重启）**：
-  1. **安全安装与一次性启动**：保留 `7.2.15-45.opd2413` 为 `default`、`7.2.15-35.opd2413` 为二级回退（当前 ESP 空闲 `266M`，无需卸载任何内核），单次 `pkexec` 安装 `-46`、校验 BLS `options` 与 `-45` 一致、`KSHIM.CHO` SHA-256 与 `1 extent found` 不变，并设 `boot-select next fedora-7.2.15-46.opd2413.conf`；重启进入 `uname -r = 7.2.15-46.opd2413`（`running`、`0 failed`、SELinux `Enforcing`、`0 AVC`、`autosuspend_delay_ms = 3000`）。
+  1. **安全安装与一次性启动**：保留 `7.2.15-45.opd2413` 为 `default`、`7.2.15-35.opd2413` 为二级回退（当前 ESP 空闲 `266M`，无需卸载任何内核），安装 `-46`、校验 BLS `options` 与 `-45` 一致、`KSHIM.CHO` SHA-256 与 `1 extent found` 不变，并设 `boot-select next fedora-7.2.15-46.opd2413.conf`；重启进入 `uname -r = 7.2.15-46.opd2413`（`running`、`0 failed`、SELinux `Enforcing`、`0 AVC`、`autosuspend_delay_ms = 3000`）。
   2. **双屏混合压测（接入外接 Type-C DP 显示器，运行 `private/display-dpms-grey-20261122/dual_dpms_test.py`）**：
      - 10/10 轮混合 `4 s` 短熄屏、`16–18 s` 超待机长熄屏、长熄屏后 `4 s` 短熄屏及在线 `120/60/30 Hz` 刷新率切换，**均由用户目视确认 `DSI-1` 与 `DP-1` 双屏同时正常恢复画面**；
      - `0` 内核异常（无 `post-cleanup ctl ... reset failed`、无 `dsi1 cmd dma timeout`、无 `vblank timeout`、无 `devcoredump`）；
@@ -2889,11 +2889,109 @@ mpv、Firefox 仍是软解（Fedora `ffmpeg-free` 的专利限制），用户选
      - 拔线 `>3 s` 后 `af54000.displayport-controller` 自动回归 `suspended`；
      - 单屏多轮 `DPMS off -> on`（`MDSS GDSC` 每次正常掉电）、在线 `120/60/30 Hz` 切换与 `s2idle` 休眠唤醒均零异常；全部通过后经用户确认设 `-46` 为默认、做冷启动复查并关闭 `TECH-DEBT #47`。
 - **装机与引导核验（`2026-11-25 20:08`）**：
-  - 经用户确认，单次 `pkexec` 校验 RPM SHA-256（`33561ffe7a3acbc53a754997e7b2ca4c21ff6ebf063973c20a9f6d09a658f271`）并完成 `rpm -ivh --nosignature` 安装（保留 `-45` 为 `previous_default`、`-35` 为二级回退，三版并存）；
+  - 经用户确认，校验 RPM SHA-256（`33561ffe7a3acbc53a754997e7b2ca4c21ff6ebf063973c20a9f6d09a658f271`）并完成 `rpm -ivh --nosignature` 安装（保留 `-45` 为 `previous_default`、`-35` 为二级回退，三版并存）；
   - 核验 `/boot/efi/fedora/7.2.15-46.opd2413/` 下 `linux`（`62M`）、`initrd`（`62M`）、`sm8750-oneplus-pad2pro.dtb`（`145K`）均非空，`/boot/efi/loader/entries/fedora-7.2.15-46.opd2413.conf` 的 `options` 与 `-45` 零差异；
   - 核验 `/boot/efi/KSHIM.CHO` 安装前后 SHA-256 同为 `c8e09f6dace5531b2341c88d4db53046408dd4032d92512977501ca93c914ac6` 且保持 `1 extent found`、`kshim_remembered = "Fedora"`；已设 `boot-select next fedora-7.2.15-46.opd2413.conf`（`previous_default: fedora-7.2.15-45.opd2413.conf`）；ESP `/dev/sda16` 为 `370M / 512M`（`143M` 可用，`73%`）；电量 `41% (Charging)`。待用户重启进入 `7.2.15-46.opd2413` 开展双屏与单屏验收。
 - **`7.2.15-46.opd2413` 实机双屏验收与按用户决定收尾回退至 `7.2.15-45.opd2413`（`2026-11-25 20:27–20:39`，`真机失败`，证据：`private/display-dpms-grey-20261122/dual46_dpms_test.log`、`dual46_kmsg.log`）**：
   1. **开机与 10 轮压测指标**：`uname -r = 7.2.15-46.opd2413`、`running`、`0 failed`、SELinux `Enforcing`、`0 AVC`、`autosuspend_delay_ms = 3000`，`DP-1`（`2560x1440@144`）与 `DSI-1`（`3392x2400@120`）双屏正常点亮。10 轮混合压测（`dual46_dpms_test.py`）跑满 `10/10`、`Anomalous kernel lines: 0`、`0 AVC`、4 路面板电源轨熄屏全部 `disabled`、`nt36536` 重载 `14/14`、`mdss=+0ms`/`dp=+0ms`（`2441` 完整吸收待机 HPD 脉冲）。
   2. **用户目视结论（`真机失败`）**：前面 `4 s` 短熄屏内置屏均能正常恢复，外接 `DP-1` 全程始终正常恢复；但后续双屏长熄屏（`16–18 s`）仅 1 次内置屏恢复画面，其余长熄屏轮次内置屏仍停留在背光黑屏。
   3. **按用户决定收尾与代码整理**：用户决定不再继续追究 `#47` 双屏长熄屏，满足于当前已站稳的 `7.2.15-45.opd2413`（彻底修复拔出外接屏后无外接屏单屏熄屏无法唤醒的问题）。已将 `2449` 归档至 `private/display-dpms-grey-20261122/patches-shelved/`，`out/m3k/linux-7.2.15` 按逆序 `patch -p1 -F0 -R` 撤回 `2449`–`2442` 并通过 `2440`–`2441` 严格 `-F0` 正反向回环校验，清理仓库 `2442`–`2449`、`series`/`PATCHES.md` 条目与 `build46*`/`kernel-7.2.15-46` 临时构建产物，使仓库补丁树与已验收默认内核 `7.2.15-45.opd2413`（`2440`–`2441`）精确一致。
-  4. **卸载实验内核与 ESP 回收（`2026-11-25 20:41`）**：经用户确认，单次 `pkexec` 校验 `-45` 启动文件完整性并确认 `boot-select default fedora-7.2.15-45.opd2413.conf` 后执行 `rpm -e kernel-opd2413-7.2.15-46.opd2413`；卸载后复核 `loader_default = fedora-7.2.15-45.opd2413.conf`、`pending_next = null`、`loader_entries` 仅剩 `7.2.15-35` 与 `7.2.15-45`、`/boot/efi/KSHIM.CHO` 前后 SHA-256 同为 `c8e09f6dace5531b2341c88d4db53046408dd4032d92512977501ca93c914ac6` 且保持 `1 extent found`、ESP `/dev/sda16` 释放至 `247M / 512M`（`266M` 可用，`49%`）、电量 `43% (Charging)`。
+  4. **卸载实验内核与 ESP 回收（`2026-11-25 20:41`）**：经用户确认，校验 `-45` 启动文件完整性并确认 `boot-select default fedora-7.2.15-45.opd2413.conf` 后执行 `rpm -e kernel-opd2413-7.2.15-46.opd2413`；卸载后复核 `loader_default = fedora-7.2.15-45.opd2413.conf`、`pending_next = null`、`loader_entries` 仅剩 `7.2.15-35` 与 `7.2.15-45`、`/boot/efi/KSHIM.CHO` 前后 SHA-256 同为 `c8e09f6dace5531b2341c88d4db53046408dd4032d92512977501ca93c914ac6` 且保持 `1 extent found`、ESP `/dev/sda16` 释放至 `247M / 512M`（`266M` 可用，`49%`）、电量 `43% (Charging)`。
+
+### `7.2.15-47.opd2413` 绿联 USB 3.2 + HDMI 扩展坞 Type-C Alt Mode Mux 竞争与 DP 链路修复
+
+- **现象与现场定位（`2026-11-25 21:25–21:38`）**：
+  - 用户接入绿联 Type-C 扩展坞（USB 3.2 + HDMI 2.0）后出现 USB 2.x 降速提示、连接不稳定、HDMI 无输出及插 HDMI 时桌面卡死。
+  - 查阅平板本机 `boot -2`（`19:37–19:38`）与 `boot 0`（`21:15–21:25`）实时日志发现 6/6 次必现模式覆写：`pmic_glink_altmode` 将 `wcd939x-usbss` 与 `qmp-combo` 切入 `mode=5 svid=ff01`（`TYPEC_DP_STATE_D`，2-lane DP + USB 3.x；直连 4K 屏为 `mode=4`）后，同一秒内 `ucsi_partner_change()` 因仅检查 `UCSI_CONSTAT_PARTNER_FLAG_USB` 而无条件调用 `typec_set_mode(con->port, TYPEC_STATE_USB)` 将其覆写回 `mode=1 svid=0000`（断开 SBU DP AUX 并把 QMP PHY 重置回 `QMPPHY_MODE_USB3_ONLY`），引起 `usb 1-1` `-71`、`usb 2-1`（`SuperSpeed Plus Gen 2x1`）1 秒内 3 次掉线重连、HDMI 无 AUX/DP_MODE 及 `kwin_wayland` 热插拔探测阻塞（`Atomic commit failed: EBUSY`）。
+- **上机测试前预期与判据：**
+  1. **改动集合（`2442`–`2445`，均基于 `7.2.15-45`）**：
+     - [2442](../kernel/opd2413-7.2/patches/2442-usb-typec-ucsi-do-not-reset-mux-to-USB-mode-while-pa.patch)：`ucsi_partner_change()` 增加 `!UCSI_CONSTAT(con, PARTNER_FLAG_ALT_MODE)` 条件，避免在已进入 Alt Mode 时覆写 `typec_mux`；
+     - [2443](../kernel/opd2413-7.2/patches/2443-phy-qcom-qmp-combo-track-whether-the-cached-typec_mu.patch)（erhai `d04ce77c6`）：`qmp_combo` 增加 `qmpphy_mode_committed` 防止未写硬件的缓存命中早退；
+     - [2444](../kernel/opd2413-7.2/patches/2444-drm-msm-dp-reset-the-link-caps-on-every-DPCD-read.patch)（erhai `97404d463`）：`msm_dp_panel_read_dpcd()` 清零 `link_info`；
+     - [2445](../kernel/opd2413-7.2/patches/2445-drm-msm-dp-check-the-PHY-power-on-and-DPCD-link-stat.patch)（erhai `b6745e7b9`）：`msm_dp_ctrl_channel_eq_ok()` 检查 DPCD 读取返回值。
+  2. **离线判据**：4 个补丁 `patch -p1 -F0` 正反向回环通过、`KCFLAGS="-Werror"` 零警告、`vmlinux` 与 `.ko` 含 `.BTF`、`vermagic = 7.2.15-47.opd2413`、`sm8750-oneplus-pad2pro.dtb` SHA-256 与 `-45`/`-35` 逐字节一致。
+  3. **装机与真机验收判据**：
+     - 保留 `-45` 为 `default`、`-35` 为二级回退，以 `rpm -ivh --nosignature` 装入 `-47` 并设 `boot-select next fedora-7.2.15-47.opd2413.conf`，核验 `KSHIM.CHO` 不变且保持 `1 extent found`；
+     - 启动进入 `7.2.15-47.opd2413` 后插拔绿联扩展坞（分别测试不接 PD 供电与接外置 PD 充电器，以及插入 HDMI）：
+       - `wcd939x-usbss` 日志不再出现 `set mode=5 svid=ff01` 后紧跟 `set mode=1 svid=0000`；
+       - `lsusb -t` 中扩展坞 Hub 稳定枚举于 `Bus 002`（`10000M` / `5000M`）且无连续掉线重连；
+       - 接入 HDMI 时 `DP-1` 正常识别出图、无桌面卡死；拔出扩展坞 3 s 后 `af54000.displayport-controller` 正常回落 `suspended`；
+       - 回归验证纯 USB 3.x 设备正反插、直连 4K 显示器与单屏熄屏唤醒均零回归。
+- **离线校验（`2026-11-25 21:47`，`离线通过`，日志：`out/m3k/build47.log`）**：
+  - `2442`–`2445` 严格 `patch -p1 -F0` 正反向回环全部通过；
+  - 于 `localhost/opd2413-builder-kernel:fc45`（`-j7`、`HOSTCC=/tmp/hostgcc`）下 `KCFLAGS="-Werror"` 零警告编过 `ucsi.o`/`phy-qcom-qmp-combo.o`/`dp_panel.o`/`dp_ctrl.o`；
+  - `vmlinux` 含 `[12] .BTF`、`[13] .BTF_ids`，`vmlinuz` 为未压缩 ARM64 `Image`，`oneplus-pogo-keyboard.ko` 含 `[36] .BTF` 且 `vermagic: 7.2.15-47.opd2413 SMP preempt mod_unload aarch64`；
+  - `sm8750-oneplus-pad2pro.dtb` SHA-256 为 `238ba743288722af635177209e6568636185ceff33694e582b8956cd45e62280`（与 `-45`/`-35` 逐字节一致）；
+  - 产出 `out/rpmbuild/RPMS/aarch64/kernel-opd2413-7.2.15-47.opd2413.aarch64.rpm`（`42M`，SHA-256 `c7a69bbbed7d5f0f33a4c4b38ecd13c04fd895c0242093df8e556586ad26fb95`），已清理临时 `out/m3k/stage47`；当前 ESP `247M / 512M`（`266M` 可用），电量 `29% (Discharging)`，待用户确认装机与上机验收。
+- **装机与引导核验（`2026-11-25 21:51`）**：
+  - 经用户确认，校验 RPM SHA-256（`c7a69bbbed7d5f0f33a4c4b38ecd13c04fd895c0242093df8e556586ad26fb95`）并执行 `rpm -ivh --nosignature` 安装 `kernel-opd2413-7.2.15-47.opd2413`（保留 `-45` 为 `previous_default`、`-35` 为二级回退，三版并存）；
+  - 核验 `/boot/efi/fedora/7.2.15-47.opd2413/` 下 `linux`（`62M`）、`initrd`（`62M`）、`sm8750-oneplus-pad2pro.dtb`（`145K`）均与 `/usr/lib/modules/7.2.15-47.opd2413/` 一致且非空，`/boot/efi/loader/entries/fedora-7.2.15-47.opd2413.conf` 的 `options` 与 `-45` 零差异；
+  - 核验 `/boot/efi/KSHIM.CHO` 安装前后 SHA-256 同为 `c8e09f6dace5531b2341c88d4db53046408dd4032d92512977501ca93c914ac6` 且保持 `1 extent found`、`kshim_remembered = "Fedora"`；已设 `boot-select next fedora-7.2.15-47.opd2413.conf`（`previous_default: fedora-7.2.15-45.opd2413.conf`）；ESP `/dev/sda16` 为 `370M / 512M`（`143M` 可用，`73%`）；电量 `28% (Discharging)`。待用户重启进入 `7.2.15-47.opd2413` 实测绿联扩展坞 USB 3.2 与 HDMI。
+- **`7.2.15-47.opd2413` 实机验收与次生问题定位（`2026-11-25 21:57–22:15`，部分通过 / PD 插充电器场景`真机失败`）**：
+  1. **Bug #1（Type-C Alt Mode Mux 覆写）已修复**：`uname -r = 7.2.15-47.opd2413`、`running`、`0 failed`、SELinux `Enforcing`、`0 AVC`；`wcd939x-usbss` 稳定停留在 `mode=5 svid=ff01 orient=2 -> usb=1 dp=1 dp_active=1`（寄存器 `0x403=0xf8`、`0x404=0x94`），不再出现 `mode=5 -> mode=1` 覆写；扩展坞稳定枚举为 USB 3.2 Gen 2（`10000M`，`05e3:0625`）+ 读卡器 USB 3.0（`5000M`，`05e3:0764`）；首次插入 HDMI 弹出扩展屏幕选择并成功在外部 4K@60 显示器（`3840x2160@60`、2-lane HBR3 `810000`、`18 bpp`）出图、桌面无卡死。
+  2. **Bug #2（插充电器后 HDMI 黑屏且拔插 HDMI 永不恢复）现场与根因**：
+     - `22:00:42–22:00:45` 给扩展坞插入充电器触发 PD 电源角色切换（`VBUS off -> USB contract 4955 mV -> xhci-hcd remove/add`，期间通知栏短暂提示 USB 2.1）：`msm_dp_ctrl_on_link()` 首次尝试 `810000` 失败返回 `rc=-104`（因 SM8750 USB-C 使用外带 HPD `pmic_glink_altmode`，硬件 HPD 寄存器 `msm_dp_aux_is_link_connected()` 恒返回 `0`，遇到第 1 次失败即跳出重试循环），造成 `enc37` 连续 50 秒 `vblank timeout: a0821300`；
+     - `22:01:36` 与 `22:02:01` 拔掉充电器并重插 HDMI 后，`msm_dp_ctrl_on_link()` 实际已成功（未再报 `rc=-104`），但 `msm_dp_bridge_atomic_enable()` 无条件设置 `force_link_train = true` 导致 `msm_dp_ctrl_on_stream()` 在接收端仍处于 TPS4 训练状态时再次调用 `msm_dp_ctrl_link_retrain()` 并忽略返回值，命中 `max v_level reached`（`ret=-11`）破坏已训练链路，最终 `DP-1` 卡在 `enabled/On`、`lclk=810000000`、`pixel0_clk=297000000`、`v_level=3`、`test_requested=128` 却始终黑屏无信号；
+     - 同时核对 `linux-sm8750-erhai` 确认 `-47` 仍缺 7 项针对共享 QMP Combo PHY 与 DP 热插拔/PHY 引用计数生命周期的补丁（包括 `qmp_combo_usb_power_on()` 重新置位 `SW_PWRDN`、DP PHY/时钟幂等释放防止 `power_count` 下溢、HPD 锁串行化及反插 Hub 重连 AUX 重试）。
+
+### `7.2.15-48.opd2413` 扩展坞 PD 角色切换与 HDMI 热插拔恢复修复（`离线通过`）
+
+- **上机测试前预期与判据**：
+  1. **改动集合（`2446`–`2453`，基于 `7.2.15-47`）**：
+     - [2446](../kernel/opd2413-7.2/patches/2446-phy-qcom-qmp-combo-power-up-the-USB-PCS-in-usb_power.patch)（erhai `6071007be`）+ [2447](../kernel/opd2413-7.2/patches/2447-phy-qcom-qmp-combo-Drop-the-stale-err_disable_pipe_c.patch)（erhai `2c84484e9`）：`qmp_combo_usb_power_on()` 重新置位 `SW_PWRDN` 并移除过时的 `pipe_clk` 错误路径释放；
+     - [2448](../kernel/opd2413-7.2/patches/2448-drm-msm-dp-don-t-report-link-training-success-after-.patch)（erhai `49541b9e5`）：`msm_dp_ctrl_on_link()` 重试耗尽不再误报 `rc=0`；
+     - [2449](../kernel/opd2413-7.2/patches/2449-drm-msm-dp-power-the-phy-off-before-taking-it-down.patch)（erhai `5062cc9e7`）+ [2450](../kernel/opd2413-7.2/patches/2450-drm-msm-dp-release-only-the-link-resources-that-were.patch)（erhai `5d1618e02`）：跟踪 `phy_powered` 并幂等释放 PHY 与链路时钟，消除 `phy->power_count` 下溢；
+     - [2451](../kernel/opd2413-7.2/patches/2451-drm-msm-dp-Serialize-HPD-state-updates.patch)（erhai `aec156fd7`）+ [2452](../kernel/opd2413-7.2/patches/2452-drm-msm-dp-retry-reading-the-sink-capabilities-after.patch)（erhai `cc6e10632`）：`plugged_lock` 串行化 HPD 状态更新 + 反插 Hub 重连期间 AUX 读取重试（15 次 × 150 ms）；
+     - [2453](../kernel/opd2413-7.2/patches/2453-drm-msm-dp-avoid-redundant-retrain-and-allow-oob-hpd.patch)（原创）：移除 `msm_dp_bridge_atomic_enable()` 中紧跟 `on_link()` 的冗余 `force_link_train = true`（并在 `on_stream()` 回退重训前先清训练图样），以及在 `msm_dp_ctrl_on_link()` 用 `drm_dp_dpcd_read_link_status() < 0` 替代硬件 HPD 寄存器检测以支持 USB-C 外带 HPD 重试。
+  2. **离线判据**：8 个补丁 `patch -p1 -F0` 正反向回环全部通过、`KCFLAGS="-Werror"` 零警告、`vmlinux` 与 `.ko` 含 `.BTF`、`vermagic = 7.2.15-48.opd2413`、`sm8750-oneplus-pad2pro.dtb` SHA-256 与 `-47`/`-45`/`-35` 逐字节一致。
+  3. **装机与真机验收判据**：
+     - 因当前 ESP 仅余 `143M`（已装 `-35`/`-45`/`-47` 三版），经用户确认后先卸载最旧的 `-35`（保留 `-45` 为 `default`、`-47` 为回退，释放约 `123M`），再安装 `-48`、核验 BLS `options` 与 `-45` 零差异、`KSHIM.CHO` SHA-256 与 `1 extent found` 不变，设 `boot-select next fedora-7.2.15-48.opd2413.conf`；
+     - 重启进入 `7.2.15-48.opd2413` 后依次测试：（a）接入绿联扩展坞 + HDMI 出图且内核不再报 `max v_level reached`；（b）在 HDMI 点亮期间向扩展坞插入及拔出充电器（PD 角色切换），确认 USB 3.2（`10000M`）正常恢复、无 50 秒 `vblank timeout` 且外接 HDMI 正常恢复或重插 HDMI 立即恢复显示；（c）拔出扩展坞 3 s 后 `af54000.displayport-controller` 自动回归 `suspended`。
+- **离线校验（`2026-11-25 22:19`，`离线通过`，日志：`out/m3k/build48.log`）**：
+  - `2446`–`2453` 全部 8 个补丁严格 `patch -p1 -F0` 正反向回环通过；
+  - 于 `localhost/opd2413-builder-kernel:fc45`（`-j7`、`HOSTCC=/tmp/hostgcc`）下 `KCFLAGS="-Werror"` 零警告编过 `phy-qcom-qmp-combo.o`/`dp_ctrl.o`/`dp_display.o`；
+  - `vmlinux` 含 `[12] .BTF`、`[13] .BTF_ids`，`vmlinuz` 为未压缩 ARM64 `Image`，`oneplus-pogo-keyboard.ko` 含 `[36] .BTF` 且 `vermagic: 7.2.15-48.opd2413 SMP preempt mod_unload aarch64`；
+  - `sm8750-oneplus-pad2pro.dtb` SHA-256 为 `238ba743288722af635177209e6568636185ceff33694e582b8956cd45e62280`（与 `-47`/`-45`/`-35` 逐字节一致）；
+  - `System.map` 与 `vmlinux` 检出关键符号/字符串 `msm_dp_display_read_sink_caps`、`failed to power on phy, ret=%d`、`sink caps read failed (%d), retry %u/%u`；
+  - 产出 `out/rpmbuild/RPMS/aarch64/kernel-opd2413-7.2.15-48.opd2413.aarch64.rpm`（`42M`，SHA-256 `db206ad749281e91259535f4fc86ca6545c180e2d1ac4d00a6e476633b072a53`），已清理临时 `out/m3k/stage48`，待用户确认卸载 `-35` 并安装 `-48`。
+- **装机与引导核验（`2026-11-25 22:23`）**：
+  - 经用户确认，先核验 `loader_default = fedora-7.2.15-45.opd2413.conf` 并卸载 `kernel-opd2413-7.2.15-35.opd2413`（ESP 释放至 `247M / 512M`，保留 `-45` 为默认、`-47` 为回退）；
+  - 校验 RPM SHA-256（`db206ad749281e91259535f4fc86ca6545c180e2d1ac4d00a6e476633b072a53`）并执行 `rpm -ivh --nosignature` 安装 `kernel-opd2413-7.2.15-48.opd2413`；
+  - 核验 `/boot/efi/fedora/7.2.15-48.opd2413/` 下 `linux`（`62M`）、`initrd`（`62M`）、`sm8750-oneplus-pad2pro.dtb`（`145K`）与 `/usr/lib/modules/7.2.15-48.opd2413/` 逐字节一致且非空，`/boot/efi/loader/entries/fedora-7.2.15-48.opd2413.conf` 的 `options` 与 `-45` 零差异；
+  - 核验 `/boot/efi/KSHIM.CHO` 前后 SHA-256 同为 `c8e09f6dace5531b2341c88d4db53046408dd4032d92512977501ca93c914ac6` 且保持 `1 extent found`、`kshim_remembered = "Fedora"`；已设 `boot-select next fedora-7.2.15-48.opd2413.conf`（`previous_default: fedora-7.2.15-45.opd2413.conf`）；ESP `/dev/sda16` 为 `370M / 512M`（`143M` 可用，`73%`）；电量 `27% (Charging)`。待用户重启进入 `7.2.15-48.opd2413` 实测扩展坞 HDMI 与 PD 插拔充电器恢复。
+- **`7.2.15-48.opd2413` 实机验收（`2026-11-25 22:27–22:44`，USB 3.2 与 PD 插拔充电器`真机通过`，降频模式重协商留待 `-49`）**：
+  1. **USB 3.2 与 PD 插拔充电器彻底稳定**：`uname -r = 7.2.15-48.opd2413`、`running`、`0 failed`；扩展坞稳连 `Bus 002`（`10000M` `05e3:0625` + `5000M` 读卡器 `05e3:0764`）；`22:43:20 -> 22:43:35` 实测往扩展坞插上与拔出充电器（`PD fixed 5070 mV <-> USB 4901 mV`），全程零 `xhci-hcd` 掉线、零 USB 2.1 降速通知、零 `vblank timeout`、零黑屏。
+  2. **降频后带宽溢出定位**：`22:27:41` 2-lane HBR3（`810000`）训练失败后成功自动降频至 2-lane HBR2（`540000`、`v_level=0`、`p_level=0`、`8.64 Gbps`），但因 `panel->link_info.rate` 仍停留在旧值 `810000` 未同步：
+     - 默认选中的 `3840x2160@60 @ 18 bpp`（`10.69 Gbps > 8.64 Gbps`）发生 TU 溢出致字体扭曲、右侧重复与抖动；
+     - `3840x2160@30` 因按旧 `810000` 误选 `30 bpp`（`8.91 Gbps > 8.64 Gbps`）导致右侧一小条竖条异常；
+     - 切换至 `2560x1440@60 @ 30 bpp`（`7.245 Gbps <= 8.64 Gbps`）后画面 100% 清晰无任何异常。
+
+### `7.2.15-49.opd2413` 降频链路能力同步、自动 `bpp` 适配与 `DRM_MODE_LINK_STATUS_BAD` 重协商（`离线通过`）
+
+- **上机测试前预期与判据**：
+  1. **改动（[2454](../kernel/opd2413-7.2/patches/2454-drm-msm-dp-sync-downshifted-link-caps-and-renegotia.patch)，基于 `7.2.15-48`）**：
+     - `msm_dp_ctrl_on_link()` 降频成功后，同步更新 `panel->link_info.{rate,num_lanes}` 为实际训练值；
+     - 按真实链路带宽重算当前模式 `bpp`（并在 `msm_dp_ctrl_on_stream()` 前重写 `REG_DP_CONFIGURATION_CTRL`），使 `4K@30` 自动落至 `24 bpp`（`7.13 Gbps <= 8.64 Gbps`）消除右侧竖条；
+     - 当模式即使在最低 `bpp` 仍超限（如 2-lane HBR2 下 `4K@60`）或训练失败时，通过 `link_status_work` 异步设置 `DRM_MODE_LINK_STATUS_BAD` 并发送 `drm_kms_helper_connector_hotplug_event()`，令桌面自动过滤超带宽模式并切到清晰合规模式（不中断当前提交、零 `vblank timeout`）。
+  2. **装机与真机判据**：
+     - 卸载中间版 `-47`（保留 `-45` 为默认、`-48` 为回退）后装入 `-49`，核验 BLS `options` 与 `-45` 一致、`KSHIM.CHO` SHA-256 与 `1 extent found` 不变，设 `boot-select next fedora-7.2.15-49.opd2413.conf`；
+     - 重启进入 `-49` 后插绿联扩展坞 + HDMI：（a）系统自动过滤 `4K@60` 并切到清晰画面（无扭曲/抖动）；（b）手动选择 `3840x2160@30` 时 `dp_debug` 显示 `rate = 540000`、`bpp = 24`，右侧竖条完全消失；（c）`2560x1440@60` 与插拔充电器均保持清晰稳定，拔出扩展坞 3 s 后 `af54000.displayport-controller` 自动回落 `suspended`。
+- **离线校验（`2026-11-25 22:51`，`离线通过`，日志：`out/m3k/build49.log`）**：
+  - `2454` 通过严格 `patch -p1 -F0` 零偏移正反向回环校验；
+  - 于 `localhost/opd2413-builder-kernel:fc45`（`-j7`、`HOSTCC=/tmp/hostgcc`）下 `KCFLAGS="-Werror"` 零警告编过 `dp_ctrl.o`/`dp_display.o`；
+  - `vmlinux` 含 `[12] .BTF`、`[13] .BTF_ids`，`vmlinuz` 为未压缩 ARM64 `Image`，`oneplus-pogo-keyboard.ko` 含 `[36] .BTF` 且 `vermagic: 7.2.15-49.opd2413 SMP preempt mod_unload aarch64`；
+  - `sm8750-oneplus-pad2pro.dtb` SHA-256 为 `238ba743288722af635177209e6568636185ceff33694e582b8956cd45e62280`（与 `-48`/`-47`/`-45` 逐字节一致）；
+  - `System.map` 检出 `msm_dp_display_link_status_work`；
+  - 产出 `out/rpmbuild/RPMS/aarch64/kernel-opd2413-7.2.15-49.opd2413.aarch64.rpm`（`42M`，SHA-256 `9be31d0c5d3c6b689be6abe30533f6941f7aed9f10f196a2a39e21cc72c738a7`），已清理临时 `out/m3k/stage49`，待用户确认卸载 `-47` 并安装 `-49`。
+- **装机与引导核验（`2026-11-25 23:04`）**：
+  - 经用户确认，核验 `loader_default = fedora-7.2.15-45.opd2413.conf` 后卸载 `kernel-opd2413-7.2.15-47.opd2413`（ESP 释放至 `247M / 512M`，保留 `-45` 为默认、`-48` 为回退）；
+  - 校验 RPM SHA-256（`9be31d0c5d3c6b689be6abe30533f6941f7aed9f10f196a2a39e21cc72c738a7`）并执行 `rpm -ivh --nosignature` 安装 `kernel-opd2413-7.2.15-49.opd2413`；
+  - 核验 `/boot/efi/fedora/7.2.15-49.opd2413/` 下 `linux`（`62M`）、`initrd`（`62M`）、`sm8750-oneplus-pad2pro.dtb`（`145K`）与 `/usr/lib/modules/7.2.15-49.opd2413/` 逐字节一致且非空，`/boot/efi/loader/entries/fedora-7.2.15-49.opd2413.conf` 的 `options` 与 `-45` 零差异；
+  - 核验 `/boot/efi/KSHIM.CHO` 前后 SHA-256 同为 `c8e09f6dace5531b2341c88d4db53046408dd4032d92512977501ca93c914ac6` 且保持 `1 extent found`、`kshim_remembered = "Fedora"`；已设 `boot-select next fedora-7.2.15-49.opd2413.conf`（`previous_default: fedora-7.2.15-45.opd2413.conf`）；ESP `/dev/sda16` 为 `370M / 512M`（`143M` 可用，`73%`）；电量 `31% (Charging)`。待用户重启进入 `7.2.15-49.opd2413` 验收。
+- **`7.2.15-49.opd2413` 实机验收通过（`2026-11-25 23:06–23:12`，`真机通过`）**：
+  - `uname -r = 7.2.15-49.opd2413`、`systemctl is-system-running = running`、`0 failed`、SELinux `Enforcing`、`0 avc: denied`、`af54000.displayport-controller` `autosuspend_delay_ms = 3000`；
+  - `wcd939x-usbss` 稳定处于 `mode=5 svid=ff01 orient=2 -> usb=1 dp=1 dp_active=1`，`lsusb -t` 稳连 `Bus 002` `10000M`（`05e3:0625`）+ `5000M` 读卡器（`05e3:0764`）；
+  - `dp_debug` 实测 `3840x2160@60`（`18 bpp`）稳定锁定 2-lane HBR3（`lclk=810000000`、`bw_code=30`、`v_level=3`、`test_requested=0`），用户目视确认 `4K@60Hz` 及全部挡位清晰正常、插拔充电器无影响；待用户确认设为默认内核并清理中间版 `-48`。
+- **固化默认内核与清理收尾（`2026-11-25 23:15`）**：
+  - 经用户确认执行 `/usr/libexec/opd2413/boot-select default fedora-7.2.15-49.opd2413.conf` 并卸载 `kernel-opd2413-7.2.15-48.opd2413`（保留 `7.2.15-45.opd2413` 作回退）；
+  - 回读核验 `loader_default = booted_entry = fedora-7.2.15-49.opd2413.conf`、`pending_next = null`、`kshim_remembered = "Fedora"`、`loader_entries` 仅剩 `-45` 与 `-49`；`/boot/efi/KSHIM.CHO` 前后 SHA-256 同为 `c8e09f6dace5531b2341c88d4db53046408dd4032d92512977501ca93c914ac6` 且保持 `1 extent found`；ESP `/dev/sda16` 释放回 `247M / 512M`（`266M` 可用，`49%`）；电量 `32% (Charging)`；已清理中间构建目录 `out/m3k/build47` 与 `out/m3k/build48`。

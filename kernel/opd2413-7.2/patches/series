@@ -130,3 +130,20 @@
 2440-drm-msm-dp-hold-one-runtime-PM-reference-per-plugged.patch
 2441-drm-msm-dp-use-3s-runtime-PM-autosuspend-to-absorb-H.patch
 
+# Type-C dock DP+USB3 alt-mode mux preservation, QMP PHY commit tracking, and DP link caps/status fixes
+2442-usb-typec-ucsi-do-not-reset-mux-to-USB-mode-while-pa.patch
+2443-phy-qcom-qmp-combo-track-whether-the-cached-typec_mu.patch
+2444-drm-msm-dp-reset-the-link-caps-on-every-DPCD-read.patch
+2445-drm-msm-dp-check-the-PHY-power-on-and-DPCD-link-stat.patch
+
+# Type-C dock PD role swap & HDMI hotplug recovery: QMP USB PCS power-on, DP PHY/clk lifecycle, HPD serialization, sink-caps retry, and OOB HPD / retrain fixes
+2446-phy-qcom-qmp-combo-power-up-the-USB-PCS-in-usb_power.patch
+2447-phy-qcom-qmp-combo-Drop-the-stale-err_disable_pipe_c.patch
+2448-drm-msm-dp-don-t-report-link-training-success-after-.patch
+2449-drm-msm-dp-power-the-phy-off-before-taking-it-down.patch
+2450-drm-msm-dp-release-only-the-link-resources-that-were.patch
+2451-drm-msm-dp-Serialize-HPD-state-updates.patch
+2452-drm-msm-dp-retry-reading-the-sink-capabilities-after.patch
+2453-drm-msm-dp-avoid-redundant-retrain-and-allow-oob-hpd.patch
+2454-drm-msm-dp-sync-downshifted-link-caps-and-renegotia.patch
+

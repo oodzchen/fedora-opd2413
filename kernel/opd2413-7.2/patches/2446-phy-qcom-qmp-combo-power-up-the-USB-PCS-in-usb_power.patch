@@ -1,0 +1,38 @@
+From 6071007be7fa016c7d3748e93f425676be3c3962 Mon Sep 17 00:00:00 2001
+From: nadelacruz-00 <323917690+nadelacruz-00@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 16:29:22 +0800
+Subject: [PATCH] phy: qcom: qmp-combo: power up the USB PCS in usb_power_on()
+
+USB power-off clears SW_PWRDN, but common initialization can return early
+when the shared block is still in use. Set SW_PWRDN in USB power-on so
+PCS can leave reset on the next initialization.
+
+Adapt the common-block fix to the existing shared USB/DP lifecycle.
+
+Source-commit: 1fd1e0452839b8699b5b71c83959461c7995672e
+Link: https://github.com/TheMojoMan/oneplus-erhai-linux/commit/1fd1e0452839b8699b5b71c83959461c7995672e
+Signed-off-by: nadelacruz-00 <323917690+nadelacruz-00@users.noreply.github.com>
+
+Assisted-by: LLM
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ drivers/phy/qualcomm/phy-qcom-qmp-combo.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/drivers/phy/qualcomm/phy-qcom-qmp-combo.c b/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
+index cdcfad2e8..7d80727cc 100644
+--- a/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
++++ b/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
+@@ -3879,6 +3879,9 @@ static int qmp_combo_usb_power_on(struct phy *phy)
+ 	unsigned int val;
+ 	int ret;
+ 
++	/* The common block can stay initialized while USB PCS is powered off. */
++	qphy_setbits(pcs, cfg->regs[QPHY_PCS_POWER_DOWN_CONTROL], SW_PWRDN);
++
+ 	qmp_configure(qmp->dev, serdes, cfg->serdes_tbl, cfg->serdes_tbl_num);
+ 
+ 	/* Tx, Rx, and PCS configurations */
+-- 
+2.56.1
+
