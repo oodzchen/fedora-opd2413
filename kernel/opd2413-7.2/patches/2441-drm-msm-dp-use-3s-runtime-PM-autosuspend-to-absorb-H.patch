@@ -1,0 +1,131 @@
+From: fedora-opd2413 <noreply@local>
+Date: Wed, 25 Nov 2026 09:53:00 +0800
+Subject: [PATCH] drm/msm/dp: use 3s runtime PM autosuspend to absorb HPD pulses
+
+With balanced DP runtime PM references (one per plugged state), an
+external monitor's ~1 s HPD unplug/replug standby pulse drops the DP
+controller's usage count to zero synchronously inside
+msm_dp_bridge_atomic_post_disable() during commit_modeset_disables().
+Running msm_dp_pm_runtime_suspend() synchronously there resets the DP
+controller and drops shared MMCX/AHB votes while the internal dual-DSI
+panel is actively scanning at 120 Hz, causing real-time DSI underruns.
+
+Enable a 3000 ms runtime PM autosuspend delay on non-eDP msm-dp-display
+devices and release runtime PM references with pm_runtime_put_autosuspend():
+- Short ~1 s HPD glitch pulses from a connected monitor are absorbed
+  without suspending the DP controller mid-scanout.
+- After a genuine cable unplug, af54000.displayport-controller cleanly
+  runtime-suspends 3 s later so ae00000.display-subsystem (MDSS GDSC)
+  powers off normally on subsequent single-display DPMS off.
+- System suspend (s2idle) still suspends immediately via
+  pm_runtime_force_suspend().
+---
+ drivers/gpu/drm/msm/dp/dp_aux.c     |  4 ++--
+ drivers/gpu/drm/msm/dp/dp_display.c | 27 +++++++++++++++++++++------
+ 2 files changed, 23 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/dp/dp_aux.c b/drivers/gpu/drm/msm/dp/dp_aux.c
+index 991234567890..abcdef123456 100644
+--- a/drivers/gpu/drm/msm/dp/dp_aux.c
++++ b/drivers/gpu/drm/msm/dp/dp_aux.c
+@@ -441,7 +441,7 @@ static ssize_t msm_dp_aux_transfer(struct drm_dp_aux *msm_dp_aux,
+ 
+ exit:
+ 	mutex_unlock(&aux->mutex);
+-	pm_runtime_put_sync(msm_dp_aux->dev);
++	pm_runtime_put_autosuspend(msm_dp_aux->dev);
+ 
+ 	return ret;
+ }
+@@ -588,7 +588,7 @@ int msm_dp_aux_is_hpd_connected(struct drm_dp_aux *msm_dp_aux, u32 wait_us)
+ 		return ret;
+ 
+ 	ret = msm_dp_aux_wait_for_hpd_connect_state(aux, wait_us);
+-	pm_runtime_put_sync(aux->dev);
++	pm_runtime_put_autosuspend(aux->dev);
+ 
+ 	return ret;
+ }
+diff --git a/drivers/gpu/drm/msm/dp/dp_display.c b/drivers/gpu/drm/msm/dp/dp_display.c
+index f30c5e921b18..c4a2b3d4e5f6 100644
+--- a/drivers/gpu/drm/msm/dp/dp_display.c
++++ b/drivers/gpu/drm/msm/dp/dp_display.c
+@@ -479,7 +479,7 @@ static int msm_dp_hpd_unplug_handle(struct msm_dp_display_private *dp)
+ 			dp->link->sink_count);
+ 
+ 	if (dp->plugged) {
+-		pm_runtime_put_sync(&pdev->dev);
++		pm_runtime_put_autosuspend(&pdev->dev);
+ 		dp->plugged = false;
+ 	}
+ 
+@@ -907,11 +907,11 @@ enum drm_connector_status msm_dp_bridge_detect(struct drm_bridge *bridge,
+ 			msm_dp_display_host_phy_exit(priv);
+ 		}
+ 
+-		pm_runtime_put_sync(&dp->pdev->dev);
++		pm_runtime_put_autosuspend(&dp->pdev->dev);
+ 	}
+ 
+ 	if (was_plugged)
+-		pm_runtime_put_sync(&dp->pdev->dev);
++		pm_runtime_put_autosuspend(&dp->pdev->dev);
+ 
+ 	return status;
+ }
+@@ -1143,6 +1143,11 @@ static int msm_dp_display_probe_tail(struct device *dev)
+ 	return 0;
+ }
+ 
++static void msm_dp_dont_use_autosuspend(void *data)
++{
++	pm_runtime_dont_use_autosuspend(data);
++}
++
+ static int msm_dp_display_probe(struct platform_device *pdev)
+ {
+ 	int rc = 0;
+@@ -1193,6 +1198,16 @@ static int msm_dp_display_probe(struct platform_device *pdev)
+ 	if (rc)
+ 		goto err;
+ 
++	if (!dp->msm_dp_display.is_edp) {
++		pm_runtime_set_autosuspend_delay(&pdev->dev, 3000);
++		pm_runtime_use_autosuspend(&pdev->dev);
++		rc = devm_add_action_or_reset(&pdev->dev,
++					      msm_dp_dont_use_autosuspend,
++					      &pdev->dev);
++		if (rc)
++			goto err;
++	}
++
+ 	rc = msm_dp_display_request_irq(dp);
+ 	if (rc)
+ 		goto err;
+@@ -1455,7 +1470,7 @@ void msm_dp_bridge_atomic_post_disable(struct drm_bridge *drm_bridge,
+ 
+ 	drm_dbg_dp(dp->drm_dev, "type=%d Done\n", dp->connector_type);
+ 
+-	pm_runtime_put_sync(&dp->pdev->dev);
++	pm_runtime_put_autosuspend(&dp->pdev->dev);
+ }
+ 
+ void msm_dp_bridge_mode_set(struct drm_bridge *drm_bridge,
+@@ -1529,7 +1544,7 @@ void msm_dp_bridge_hpd_disable(struct drm_bridge *bridge)
+ 	msm_dp_aux_hpd_intr_disable(dp->aux);
+ 	msm_dp_aux_hpd_disable(dp->aux);
+ 
+-	pm_runtime_put_sync(&msm_dp_display->pdev->dev);
++	pm_runtime_put_autosuspend(&msm_dp_display->pdev->dev);
+ }
+ 
+ void msm_dp_bridge_hpd_notify(struct drm_bridge *bridge,
+@@ -1564,5 +1579,5 @@ void msm_dp_bridge_hpd_notify(struct drm_bridge *bridge,
+ 		msm_dp_hpd_unplug_handle(dp);
+ 	}
+ 
+-	pm_runtime_put_sync(&msm_dp_display->pdev->dev);
++	pm_runtime_put_autosuspend(&msm_dp_display->pdev->dev);
+ }
+-- 
+2.49.0

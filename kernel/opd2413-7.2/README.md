@@ -73,8 +73,14 @@
 | `7.2.15-33` | Type-C 4-lane DP 下 USB 2.0（KVM 键鼠/Hub）修复：`2438`（`wcd939x_usbss_set()` 在 `TYPEC_DP_STATE_C`/`E` 下同步开启 `enable_usb = true`，不再断开 D+/D- 开关） |
 | `7.2.15-34` | 实验（极性反）：`2439` 初版误用 `GPIO_ACTIVE_LOW`，正反插均降速 480M |
 | `7.2.15-35` | Type-C USB 3.x 正反双向修复：`2439` 修正为 `orientation-gpios = <&tlmm 61 GPIO_ACTIVE_HIGH>`（与 SM8750 MTP/QRD 一致），纯 USB 3.x 正反插均可满速 10 Gbps |
-| `7.2.15-36` | 显示熄屏/DPMS 黑灰屏花屏修复候选：`2440`–`2445`；上机实测 `dsi1_phy[0x10]=0x61`、`HS_TIMER_CTRL=0x3fd08` 与 `TIMEOUT_STATUS=0` 已生效，发现 `2443` 末 hunk 误落入 `dsi_phy_4nm_8650_cfgs` 致 `CLK_EN_SEL` 未清（`0x30/0x34`） |
-| `7.2.15-37` | 修正 `2443` 将 `toggle_resync_fifo` / `reset_clk_en_sel` 精确挂入 `dsi_phy_3nm_8750_cfgs.ops`（`2440`–`2445` 完整生效） |
-| `7.2.15-38` | 实验（失败回退）：尝试用 erhai `2446`–`2449` 替换 `2411`/`2414`，实机首轮单屏 `DPMS off -> on` 即触发 `dsi1 cmd dma timeout` 与 `VBIF AXI halt` 失败，已撤回 |
-| `7.2.15-39` | 恢复已验证单屏 10/10 通过的 `2411` + `2440`–`2445`，扩展 `2414` 的 `skip_vid_trigger` 覆盖“外接 `priv->kms->dp[]` 处于 `pm_runtime_active` 或存在其他活跃 CRTC（`MDSS GDSC` 保电不掉电）”场景，根治双屏 `DPMS off -> on` 后 `sspp_8` 停摆灰黑屏（`TECH-DEBT #47`） |
-| `7.2.15-30` | Pogo 键盘触摸板掌触与心跳修复：`2436`（`oneplus-pogo-keyboard.c` 按 `slot[0] & BIT(0)` 上报 `ABS_MT_TOOL_TYPE`=`MT_TOOL_PALM`/`MT_TOOL_FINGER`，且仅在 UART 帧/CRC 错误 `tp_rx_err` 并超时 `250 ms` 无新触控帧时于 `0x2f` 心跳释放残余触点，消除 1 s 周期性断触） |
+| `7.2.15-36` | 实验已撤回：显示熄屏/DPMS 黑灰屏花屏修复候选 `2440`–`2445`（`2443` 末 hunk 误落入 `8650`；补丁已归档至 `private/display-dpms-grey-20261122/patches-shelved/`，现行树已回退 `2439`） |
+| `7.2.15-37` | 实验已撤回：修正 `2443` 至 `dsi_phy_3nm_8750_cfgs.ops`（双屏长短熄屏灰黑屏未解） |
+| `7.2.15-38` | 实验已撤回：尝试 erhai `2446`–`2449` 替换 `2411`/`2414`，单屏首轮 DPMS 即 `dsi1 cmd dma timeout` 与 `VBIF AXI halt` 失败 |
+| `7.2.15-39` | 实验已撤回：扩展 `2414` 覆盖保电态；单屏 10/10 通过，双屏首轮即 `dsi1 cmd dma timeout` 与 `DP-1` 蓝屏（`真机失败`） |
+| `7.2.15-40` | 实验已撤回：`dpu_crtc_atomic_begin()` 复位 `CTL` 触发 `CTL_SW_RESET_OVERRIDE`，致 `DSI-1` 黑屏/竖向彩条（`真机失败`） |
+| `7.2.15-41` | 实验已撤回：将 DSI `hw_ctl` 复位迁至 `dpu_encoder_virt_atomic_enable()`；4 s 短熄屏 9/9 通过，15 s 长熄屏欠载卡死 `sspp_8`（`真机失败`） |
+| `7.2.15-42` | 实验已撤回：`2447` 修好长熄屏 `0 KB/s` 欠载，但叠加 `2448`–`2459` 致 4 s 短熄屏 0/5 欠载且 `2449` 破坏 `88e8000.phy` `s2idle`（`真机失败`） |
+| `7.2.15-43` | 实验已撤回：仅保留 `2440`–`2446` + `2447`，`0` 欠载但长熄屏后因后置 `CTL_0` 复位仍卡死 `sspp_8`（`真机失败`） |
+| `7.2.15-44` | 实验已撤回：`2446` 在 `msm_atomic_commit_tail()` 提前 `commit_modeset_enables()` 至 `commit_planes()` 前，重启即内置屏花屏、外接 `DP-1` 蓝屏（`真机失败`；已卸载并全面回退 `7.2.15-35` 基线 `2439`） |
+| `7.2.15-45` | 拔线后单屏熄屏修复（**默认内核，`真机通过`**）：`2440`（erhai `762bd1bc814f`，DP 插入态仅持 1 份 runtime PM 引用，消除拔出外接屏后 `af54000.displayport-controller` 泄漏钉死 `MDSS GDSC`）+ `2441`（非 eDP DP 控制器启用 3 s `autosuspend`，吸收 ~1 s HPD 脉冲且拔线 3 s 后释放 `MDSS GDSC`） |
+| `7.2.15-46` | 实验已撤回：`#47` 双屏/保电态候选（在 `-45` 上叠加 `2442`–`2447` SM8750 双路 DSI 同步、`2448` 首帧带宽与 `2449` `DPMS off` 末尾软复位 `CTL`）；实机双屏短熄屏（`4 s`）及外接 `DP-1` 正常、内核 0 报错，但 `16–18 s` 长熄屏仅 1 轮恢复、其余内置屏仍背光黑屏（`真机失败`）；按用户决定不再继续深挖 `#47`，补丁已归档至 `private/display-dpms-grey-20261122/patches-shelved/`，现行树回退至已验收的 `7.2.15-45`（`2441`） |
